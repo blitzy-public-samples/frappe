@@ -2,18 +2,98 @@
 # License: MIT. See LICENSE
 
 from datetime import date, datetime
+from functools import wraps
 from typing import Any
 
 import frappe
 from frappe import _
 from frappe.desk.doctype.dashboard_chart.dashboard_chart import get_result
-from frappe.utils import get_datetime, getdate, now_datetime
+from frappe.utils import cint, cstr, get_datetime, getdate, now_datetime, sha256_hash
 from frappe.utils.dashboard import cache_source
 from frappe.utils.data import format_date
 from frappe.utils.dateutils import get_from_date_from_timespan, get_period, get_period_beginning
 
+DEFAULT_TIMESPAN = "Last Week"
+DEFAULT_TIME_INTERVAL = "Daily"
+CACHE_EXPIRY_SECONDS = 5 * 60
+CACHE_DIMENSIONS = (
+	"chart",
+	"filters",
+	"from_date",
+	"to_date",
+	"timespan",
+	"time_interval",
+	"heatmap_year",
+)
+
+
+def _resolve_chart(chart_name: str | None, chart: str | dict[str, Any] | None) -> Any:
+	"""Return the saved Dashboard Chart named `chart_name`, or the given unsaved chart payload.
+
+	A saved chart is read through the document cache; an unsaved payload is parsed into a
+	`frappe._dict`. This is the only chart resolution the module performs.
+	"""
+	if chart_name:
+		return frappe.get_cached_doc("Dashboard Chart", chart_name)
+
+	return frappe._dict(frappe.parse_json(chart) or {})
+
+
+def _cache_key(kwargs: dict[str, Any]) -> str:
+	"""Return the cache key of the payload for the given request arguments.
+
+	The key is `chart-data:<chart name>:<digest>`, where the digest covers the calling user,
+	the chart's `modified` timestamp, the current date and every request argument listed in
+	`CACHE_DIMENSIONS`.
+	"""
+	chart = _resolve_chart(kwargs.get("chart_name"), kwargs.get("chart"))
+	dimensions = [
+		frappe.session.user,
+		cstr(chart.modified),
+		cstr(getdate()),
+		*(cstr(kwargs.get(name)) for name in CACHE_DIMENSIONS),
+	]
+
+	return f"chart-data:{cstr(kwargs.get('chart_name'))}:{sha256_hash('|'.join(dimensions))}"
+
+
+def _cache_payload(function):
+	"""Serve the payload of `function` from the site cache for `CACHE_EXPIRY_SECONDS`.
+
+	A cached payload is returned only for the user and the request arguments it was computed
+	for. `refresh` recomputes and repopulates the entry, `no_cache` neither reads nor writes
+	it, a `None` payload is not cached, and an unsaved chart payload is always computed. A
+	payload that has to be computed is requested with `no_cache`; this decorator is the only
+	caching layer of the call.
+	"""
+
+	@wraps(function)
+	def wrapper(*args, **kwargs):
+		if args or kwargs.get("no_cache"):
+			return function(*args, **kwargs)
+
+		if not kwargs.get("chart_name"):
+			return function(**dict(kwargs, no_cache=1))
+
+		cache_key = _cache_key(kwargs)
+
+		if not cint(kwargs.get("refresh")):
+			payload = frappe.cache.get_value(cache_key)
+			if payload is not None:
+				return payload
+
+		payload = function(**dict(kwargs, no_cache=1))
+
+		if payload is not None:
+			frappe.cache.set_value(cache_key, payload, expires_in_sec=CACHE_EXPIRY_SECONDS)
+
+		return payload
+
+	return wrapper
+
 
 @frappe.whitelist()
+@_cache_payload
 @cache_source
 def get(
 	chart_name: str | None = None,
@@ -34,13 +114,10 @@ def get(
 	the datasets "Created" (counted on `creation`) and "Completed" (counted on `modified`
 	of ToDos whose `status` is "Closed"), zero-filled for periods without activity.
 	"""
-	if chart_name:
-		chart = frappe.get_doc("Dashboard Chart", chart_name)
-	else:
-		chart = frappe._dict(frappe.parse_json(chart) or {})
+	chart = _resolve_chart(chart_name, chart)
 
-	timespan = timespan or chart.timespan or "Last Week"
-	timegrain = time_interval or chart.time_interval or "Daily"
+	timespan = timespan or chart.timespan or DEFAULT_TIMESPAN
+	timegrain = time_interval or chart.time_interval or DEFAULT_TIME_INTERVAL
 
 	from_date, to_date = _resolve_window(chart, timespan, timegrain, from_date, to_date)
 

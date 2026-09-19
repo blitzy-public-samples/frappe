@@ -4,6 +4,7 @@
 import frappe
 from frappe.desk.dashboard_chart_source.todo_top_owners.todo_top_owners import (
 	TOP_N,
+	_cache_key,
 	_owner_label,
 	get,
 	get_top_owners,
@@ -17,6 +18,9 @@ CHART_CACHE_KEY = f"chart-data:{CHART_NAME}"
 
 DATASET_NAME = "Open ToDos"
 UNKNOWN_USER = "ghost@example.com"
+SCOPED_USER = "test2@example.com"
+INVALID_LIMITS = (0, -1, None, "2", 2.0, True, False, TOP_N + 1)
+UNNAMED_CACHE_KEY = "chart-data::"
 
 
 class TestToDoTopOwners(IntegrationTestCase):
@@ -25,7 +29,7 @@ class TestToDoTopOwners(IntegrationTestCase):
 	def setUp(self):
 		super().setUp()
 		frappe.db.delete("ToDo")
-		frappe.cache.delete_key(CHART_CACHE_KEY)
+		frappe.cache.delete_keys(CHART_CACHE_KEY)
 
 	def _seed(self, owner, count=1, status="Open"):
 		"""Insert `count` ToDos of `status` allocated to `owner` and return the inserted documents."""
@@ -136,3 +140,122 @@ class TestToDoTopOwners(IntegrationTestCase):
 		"""A user id that resolves to no User record is used as its own label."""
 		self.assertFalse(frappe.db.exists("User", UNKNOWN_USER))
 		self.assertEqual(_owner_label(UNKNOWN_USER), UNKNOWN_USER)
+
+	def test_limit_rejects_values_outside_one_to_top_n(self):
+		"""Zero, negative, non-integer, boolean and above-TOP_N limits raise before any query runs."""
+		self._seed("test1@example.com", 2)
+		self._seed("test2@example.com", 1)
+
+		self.assertRaises(frappe.ValidationError, get_top_owners, 0)
+
+		for limit in INVALID_LIMITS:
+			with self.subTest(limit=limit), self.assertQueryCount(0):
+				self.assertRaises(frappe.ValidationError, get_top_owners, limit)
+
+		self.assertEqual(len(get_top_owners()), 2)
+
+	def test_limit_accepts_positive_values_up_to_top_n(self):
+		"""Every integer from 1 to TOP_N bounds the ranking to exactly that many owners."""
+		seeded = {
+			"test1@example.com": 6,
+			"test2@example.com": 5,
+			"test3@example.com": 4,
+			"test4@example.com": 3,
+			"testperm@example.com": 2,
+			"Administrator": 1,
+		}
+		for owner, count in seeded.items():
+			self._seed(owner, count)
+
+		for limit in range(1, TOP_N + 1):
+			with self.subTest(limit=limit):
+				rows = get_top_owners(limit=limit)
+				self.assertEqual([row.name for row in rows], list(seeded)[:limit])
+				self.assertEqual([row["count"] for row in rows], list(seeded.values())[:limit])
+
+	def test_repeat_call_is_served_from_cache(self):
+		"""A repeat widget call returns the cached payload without querying; a refresh repopulates it."""
+		self._seed("test1@example.com", 2)
+
+		first = get(chart_name=CHART_NAME)
+
+		self.assertEqual(first["datasets"][0]["values"], [2])
+		self.assertTrue(frappe.cache.get_keys(CHART_CACHE_KEY))
+
+		self._seed("test1@example.com", 1)
+
+		with self.assertQueryCount(0):
+			self.assertEqual(get(chart_name=CHART_NAME), first)
+
+		refreshed = get(chart_name=CHART_NAME, refresh=1)
+
+		self.assertEqual(refreshed["datasets"][0]["values"], [3])
+
+		with self.assertQueryCount(0):
+			self.assertEqual(get(chart_name=CHART_NAME), refreshed)
+
+		self.assertEqual(get(chart_name=CHART_NAME, no_cache=1), refreshed)
+
+	def test_cached_payload_is_scoped_to_the_caller(self):
+		"""Every caller reads its own cache entry, so one user's counts never reach another."""
+		self._seed("test1@example.com", 2)
+		self._seed(SCOPED_USER, 1)
+
+		administrator_key = _cache_key({"chart_name": CHART_NAME})
+		administrator = get(chart_name=CHART_NAME)
+
+		with self.set_user(SCOPED_USER):
+			scoped_key = _cache_key({"chart_name": CHART_NAME})
+			scoped = get(chart_name=CHART_NAME)
+
+		self.assertNotEqual(administrator_key, scoped_key)
+		for key in (administrator_key, scoped_key):
+			self.assertTrue(key.startswith(f"{CHART_CACHE_KEY}:"))
+
+		self.assertEqual(len(administrator["labels"]), 2)
+		self.assertEqual(administrator["datasets"][0]["values"], [2, 1])
+		self.assertEqual(scoped["labels"], [self._full_name(SCOPED_USER)])
+		self.assertEqual(scoped["datasets"][0]["values"], [1])
+
+	def test_prefix_clear_invalidates_the_cached_payload(self):
+		"""Clearing the chart-data prefix drops every cached variant, so the next call queries again."""
+		self._seed("test1@example.com", 1)
+
+		get(chart_name=CHART_NAME)
+
+		self.assertTrue(frappe.cache.get_keys(CHART_CACHE_KEY))
+
+		frappe.cache.delete_keys(CHART_CACHE_KEY)
+
+		self.assertFalse(frappe.cache.get_keys(CHART_CACHE_KEY))
+
+		self._seed("test2@example.com", 3)
+		result = get(chart_name=CHART_NAME)
+
+		self.assertEqual(
+			result["labels"],
+			[self._full_name("test2@example.com"), self._full_name("test1@example.com")],
+		)
+		self.assertEqual(result["datasets"][0]["values"], [3, 1])
+
+	def test_unsaved_chart_payload_is_computed_on_every_path(self):
+		"""An unsaved chart payload returns the ranking and is never cached under an empty name."""
+		self._seed("test1@example.com", 2)
+
+		payload = frappe.as_json({"chart_type": "Custom", "source": CHART_NAME})
+		result = get(chart=payload)
+
+		self.assertEqual(result["labels"], [self._full_name("test1@example.com")])
+		self.assertEqual(result["datasets"][0]["values"], [2])
+		self.assertEqual(get(chart=payload, no_cache=1), result)
+		self.assertFalse(frappe.cache.get_keys(UNNAMED_CACHE_KEY))
+
+	def test_empty_payload_is_not_cached(self):
+		"""The "No Data" payload is not cached, so the next call sees a newly opened ToDo."""
+		self.assertIsNone(get(chart_name=CHART_NAME))
+		self.assertFalse(frappe.cache.get_keys(CHART_CACHE_KEY))
+
+		self._seed("test1@example.com", 1)
+
+		self.assertEqual(get(chart_name=CHART_NAME)["datasets"][0]["values"], [1])
+		self.assertTrue(frappe.cache.get_keys(CHART_CACHE_KEY))

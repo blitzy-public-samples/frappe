@@ -4,6 +4,7 @@
 import json
 
 import frappe
+from frappe.core.doctype.user.test_user import test_user
 from frappe.desk.dashboard_chart_source.todo_created_vs_completed.todo_created_vs_completed import (
 	get as get_created_vs_completed,
 )
@@ -11,6 +12,7 @@ from frappe.desk.dashboard_chart_source.todo_top_owners.todo_top_owners import g
 from frappe.desk.doctype.dashboard.dashboard import get_permitted_cards, get_permitted_charts
 from frappe.desk.doctype.dashboard_chart_source.dashboard_chart_source import get_config
 from frappe.desk.doctype.number_card.number_card import get_result
+from frappe.permissions import AUTOMATIC_ROLES
 from frappe.tests import IntegrationTestCase
 from frappe.utils import cint
 
@@ -21,8 +23,6 @@ OPEN_CARD = "ToDo Total Open"
 CLOSED_CARD = "ToDo Total Closed"
 TREND_CHART = "ToDo Created vs Completed"
 TOP_OWNERS_CHART = "ToDo Top Owners"
-DESK_USER = "test2@example.com"
-DESK_ROLE = "_Test Role"
 
 
 class TestToDoAnalyticsDashboard(IntegrationTestCase):
@@ -32,7 +32,7 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 		super().setUp()
 		frappe.db.delete("ToDo")
 		for chart in (TREND_CHART, TOP_OWNERS_CHART):
-			frappe.cache.delete_key(f"chart-data:{chart}")
+			frappe.cache.delete_keys(f"chart-data:{chart}")
 
 	def _make_todo(self, status="Open", allocated_to=None):
 		"""Insert one ToDo of `status` allocated to `allocated_to` and return it."""
@@ -94,6 +94,33 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 				msg=f"Chart source {source_name} carries the wrong timeseries value",
 			)
 
+	def test_chart_sources_serve_repeat_calls_from_cache(self):
+		"""Both chart sources cache their payload per caller and repopulate it on an explicit refresh."""
+		self._make_todo(status="Open", allocated_to="Administrator")
+
+		for source, chart_name in (
+			(get_created_vs_completed, TREND_CHART),
+			(get_top_owners_chart, TOP_OWNERS_CHART),
+		):
+			with self.subTest(chart=chart_name):
+				first = source(chart_name=chart_name)
+
+				self.assertTrue(
+					frappe.cache.get_keys(f"chart-data:{chart_name}"),
+					msg=f"Chart source {chart_name} cached no payload",
+				)
+
+				self._make_todo(status="Open", allocated_to="Administrator")
+
+				self.assertEqual(source(chart_name=chart_name), first)
+				with self.assertQueryCount(0):
+					self.assertEqual(source(chart_name=chart_name), first)
+
+				refreshed = source(chart_name=chart_name, refresh=1)
+
+				self.assertNotEqual(refreshed, first)
+				self.assertEqual(source(chart_name=chart_name, no_cache=1), refreshed)
+
 	def test_dashboard_loads_all_four_components(self):
 		"""The dashboard yields both cards and both charts, and every backing server call returns data."""
 		self._make_todo(status="Open", allocated_to="Administrator")
@@ -131,13 +158,20 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 			self.assertEqual(result, expected, msg=f"{card_name} did not return a result")
 
 	def test_dashboard_visible_to_desk_user(self):
-		"""A Desk user without System Manager reads the dashboard and every widget on it."""
-		frappe.get_doc("User", DESK_USER).add_roles(DESK_ROLE)
+		"""A Desk user holding no granted role reads the dashboard and every widget on it."""
+		for chart_name in (TREND_CHART, TOP_OWNERS_CHART):
+			self.assertEqual(
+				frappe.get_doc("Dashboard Chart", chart_name).roles,
+				[],
+				msg=f"Dashboard Chart {chart_name} restricts access to a role",
+			)
 
-		with self.set_user(DESK_USER):
+		with test_user(roles=["Desk User"]) as desk_user, self.set_user(desk_user.name):
 			roles = frappe.get_roles()
 			self.assertIn("Desk User", roles)
 			self.assertNotIn("System Manager", roles)
+			granted_roles = [role for role in roles if role not in AUTOMATIC_ROLES]
+			self.assertEqual(granted_roles, [], msg=f"{desk_user.name} holds granted roles {granted_roles}")
 			self.assertTrue(frappe.has_permission("Dashboard", doc=DASHBOARD))
 			self.assertEqual(len(get_permitted_cards(DASHBOARD)), 2)
 			self.assertEqual(len(get_permitted_charts(DASHBOARD)), 2)
