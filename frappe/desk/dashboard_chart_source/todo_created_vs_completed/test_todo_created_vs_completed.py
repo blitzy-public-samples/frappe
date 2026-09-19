@@ -30,6 +30,9 @@ MONTHLY_BUCKET_ENDINGS = ("2025-12-31", "2026-01-31", "2026-02-28", "2026-03-31"
 YEARLY_DAILY_BUCKETS = 366
 ABUSIVE_FROM_DATE = "0002-01-01"
 ABUSIVE_TO_DATE = "9999-12-31"
+WIDE_FROM_DATE = "2020-01-01"
+MALFORMED_DATES = ("not-a-date", "Invalid date", "13-45-2026")
+MALFORMED_PAYLOADS = ("{not json", "[1,2,3]", '"just a string"')
 
 
 class TestToDoCreatedVsCompleted(IntegrationTestCase):
@@ -141,6 +144,8 @@ class TestToDoCreatedVsCompleted(IntegrationTestCase):
 
 	def test_select_date_range_uses_from_to(self):
 		self._make_todo("2026-03-17 12:00:00")
+		on_last_day = self._make_todo("2026-03-18 09:00:00")
+		self._set_status(on_last_day, "Closed", "2026-03-18 09:30:00")
 
 		result = self._get_chart(
 			timespan="Select Date Range", from_date=RANGE_FROM_DATE, to_date=RANGE_TO_DATE
@@ -148,8 +153,31 @@ class TestToDoCreatedVsCompleted(IntegrationTestCase):
 		created, completed = self._series(result)
 
 		self.assertEqual(len(result["labels"]), RANGE_BUCKETS)
-		self.assertEqual(created, [0, 1, 0])
-		self.assertEqual(completed, [0] * RANGE_BUCKETS)
+		self.assertEqual(created, [0, 1, 1])
+		self.assertEqual(completed, [0, 0, 1])
+
+		explicit_bounds = self._get_chart(
+			timespan="Select Date Range",
+			from_date=RANGE_FROM_DATE,
+			to_date=f"{RANGE_TO_DATE} 23:59:59",
+		)
+
+		self.assertEqual(result, explicit_bounds)
+
+		single_day = self._get_chart(
+			timespan="Select Date Range", from_date=RANGE_TO_DATE, to_date=RANGE_TO_DATE
+		)
+
+		self.assertEqual(len(single_day["labels"]), 1)
+		self.assertEqual(self._series(single_day), ([1], [1]))
+
+		morning_only = self._get_chart(
+			timespan="Select Date Range",
+			from_date=RANGE_TO_DATE,
+			to_date=f"{RANGE_TO_DATE} 08:00:00",
+		)
+
+		self.assertEqual(self._series(morning_only), ([0], [0]))
 
 	def test_counts_are_permission_scoped(self):
 		visible = self._make_todo("2026-03-17 09:00:00", allocated_to="test2@example.com")
@@ -228,6 +256,14 @@ class TestToDoCreatedVsCompleted(IntegrationTestCase):
 			("reversed bounds", "Select Date Range", "Daily", RANGE_TO_DATE, RANGE_FROM_DATE),
 			("unsupported time interval", "Last Week", "Hourly", None, None),
 			("unsupported timespan", "All Time", "Daily", None, None),
+			*(
+				(f"malformed from date {value}", "Select Date Range", "Daily", value, RANGE_TO_DATE)
+				for value in MALFORMED_DATES
+			),
+			*(
+				(f"malformed to date {value}", "Select Date Range", "Daily", RANGE_FROM_DATE, value)
+				for value in MALFORMED_DATES
+			),
 		)
 
 		for case, timespan, time_interval, from_date, to_date in rejected:
@@ -255,38 +291,63 @@ class TestToDoCreatedVsCompleted(IntegrationTestCase):
 
 		aggregated.assert_not_called()
 
-	def test_window_rejects_more_readable_todos_than_the_aggregate_limit(self):
-		for hour in range(3):
-			self._make_todo(f"2026-03-17 0{hour}:00:00", description=f"_Test ToDo Analytics {hour}")
+	def test_rejects_a_malformed_or_missing_chart_argument(self):
+		with self.freeze_time(NOW):
+			for payload in MALFORMED_PAYLOADS:
+				with self.subTest(payload=payload):
+					self.assertRaises(frappe.ValidationError, get, chart=payload, no_cache=1)
+					self.assertRaises(frappe.ValidationError, get, chart=payload, refresh=1)
 
-		with (
-			patch.object(trend_source, "MAX_AGGREGATE_ROWS", 2),
-			patch.object(trend_source, "get_result") as zero_filled,
-		):
-			self.assertRaises(frappe.ValidationError, self._get_chart)
+			for case, kwargs in (
+				("no chart at all", {}),
+				("cached without a chart", {"refresh": 1}),
+				("empty chart name", {"chart_name": "", "refresh": 1}),
+			):
+				with self.subTest(case=case):
+					self.assertRaises(frappe.ValidationError, get, **kwargs)
 
-		zero_filled.assert_not_called()
+			self.assertEqual(len(get(no_cache=1)["labels"]), DAILY_BUCKETS)
+			self.assertEqual(len(get(chart="{}", no_cache=1)["labels"]), DAILY_BUCKETS)
 
-		created, completed = self._series(self._get_chart())
+	def test_each_series_runs_one_permission_scoped_aggregation(self):
+		self._make_todo("2026-03-17 12:00:00")
 
-		self.assertEqual(sum(created), 3)
-		self.assertEqual(completed, [0] * DAILY_BUCKETS)
+		aggregations = []
+		unpatched_get_list = frappe.get_list
+
+		def counting_get_list(doctype, *args, **kwargs):
+			aggregations.append(doctype)
+			return unpatched_get_list(doctype, *args, **kwargs)
+
+		with patch.object(frappe, "get_list", counting_get_list):
+			created, completed = self._series(self._get_chart())
+
+		self.assertEqual(aggregations, ["ToDo", "ToDo"])
+		self.assertEqual(sum(created), 1)
+		self.assertEqual(sum(completed), 0)
 
 	def test_window_accepts_windows_up_to_the_period_limit(self):
 		self.assertEqual(len(self._get_chart(timespan="Last Year")["labels"]), YEARLY_DAILY_BUCKETS)
 
-		limit_from_date = add_days(getdate(NOW), -(MAX_PERIODS - 1))
-		result = self._get_chart(timespan="Select Date Range", from_date=str(limit_from_date), to_date=NOW)
+		wide_window = self._get_chart(timespan="Select Date Range", from_date=WIDE_FROM_DATE, to_date=NOW)
 
-		self.assertEqual(len(result["labels"]), MAX_PERIODS)
-		self.assertEqual(sum(self._series(result)[0]), 0)
+		self.assertEqual(len(wide_window["labels"]), (getdate(NOW) - getdate(WIDE_FROM_DATE)).days + 1)
+		self.assertEqual(sum(self._series(wide_window)[0]), 0)
 
-		self.assertRaises(
-			frappe.ValidationError,
-			get,
-			chart_name=CHART_NAME,
-			no_cache=1,
-			timespan="Select Date Range",
-			from_date=str(add_days(limit_from_date, -1)),
-			to_date=NOW,
-		)
+		with patch.object(trend_source, "MAX_PERIODS", RANGE_BUCKETS):
+			at_limit = self._get_chart(
+				timespan="Select Date Range", from_date=RANGE_FROM_DATE, to_date=RANGE_TO_DATE
+			)
+
+			self.assertEqual(len(at_limit["labels"]), RANGE_BUCKETS)
+			self.assertRaises(
+				frappe.ValidationError,
+				get,
+				chart_name=CHART_NAME,
+				no_cache=1,
+				timespan="Select Date Range",
+				from_date=str(add_days(getdate(RANGE_FROM_DATE), -1)),
+				to_date=RANGE_TO_DATE,
+			)
+
+		self.assertGreater(MAX_PERIODS, (getdate(NOW) - getdate(WIDE_FROM_DATE)).days + 1)

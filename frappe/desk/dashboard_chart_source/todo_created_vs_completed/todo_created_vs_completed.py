@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Frappe Technologies and contributors
 # License: MIT. See LICENSE
 
-from datetime import date, datetime
+from datetime import date, datetime, time
 from typing import Any
 
 import frappe
@@ -14,8 +14,9 @@ from frappe.utils.dateutils import get_from_date_from_timespan, get_period, get_
 
 DEFAULT_TIMESPAN = "Last Week"
 DEFAULT_TIME_INTERVAL = "Daily"
-MAX_PERIODS = 1000
-MAX_AGGREGATE_ROWS = 100000
+MAX_PERIODS = 10000
+DATE_STRING_LENGTH = 10
+WINDOW_FIELDS = ["timespan", "time_interval", "from_date", "to_date"]
 PERIOD_LENGTH_IN_DAYS = {
 	"Daily": 1,
 	"Weekly": 7,
@@ -26,7 +27,6 @@ PERIOD_LENGTH_IN_DAYS = {
 
 
 @frappe.whitelist()
-@cache_source
 def get(
 	chart_name: str | None = None,
 	chart: str | dict[str, Any] | None = None,
@@ -42,14 +42,56 @@ def get(
 	"""Return created and completed ToDo counts per period as two chart datasets.
 
 	`chart_name` loads a saved Dashboard Chart; `chart` accepts an unsaved chart payload
-	as JSON or a dict. The response holds one label per period of the resolved window and
-	the datasets "Created" (counted on `creation`) and "Completed" (counted on `modified`
-	of ToDos whose `status` is "Closed"), zero-filled for periods without activity.
+	as a JSON object or a dict. The response holds one label per period of the resolved
+	window and the datasets "Created" (counted on `creation`) and "Completed" (counted on
+	`modified` of ToDos whose `status` is "Closed"), zero-filled for periods without
+	activity.
+
+	Both arguments are validated before any cached result is looked up: a `chart` payload
+	that is not a JSON object raises `frappe.ValidationError`, and so does a request that
+	names no chart at all while asking for the cached result.
 	"""
-	if chart_name:
-		chart = frappe.get_doc("Dashboard Chart", chart_name)
-	else:
-		chart = frappe._dict(frappe.parse_json(chart) or {})
+	chart = _parse_chart(chart)
+
+	if not no_cache and not chart_name and chart is None:
+		frappe.throw(
+			_("Either Chart Name or Chart is required"),
+			title=_("Invalid Chart Request"),
+		)
+
+	return _get_chart_data(
+		chart_name=chart_name,
+		chart=chart,
+		no_cache=no_cache,
+		filters=filters,
+		from_date=from_date,
+		to_date=to_date,
+		timespan=timespan,
+		time_interval=time_interval,
+		heatmap_year=heatmap_year,
+		refresh=refresh,
+	)
+
+
+@cache_source
+def _get_chart_data(
+	chart_name: str | None = None,
+	chart: dict[str, Any] | None = None,
+	no_cache: bool | int | None = None,
+	filters: str | list | dict[str, Any] | None = None,
+	from_date: str | datetime | None = None,
+	to_date: str | datetime | None = None,
+	timespan: str | None = None,
+	time_interval: str | None = None,
+	heatmap_year: str | int | None = None,
+	refresh: bool | int | None = None,
+) -> dict[str, Any]:
+	"""Return the two trend datasets for the window the given arguments resolve to.
+
+	`cache_source` serves and stores the result under the chart's own cache key unless
+	`no_cache` is set, and calls this function with `chart_name` but without `chart`.
+	"""
+	chart = _load_window_fields(chart_name, chart)
 
 	timespan = timespan or chart.timespan or DEFAULT_TIMESPAN
 	timegrain = time_interval or chart.time_interval or DEFAULT_TIME_INTERVAL
@@ -75,6 +117,48 @@ def get(
 	}
 
 
+def _parse_chart(chart: str | dict[str, Any] | None) -> frappe._dict | None:
+	"""Return the given chart payload as a dict, or None when no payload was given.
+
+	A payload that is not parsable JSON, or that parses to anything other than an object,
+	raises `frappe.ValidationError`.
+	"""
+	if chart is None or chart == "":
+		return None
+
+	if isinstance(chart, str):
+		try:
+			chart = frappe.parse_json(chart)
+		except (TypeError, ValueError):
+			frappe.throw(_("Chart is not valid JSON"), title=_("Invalid Chart Request"))
+
+	if not isinstance(chart, dict):
+		frappe.throw(_("Chart must be a JSON object"), title=_("Invalid Chart Request"))
+
+	return frappe._dict(chart)
+
+
+def _load_window_fields(chart_name: str | None, chart: dict[str, Any] | None) -> Any:
+	"""Return the window fields the request resolves its window from.
+
+	With `chart_name` the saved chart's `timespan`, `time_interval`, `from_date` and
+	`to_date` are read in one query; otherwise the given payload is returned as a dict. A
+	`chart_name` that names no Dashboard Chart raises `frappe.DoesNotExistError`.
+	"""
+	if not chart_name:
+		return frappe._dict(chart or {})
+
+	window = frappe.db.get_value("Dashboard Chart", chart_name, WINDOW_FIELDS, as_dict=True)
+
+	if not window:
+		frappe.throw(
+			_("Dashboard Chart {0} not found").format(chart_name),
+			frappe.DoesNotExistError,
+		)
+
+	return window
+
+
 def _resolve_window(
 	chart: Any,
 	timespan: str,
@@ -85,15 +169,17 @@ def _resolve_window(
 	"""Return the inclusive window bounds for the given timespan and time interval.
 
 	For the timespan "Select Date Range" the bounds come from the given `from_date` and
-	`to_date`, falling back to the chart's own date fields. Every other timespan ends at
-	the current datetime and begins at the start of the time grain that contains the
-	from-date calculated for that timespan. The lower bound is a date, the upper bound a
-	datetime.
+	`to_date`, falling back to the chart's own date fields; a bound that names a day
+	without a time of day spans that whole day, so activity on the last day of the range
+	is counted. Every other timespan ends at the current datetime and begins at the start
+	of the time grain that contains the from-date calculated for that timespan. The lower
+	bound is a date, the upper bound a datetime.
 
 	`timegrain` must be a key of `PERIOD_LENGTH_IN_DAYS` and `timespan` an option of the
-	Dashboard Chart field `timespan`, the lower bound must not be after the upper bound,
-	and the window must hold at most `MAX_PERIODS` periods of `timegrain`; anything else
-	raises `frappe.ValidationError` before a query runs.
+	Dashboard Chart field `timespan`, each given bound must be a valid date, the lower
+	bound must not be after the upper bound, and the window must hold at most
+	`MAX_PERIODS` periods of `timegrain`; anything else raises `frappe.ValidationError`
+	before a query runs.
 	"""
 	if timegrain not in PERIOD_LENGTH_IN_DAYS:
 		frappe.throw(
@@ -110,8 +196,8 @@ def _resolve_window(
 		)
 
 	if timespan == "Select Date Range":
-		from_date = get_datetime(from_date) if from_date else get_datetime(chart.from_date)
-		to_date = get_datetime(to_date) if to_date else get_datetime(chart.to_date)
+		from_date = _window_bound(from_date or chart.from_date, _("From Date"))
+		to_date = _window_bound(to_date or chart.to_date, _("To Date"), end_of_day=True)
 	else:
 		to_date = now_datetime()
 		from_date = get_period_beginning(get_from_date_from_timespan(to_date, timespan), timegrain)
@@ -139,6 +225,41 @@ def _resolve_window(
 	return from_date, to_date
 
 
+def _window_bound(value: Any, label: str, end_of_day: bool = False) -> datetime:
+	"""Return the given window bound as a datetime.
+
+	With `end_of_day`, a bound that names a day without a time of day is returned as the
+	last microsecond of that day. A bound that is not a valid date raises
+	`frappe.ValidationError` naming `label`.
+	"""
+	try:
+		bound = get_datetime(value)
+	except (TypeError, ValueError, OverflowError):
+		bound = None
+
+	if not isinstance(bound, datetime):
+		frappe.throw(
+			_("{0} is not a valid date").format(label),
+			title=_("Invalid Chart Window"),
+		)
+
+	if end_of_day and _is_date_only(value):
+		return datetime.combine(getdate(bound), time.max)
+
+	return bound
+
+
+def _is_date_only(value: Any) -> bool:
+	"""Return whether the given window bound names a day without a time of day."""
+	if isinstance(value, datetime):
+		return False
+
+	if isinstance(value, date):
+		return True
+
+	return isinstance(value, str) and len(value.strip()) <= DATE_STRING_LENGTH
+
+
 def _count_by_period(
 	datefield: str,
 	extra_filters: list,
@@ -150,29 +271,15 @@ def _count_by_period(
 
 	`extra_filters` is added to the window filters on `datefield`. Both window bounds are
 	inclusive and the counts are scoped to the ToDos readable by the current user.
-
-	A window whose readable ToDos exceed `MAX_AGGREGATE_ROWS` raises
-	`frappe.ValidationError` before the grouped rows are fetched.
 	"""
-	filters = [
-		*extra_filters,
-		["ToDo", datefield, ">=", from_date.strftime("%Y-%m-%d")],
-		["ToDo", datefield, "<=", to_date],
-	]
-	readable_rows = frappe.get_list("ToDo", fields=[{"COUNT": "*"}], filters=filters, as_list=True)[0][0]
-
-	if readable_rows > MAX_AGGREGATE_ROWS:
-		frappe.throw(
-			_("The window holds {0} ToDos, more than the limit of {1}").format(
-				readable_rows, MAX_AGGREGATE_ROWS
-			),
-			title=_("Invalid Chart Window"),
-		)
-
 	rows = frappe.get_list(
 		"ToDo",
 		fields=[datefield, {"SUM": "1"}, {"COUNT": "*"}],
-		filters=filters,
+		filters=[
+			*extra_filters,
+			["ToDo", datefield, ">=", from_date.strftime("%Y-%m-%d")],
+			["ToDo", datefield, "<=", to_date],
+		],
 		group_by=datefield,
 		order_by=datefield,
 		as_list=True,

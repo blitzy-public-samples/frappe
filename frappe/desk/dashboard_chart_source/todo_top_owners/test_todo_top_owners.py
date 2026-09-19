@@ -5,6 +5,7 @@ import frappe
 from frappe.desk.dashboard_chart_source.todo_top_owners.todo_top_owners import (
 	TOP_N,
 	_owner_label,
+	_owner_labels,
 	get,
 	get_top_owners,
 )
@@ -14,16 +15,31 @@ EXTRA_TEST_RECORD_DEPENDENCIES = ["User"]
 
 CHART_NAME = "ToDo Top Owners"
 CHART_CACHE_KEY = f"chart-data:{CHART_NAME}"
+UNNAMED_CHART_CACHE_KEY = "chart-data:None"
 
 DATASET_NAME = "Open ToDos"
 UNKNOWN_USER = "ghost@example.com"
+
+FIVE_OWNERS = [
+	"test1@example.com",
+	"test2@example.com",
+	"test3@example.com",
+	"test4@example.com",
+	"testperm@example.com",
+]
+OWNER_LOOKUP_QUERY_LIMIT = 8
 
 
 class TestToDoTopOwners(IntegrationTestCase):
 	def setUp(self):
 		super().setUp()
 		frappe.db.delete("ToDo")
+		self._clear_chart_cache()
+		self.addCleanup(self._clear_chart_cache)
+
+	def _clear_chart_cache(self):
 		frappe.cache.delete_keys(CHART_CACHE_KEY)
+		frappe.cache.delete_keys(UNNAMED_CHART_CACHE_KEY)
 
 	def _seed(self, owner, count=1, status="Open"):
 		return [
@@ -124,3 +140,64 @@ class TestToDoTopOwners(IntegrationTestCase):
 	def test_label_falls_back_to_user_id(self):
 		self.assertFalse(frappe.db.exists("User", UNKNOWN_USER))
 		self.assertEqual(_owner_label(UNKNOWN_USER), UNKNOWN_USER)
+
+	def test_unidentifiable_chart_raises_client_error(self):
+		self._seed("test1@example.com")
+
+		for kwargs in (
+			{},
+			{"refresh": 1},
+			{"chart_name": ""},
+			{"chart": ""},
+			{"chart_name": "", "chart": ""},
+		):
+			with self.subTest(kwargs=kwargs), self.assertRaises(frappe.exceptions.MandatoryError):
+				get(**kwargs)
+
+		for chart in ("{not json", "[1,2]", "5", "null", '"x"'):
+			with self.subTest(chart=chart):
+				with self.assertRaises(frappe.ValidationError) as raised:
+					get(chart=chart, refresh=1)
+
+				self.assertNotIsInstance(raised.exception, frappe.exceptions.MandatoryError)
+
+		self.assertEqual(frappe.exceptions.MandatoryError.http_status_code, 417)
+		self.assertEqual(frappe.ValidationError.http_status_code, 417)
+		self.assertEqual(frappe.DoesNotExistError.http_status_code, 404)
+
+		with self.assertRaises(frappe.DoesNotExistError):
+			get(chart_name="Nope", refresh=1)
+
+		expected = {
+			"labels": [self._full_name("test1@example.com")],
+			"datasets": [{"name": frappe._(DATASET_NAME), "values": [1]}],
+		}
+
+		self.assertEqual(get(chart=frappe.as_json({"name": CHART_NAME}), refresh=1), expected)
+		self.assertEqual(get(chart={"timespan": "Last Week"}, refresh=1), expected)
+		self.assertEqual(get(chart_name=CHART_NAME, refresh=1), expected)
+
+	def test_owner_labels_resolve_without_loading_user_documents(self):
+		for owner in FIVE_OWNERS:
+			self._seed(owner)
+
+		warmed_rows = get_top_owners()
+
+		self.assertEqual([row.name for row in warmed_rows], FIVE_OWNERS)
+
+		for owner in FIVE_OWNERS:
+			frappe.clear_document_cache("User", owner)
+
+		with self.assertQueryCount(OWNER_LOOKUP_QUERY_LIMIT):
+			rows = get_top_owners()
+
+		expected_labels = [self._full_name(owner) for owner in FIVE_OWNERS]
+
+		self.assertEqual([row.name for row in rows], FIVE_OWNERS)
+		self.assertEqual([row.label for row in rows], expected_labels)
+
+		labels = _owner_labels([*FIVE_OWNERS, UNKNOWN_USER])
+
+		self.assertEqual(labels[UNKNOWN_USER], UNKNOWN_USER)
+		self.assertEqual([labels[owner] for owner in FIVE_OWNERS], expected_labels)
+		self.assertEqual(_owner_labels([]), {})
