@@ -38,7 +38,9 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		cy.findByText("ToDo Created vs Completed").should("be.visible");
 		cy.findByText("ToDo Top Owners").should("be.visible");
 
-		// expect both charts to be loaded without an error state
+		cy.get(".dashboard-widget-box .chart-loading-state.text-extra-muted").should(
+			"not.be.visible"
+		);
 		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
 		cy.get(".dashboard-widget-box .chart-loading-state.text-danger").should("not.be.visible");
 	});

@@ -1,18 +1,19 @@
 # Copyright (c) 2026, Frappe Technologies and contributors
 # License: MIT. See LICENSE
 
-from contextlib import contextmanager
 from unittest.mock import patch
 
 import frappe
+from frappe.desk.dashboard_chart_source.todo_created_vs_completed import (
+	todo_created_vs_completed as trend_source,
+)
 from frappe.desk.dashboard_chart_source.todo_created_vs_completed.todo_created_vs_completed import (
-	_cache_key,
-	_resolve_chart,
+	MAX_PERIODS,
+	_resolve_window,
 	get,
 )
-from frappe.model.document import Document
 from frappe.tests import IntegrationTestCase
-from frappe.utils import getdate
+from frappe.utils import add_days, getdate
 from frappe.utils.dateutils import get_period
 
 EXTRA_TEST_RECORD_DEPENDENCIES = ["User"]
@@ -26,21 +27,18 @@ RANGE_FROM_DATE = "2026-03-16"
 RANGE_TO_DATE = "2026-03-18"
 RANGE_BUCKETS = 3
 MONTHLY_BUCKET_ENDINGS = ("2025-12-31", "2026-01-31", "2026-02-28", "2026-03-31")
-SCOPED_USER = "test2@example.com"
-AGGREGATE_QUERIES = 2
-UNNAMED_CACHE_KEY = "chart-data::"
+YEARLY_DAILY_BUCKETS = 366
+ABUSIVE_FROM_DATE = "0002-01-01"
+ABUSIVE_TO_DATE = "9999-12-31"
 
 
 class TestToDoCreatedVsCompleted(IntegrationTestCase):
-	"""Cover the ToDo Created vs Completed dashboard chart source."""
-
 	def setUp(self):
 		super().setUp()
 		frappe.db.delete("ToDo")
 		frappe.cache.delete_keys(CHART_CACHE_KEY)
 
 	def _make_todo(self, created_at, allocated_to="Administrator", description="_Test ToDo Analytics"):
-		"""Insert one ToDo whose `creation` is `created_at` and return it."""
 		with self.freeze_time(created_at):
 			return frappe.get_doc(
 				doctype="ToDo",
@@ -50,7 +48,7 @@ class TestToDoCreatedVsCompleted(IntegrationTestCase):
 			).insert()
 
 	def _set_status(self, todo, status, at):
-		"""Save `todo` with `status` so that its `modified` becomes `at`, and return it."""
+		"""Set `todo.status`, save it at `at`, and return it. The save sets `modified` to `at`."""
 		with self.freeze_time(at):
 			todo.reload()
 			todo.status = status
@@ -59,7 +57,6 @@ class TestToDoCreatedVsCompleted(IntegrationTestCase):
 		return todo
 
 	def _get_chart(self, **kwargs):
-		"""Return the chart payload of the saved chart, resolved against the frozen `NOW`."""
 		with self.freeze_time(NOW):
 			return get(chart_name=CHART_NAME, no_cache=1, **kwargs)
 
@@ -68,20 +65,6 @@ class TestToDoCreatedVsCompleted(IntegrationTestCase):
 		self.assertEqual([dataset["name"] for dataset in result["datasets"]], ["Created", "Completed"])
 
 		return result["datasets"][0]["values"], result["datasets"][1]["values"]
-
-	@contextmanager
-	def _loaded_doctypes(self):
-		"""Yield a list collecting the doctype of every document read from the database."""
-		loaded = []
-		load_from_db = Document.load_from_db
-
-		def counted(doc, *args, **kwargs):
-			loaded.append(doc.doctype)
-
-			return load_from_db(doc, *args, **kwargs)
-
-		with patch.object(Document, "load_from_db", counted):
-			yield loaded
 
 	def test_buckets_created_and_completed_daily(self):
 		closed_early = self._make_todo("2026-03-12 09:00:00")
@@ -238,129 +221,72 @@ class TestToDoCreatedVsCompleted(IntegrationTestCase):
 		self.assertEqual(created, [0, 1, 0])
 		self.assertEqual(completed, [0] * RANGE_BUCKETS)
 
-	def test_repeat_call_is_served_from_cache(self):
-		"""A repeat widget call returns the cached payload without querying; refresh repopulates it."""
-		self._make_todo("2026-03-17 12:00:00")
-
-		with self.freeze_time(NOW):
-			first = get(chart_name=CHART_NAME)
-
-		self.assertTrue(frappe.cache.get_keys(CHART_CACHE_KEY))
-		self.assertEqual(self._series(first)[0], [0, 0, 0, 0, 0, 0, 1, 0])
-
-		self._make_todo("2026-03-18 08:00:00")
-
-		with self.freeze_time(NOW):
-			self.assertEqual(get(chart_name=CHART_NAME), first)
-
-			with self.assertQueryCount(0):
-				self.assertEqual(get(chart_name=CHART_NAME), first)
-
-			refreshed = get(chart_name=CHART_NAME, refresh=1)
-
-			self.assertEqual(self._series(refreshed)[0], [0, 0, 0, 0, 0, 0, 1, 1])
-			self.assertEqual(get(chart_name=CHART_NAME, no_cache=1), refreshed)
-
-			frappe.cache.delete_keys(CHART_CACHE_KEY)
-
-			self.assertFalse(frappe.cache.get_keys(CHART_CACHE_KEY))
-			self.assertEqual(get(chart_name=CHART_NAME), refreshed)
-
-	def test_cached_payload_is_scoped_to_the_caller_and_the_window(self):
-		"""Every caller and every requested window read their own entry under the chart prefix."""
-		self._make_todo("2026-03-17 09:00:00", allocated_to=SCOPED_USER)
-		self._make_todo("2026-03-17 10:00:00", allocated_to="test1@example.com")
-
-		with self.freeze_time(NOW):
-			default_key = _cache_key({"chart_name": CHART_NAME})
-			range_key = _cache_key(
-				{
-					"chart_name": CHART_NAME,
-					"timespan": "Select Date Range",
-					"from_date": RANGE_FROM_DATE,
-					"to_date": RANGE_TO_DATE,
-				}
-			)
-			monthly_key = _cache_key(
-				{"chart_name": CHART_NAME, "timespan": "Last Quarter", "time_interval": "Monthly"}
-			)
-
-			with self.set_user(SCOPED_USER):
-				scoped_key = _cache_key({"chart_name": CHART_NAME})
-				scoped = get(chart_name=CHART_NAME)
-
-			everything = get(chart_name=CHART_NAME)
-			ranged = get(
-				chart_name=CHART_NAME,
-				timespan="Select Date Range",
-				from_date=RANGE_FROM_DATE,
-				to_date=RANGE_TO_DATE,
-			)
-
-		self.assertEqual(len({default_key, range_key, monthly_key, scoped_key}), 4)
-		for key in (default_key, range_key, monthly_key, scoped_key):
-			self.assertTrue(key.startswith(f"{CHART_CACHE_KEY}:"))
-
-		self.assertEqual(sum(self._series(everything)[0]), 2)
-		self.assertEqual(sum(self._series(scoped)[0]), 1)
-		self.assertEqual(len(ranged["labels"]), RANGE_BUCKETS)
-
-	def test_chart_document_is_resolved_once_and_reused(self):
-		"""The saved chart is read from the document cache, and an unsaved payload still resolves."""
-		chart = _resolve_chart(CHART_NAME, None)
-
-		self.assertEqual(chart.name, CHART_NAME)
-		self.assertIs(_resolve_chart(CHART_NAME, None), chart)
-
-		payload = _resolve_chart(None, frappe.as_json({"timespan": "Last Week", "time_interval": "Daily"}))
-
-		self.assertIsNone(payload.name)
-		self.assertEqual(payload.timespan, "Last Week")
-		self.assertEqual(payload.time_interval, "Daily")
-
-		with self.freeze_time(NOW):
-			get(chart_name=CHART_NAME, no_cache=1)
-
-			with self.assertQueryCount(AGGREGATE_QUERIES):
-				get(chart_name=CHART_NAME, no_cache=1)
-
-	def test_cold_miss_resolves_the_chart_once(self):
-		"""A miss with the payload and document caches cleared reads the saved chart exactly once."""
-		self._make_todo("2026-03-17 12:00:00")
-
-		with self.freeze_time(NOW):
-			get(chart_name=CHART_NAME, no_cache=1)
-
-			for label, arguments in (("miss", {}), ("refresh", {"refresh": 1})):
-				with self.subTest(call=label):
-					frappe.cache.delete_keys(CHART_CACHE_KEY)
-					frappe.clear_document_cache("Dashboard Chart", CHART_NAME)
-
-					with self._loaded_doctypes() as loaded:
-						result = get(chart_name=CHART_NAME, **arguments)
-
-					self.assertEqual(loaded.count("Dashboard Chart"), 1)
-					self.assertEqual(len(result["labels"]), DAILY_BUCKETS)
-					self.assertEqual(self._series(result)[0], [0, 0, 0, 0, 0, 0, 1, 0])
-
-	def test_unsaved_chart_payload_is_computed_on_every_path(self):
-		"""An unsaved chart payload resolves its own window and is never cached under an empty name."""
-		self._make_todo("2026-03-17 12:00:00")
-
-		payload = frappe.as_json(
-			{
-				"timespan": "Select Date Range",
-				"time_interval": "Daily",
-				"from_date": RANGE_FROM_DATE,
-				"to_date": RANGE_TO_DATE,
-			}
+	def test_window_rejects_unsupported_grains_spans_and_bounds(self):
+		chart = frappe.get_doc("Dashboard Chart", CHART_NAME)
+		rejected = (
+			("abusive range", "Select Date Range", "Daily", ABUSIVE_FROM_DATE, ABUSIVE_TO_DATE),
+			("reversed bounds", "Select Date Range", "Daily", RANGE_TO_DATE, RANGE_FROM_DATE),
+			("unsupported time interval", "Last Week", "Hourly", None, None),
+			("unsupported timespan", "All Time", "Daily", None, None),
 		)
 
-		with self.freeze_time(NOW):
-			result = get(chart=payload)
+		for case, timespan, time_interval, from_date, to_date in rejected:
+			with self.subTest(case=case):
+				self.assertRaises(
+					frappe.ValidationError,
+					_resolve_window,
+					chart,
+					timespan,
+					time_interval,
+					from_date,
+					to_date,
+				)
 
-			self.assertEqual(len(result["labels"]), RANGE_BUCKETS)
-			self.assertEqual(self._series(result)[0], [0, 1, 0])
-			self.assertEqual(get(chart=payload, no_cache=1), result)
+		with patch.object(frappe, "get_list") as aggregated:
+			self.assertRaises(
+				frappe.ValidationError,
+				get,
+				chart_name=CHART_NAME,
+				no_cache=1,
+				timespan="Select Date Range",
+				from_date=ABUSIVE_FROM_DATE,
+				to_date=ABUSIVE_TO_DATE,
+			)
 
-		self.assertFalse(frappe.cache.get_keys(UNNAMED_CACHE_KEY))
+		aggregated.assert_not_called()
+
+	def test_window_rejects_more_readable_todos_than_the_aggregate_limit(self):
+		for hour in range(3):
+			self._make_todo(f"2026-03-17 0{hour}:00:00", description=f"_Test ToDo Analytics {hour}")
+
+		with (
+			patch.object(trend_source, "MAX_AGGREGATE_ROWS", 2),
+			patch.object(trend_source, "get_result") as zero_filled,
+		):
+			self.assertRaises(frappe.ValidationError, self._get_chart)
+
+		zero_filled.assert_not_called()
+
+		created, completed = self._series(self._get_chart())
+
+		self.assertEqual(sum(created), 3)
+		self.assertEqual(completed, [0] * DAILY_BUCKETS)
+
+	def test_window_accepts_windows_up_to_the_period_limit(self):
+		self.assertEqual(len(self._get_chart(timespan="Last Year")["labels"]), YEARLY_DAILY_BUCKETS)
+
+		limit_from_date = add_days(getdate(NOW), -(MAX_PERIODS - 1))
+		result = self._get_chart(timespan="Select Date Range", from_date=str(limit_from_date), to_date=NOW)
+
+		self.assertEqual(len(result["labels"]), MAX_PERIODS)
+		self.assertEqual(sum(self._series(result)[0]), 0)
+
+		self.assertRaises(
+			frappe.ValidationError,
+			get,
+			chart_name=CHART_NAME,
+			no_cache=1,
+			timespan="Select Date Range",
+			from_date=str(add_days(limit_from_date, -1)),
+			to_date=NOW,
+		)

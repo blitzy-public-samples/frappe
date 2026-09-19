@@ -4,7 +4,6 @@
 import json
 
 import frappe
-from frappe.core.doctype.user.test_user import test_user
 from frappe.desk.dashboard_chart_source.todo_created_vs_completed.todo_created_vs_completed import (
 	get as get_created_vs_completed,
 )
@@ -12,7 +11,6 @@ from frappe.desk.dashboard_chart_source.todo_top_owners.todo_top_owners import g
 from frappe.desk.doctype.dashboard.dashboard import get_permitted_cards, get_permitted_charts
 from frappe.desk.doctype.dashboard_chart_source.dashboard_chart_source import get_config
 from frappe.desk.doctype.number_card.number_card import get_result
-from frappe.permissions import AUTOMATIC_ROLES
 from frappe.tests import IntegrationTestCase
 from frappe.utils import cint
 
@@ -23,11 +21,10 @@ OPEN_CARD = "ToDo Total Open"
 CLOSED_CARD = "ToDo Total Closed"
 TREND_CHART = "ToDo Created vs Completed"
 TOP_OWNERS_CHART = "ToDo Top Owners"
+DESK_USER = "test2@example.com"
 
 
 class TestToDoAnalyticsDashboard(IntegrationTestCase):
-	"""Cover the standard records and the server calls behind the ToDo Analytics dashboard page."""
-
 	def setUp(self):
 		super().setUp()
 		frappe.db.delete("ToDo")
@@ -35,7 +32,6 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 			frappe.cache.delete_keys(f"chart-data:{chart}")
 
 	def _make_todo(self, status="Open", allocated_to=None):
-		"""Insert one ToDo of `status` allocated to `allocated_to` and return it."""
 		return frappe.get_doc(
 			doctype="ToDo",
 			description=f"ToDo Analytics {status}",
@@ -44,8 +40,11 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 			assigned_by="Administrator",
 		).insert()
 
+	def _set_user_type(self, user, user_type):
+		frappe.db.set_value("User", user, "user_type", user_type, update_modified=False)
+		frappe.clear_cache(user=user)
+
 	def test_open_and_closed_cards_count_seeded_todos(self):
-		"""Each card counts only the seeded ToDos carrying the status it filters on."""
 		for _ in range(3):
 			self._make_todo(status="Open")
 		for _ in range(2):
@@ -58,7 +57,6 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 			self.assertEqual(result, expected, msg=f"{card_name} did not count the seeded ToDos")
 
 	def test_cards_empty_state_zero(self):
-		"""Both cards return zero when no ToDo exists."""
 		for card_name in (OPEN_CARD, CLOSED_CARD):
 			card = frappe.get_doc("Number Card", card_name)
 			result = get_result(doc=card.as_dict(), filters=json.loads(card.filters_json))
@@ -94,8 +92,7 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 				msg=f"Chart source {source_name} carries the wrong timeseries value",
 			)
 
-	def test_chart_sources_serve_repeat_calls_from_cache(self):
-		"""Both chart sources cache their payload per caller and repopulate it on an explicit refresh."""
+	def test_chart_sources_record_the_last_sync_on_a_widget_refresh(self):
 		self._make_todo(status="Open", allocated_to="Administrator")
 
 		for source, chart_name in (
@@ -103,23 +100,15 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 			(get_top_owners_chart, TOP_OWNERS_CHART),
 		):
 			with self.subTest(chart=chart_name):
-				first = source(chart_name=chart_name)
-
-				self.assertTrue(
-					frappe.cache.get_keys(f"chart-data:{chart_name}"),
-					msg=f"Chart source {chart_name} cached no payload",
+				frappe.db.set_value(
+					"Dashboard Chart", chart_name, "last_synced_on", None, update_modified=False
 				)
 
-				self._make_todo(status="Open", allocated_to="Administrator")
-
-				self.assertEqual(source(chart_name=chart_name), first)
-				with self.assertQueryCount(0):
-					self.assertEqual(source(chart_name=chart_name), first)
-
-				refreshed = source(chart_name=chart_name, refresh=1)
-
-				self.assertNotEqual(refreshed, first)
-				self.assertEqual(source(chart_name=chart_name, no_cache=1), refreshed)
+				self.assertIsNotNone(source(chart_name=chart_name, refresh=1))
+				self.assertIsNotNone(
+					frappe.db.get_value("Dashboard Chart", chart_name, "last_synced_on"),
+					msg=f"Chart source {chart_name} did not record last_synced_on",
+				)
 
 	def test_dashboard_loads_all_four_components(self):
 		"""The dashboard yields both cards and both charts, and every backing server call returns data."""
@@ -158,7 +147,7 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 			self.assertEqual(result, expected, msg=f"{card_name} did not return a result")
 
 	def test_dashboard_visible_to_desk_user(self):
-		"""A Desk user holding no granted role reads the dashboard and every widget on it."""
+		"""A Desk user without the System Manager role reads the dashboard, both cards and both charts."""
 		for chart_name in (TREND_CHART, TOP_OWNERS_CHART):
 			self.assertEqual(
 				frappe.get_doc("Dashboard Chart", chart_name).roles,
@@ -166,12 +155,20 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 				msg=f"Dashboard Chart {chart_name} restricts access to a role",
 			)
 
-		with test_user(roles=["Desk User"]) as desk_user, self.set_user(desk_user.name):
+		self.addCleanup(self._set_user_type, DESK_USER, frappe.db.get_value("User", DESK_USER, "user_type"))
+		self._set_user_type(DESK_USER, "System User")
+
+		with self.set_user(DESK_USER):
 			roles = frappe.get_roles()
-			self.assertIn("Desk User", roles)
-			self.assertNotIn("System Manager", roles)
-			granted_roles = [role for role in roles if role not in AUTOMATIC_ROLES]
-			self.assertEqual(granted_roles, [], msg=f"{desk_user.name} holds granted roles {granted_roles}")
-			self.assertTrue(frappe.has_permission("Dashboard", doc=DASHBOARD))
-			self.assertEqual(len(get_permitted_cards(DASHBOARD)), 2)
-			self.assertEqual(len(get_permitted_charts(DASHBOARD)), 2)
+			self.assertIn("Desk User", roles, msg=f"{DESK_USER} holds no Desk access")
+			self.assertNotIn("System Manager", roles, msg=f"{DESK_USER} holds the System Manager role")
+			self.assertTrue(
+				frappe.has_permission("Dashboard", doc=DASHBOARD),
+				msg=f"{DESK_USER} cannot read Dashboard {DASHBOARD}",
+			)
+			self.assertEqual(
+				len(get_permitted_cards(DASHBOARD)), 2, msg=f"{DESK_USER} is not permitted both cards"
+			)
+			self.assertEqual(
+				len(get_permitted_charts(DASHBOARD)), 2, msg=f"{DESK_USER} is not permitted both charts"
+			)

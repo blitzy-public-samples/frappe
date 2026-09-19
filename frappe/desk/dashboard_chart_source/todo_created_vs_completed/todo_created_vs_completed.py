@@ -2,98 +2,30 @@
 # License: MIT. See LICENSE
 
 from datetime import date, datetime
-from functools import wraps
 from typing import Any
 
 import frappe
 from frappe import _
 from frappe.desk.doctype.dashboard_chart.dashboard_chart import get_result
-from frappe.utils import cint, cstr, get_datetime, getdate, now_datetime, sha256_hash
+from frappe.utils import get_datetime, getdate, now_datetime
 from frappe.utils.dashboard import cache_source
 from frappe.utils.data import format_date
 from frappe.utils.dateutils import get_from_date_from_timespan, get_period, get_period_beginning
 
 DEFAULT_TIMESPAN = "Last Week"
 DEFAULT_TIME_INTERVAL = "Daily"
-CACHE_EXPIRY_SECONDS = 5 * 60
-CACHE_DIMENSIONS = (
-	"chart",
-	"filters",
-	"from_date",
-	"to_date",
-	"timespan",
-	"time_interval",
-	"heatmap_year",
-)
-
-
-def _resolve_chart(chart_name: str | None, chart: str | dict[str, Any] | None) -> Any:
-	"""Return the saved Dashboard Chart named `chart_name`, or the given unsaved chart payload.
-
-	A saved chart is read through the document cache; an unsaved payload is parsed into a
-	`frappe._dict`. This is the only chart resolution the module performs.
-	"""
-	if chart_name:
-		return frappe.get_cached_doc("Dashboard Chart", chart_name)
-
-	return frappe._dict(frappe.parse_json(chart) or {})
-
-
-def _cache_key(kwargs: dict[str, Any]) -> str:
-	"""Return the cache key of the payload for the given request arguments.
-
-	The key is `chart-data:<chart name>:<digest>`, where the digest covers the calling user,
-	the chart's `modified` timestamp, the current date and every request argument listed in
-	`CACHE_DIMENSIONS`.
-	"""
-	chart = _resolve_chart(kwargs.get("chart_name"), kwargs.get("chart"))
-	dimensions = [
-		frappe.session.user,
-		cstr(chart.modified),
-		cstr(getdate()),
-		*(cstr(kwargs.get(name)) for name in CACHE_DIMENSIONS),
-	]
-
-	return f"chart-data:{cstr(kwargs.get('chart_name'))}:{sha256_hash('|'.join(dimensions))}"
-
-
-def _cache_payload(function):
-	"""Serve the payload of `function` from the site cache for `CACHE_EXPIRY_SECONDS`.
-
-	A cached payload is returned only for the user and the request arguments it was computed
-	for. `refresh` recomputes and repopulates the entry, `no_cache` neither reads nor writes
-	it, a `None` payload is not cached, and an unsaved chart payload is always computed. A
-	payload that has to be computed is requested with `no_cache`; this decorator is the only
-	caching layer of the call.
-	"""
-
-	@wraps(function)
-	def wrapper(*args, **kwargs):
-		if args or kwargs.get("no_cache"):
-			return function(*args, **kwargs)
-
-		if not kwargs.get("chart_name"):
-			return function(**dict(kwargs, no_cache=1))
-
-		cache_key = _cache_key(kwargs)
-
-		if not cint(kwargs.get("refresh")):
-			payload = frappe.cache.get_value(cache_key)
-			if payload is not None:
-				return payload
-
-		payload = function(**dict(kwargs, no_cache=1))
-
-		if payload is not None:
-			frappe.cache.set_value(cache_key, payload, expires_in_sec=CACHE_EXPIRY_SECONDS)
-
-		return payload
-
-	return wrapper
+MAX_PERIODS = 1000
+MAX_AGGREGATE_ROWS = 100000
+PERIOD_LENGTH_IN_DAYS = {
+	"Daily": 1,
+	"Weekly": 7,
+	"Monthly": 28,
+	"Quarterly": 90,
+	"Yearly": 365,
+}
 
 
 @frappe.whitelist()
-@_cache_payload
 @cache_source
 def get(
 	chart_name: str | None = None,
@@ -114,7 +46,10 @@ def get(
 	the datasets "Created" (counted on `creation`) and "Completed" (counted on `modified`
 	of ToDos whose `status` is "Closed"), zero-filled for periods without activity.
 	"""
-	chart = _resolve_chart(chart_name, chart)
+	if chart_name:
+		chart = frappe.get_doc("Dashboard Chart", chart_name)
+	else:
+		chart = frappe._dict(frappe.parse_json(chart) or {})
 
 	timespan = timespan or chart.timespan or DEFAULT_TIMESPAN
 	timegrain = time_interval or chart.time_interval or DEFAULT_TIME_INTERVAL
@@ -151,9 +86,29 @@ def _resolve_window(
 
 	For the timespan "Select Date Range" the bounds come from the given `from_date` and
 	`to_date`, falling back to the chart's own date fields. Every other timespan ends at
-	the current datetime and begins at the start of the period that contains it. The
-	lower bound is a date, the upper bound a datetime.
+	the current datetime and begins at the start of the time grain that contains the
+	from-date calculated for that timespan. The lower bound is a date, the upper bound a
+	datetime.
+
+	`timegrain` must be a key of `PERIOD_LENGTH_IN_DAYS` and `timespan` an option of the
+	Dashboard Chart field `timespan`, the lower bound must not be after the upper bound,
+	and the window must hold at most `MAX_PERIODS` periods of `timegrain`; anything else
+	raises `frappe.ValidationError` before a query runs.
 	"""
+	if timegrain not in PERIOD_LENGTH_IN_DAYS:
+		frappe.throw(
+			_("Time Interval must be one of: {0}").format(", ".join(PERIOD_LENGTH_IN_DAYS)),
+			title=_("Invalid Chart Window"),
+		)
+
+	timespans = frappe.get_meta("Dashboard Chart").get_field("timespan").options.split("\n")
+
+	if timespan not in timespans:
+		frappe.throw(
+			_("Timespan must be one of: {0}").format(", ".join(timespans)),
+			title=_("Invalid Chart Window"),
+		)
+
 	if timespan == "Select Date Range":
 		from_date = get_datetime(from_date) if from_date else get_datetime(chart.from_date)
 		to_date = get_datetime(to_date) if to_date else get_datetime(chart.to_date)
@@ -161,7 +116,27 @@ def _resolve_window(
 		to_date = now_datetime()
 		from_date = get_period_beginning(get_from_date_from_timespan(to_date, timespan), timegrain)
 
-	return getdate(from_date), get_datetime(to_date)
+	from_date, to_date = getdate(from_date), get_datetime(to_date)
+	last_day = getdate(to_date)
+
+	if from_date > last_day:
+		frappe.throw(
+			_("From Date {0} must not be after To Date {1}").format(from_date, last_day),
+			title=_("Invalid Chart Window"),
+		)
+
+	period_length = PERIOD_LENGTH_IN_DAYS[timegrain]
+	periods = ((last_day - from_date).days + period_length) // period_length
+
+	if periods > MAX_PERIODS:
+		frappe.throw(
+			_("A window of {0} {1} periods exceeds the limit of {2}").format(
+				periods, _(timegrain), MAX_PERIODS
+			),
+			title=_("Invalid Chart Window"),
+		)
+
+	return from_date, to_date
 
 
 def _count_by_period(
@@ -175,15 +150,29 @@ def _count_by_period(
 
 	`extra_filters` is added to the window filters on `datefield`. Both window bounds are
 	inclusive and the counts are scoped to the ToDos readable by the current user.
+
+	A window whose readable ToDos exceed `MAX_AGGREGATE_ROWS` raises
+	`frappe.ValidationError` before the grouped rows are fetched.
 	"""
+	filters = [
+		*extra_filters,
+		["ToDo", datefield, ">=", from_date.strftime("%Y-%m-%d")],
+		["ToDo", datefield, "<=", to_date],
+	]
+	readable_rows = frappe.get_list("ToDo", fields=[{"COUNT": "*"}], filters=filters, as_list=True)[0][0]
+
+	if readable_rows > MAX_AGGREGATE_ROWS:
+		frappe.throw(
+			_("The window holds {0} ToDos, more than the limit of {1}").format(
+				readable_rows, MAX_AGGREGATE_ROWS
+			),
+			title=_("Invalid Chart Window"),
+		)
+
 	rows = frappe.get_list(
 		"ToDo",
 		fields=[datefield, {"SUM": "1"}, {"COUNT": "*"}],
-		filters=[
-			*extra_filters,
-			["ToDo", datefield, ">=", from_date.strftime("%Y-%m-%d")],
-			["ToDo", datefield, "<=", to_date],
-		],
+		filters=filters,
 		group_by=datefield,
 		order_by=datefield,
 		as_list=True,
