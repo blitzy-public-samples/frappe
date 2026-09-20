@@ -22,6 +22,7 @@ CLOSED_CARD = "ToDo Total Closed"
 TREND_CHART = "ToDo Created vs Completed"
 TOP_OWNERS_CHART = "ToDo Top Owners"
 DESK_USER = "test2@example.com"
+READ_HTTP_METHODS = ("GET", "POST", "QUERY")
 
 
 class TestToDoAnalyticsDashboard(IntegrationTestCase):
@@ -110,6 +111,40 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 					msg=f"Chart source {chart_name} did not record last_synced_on",
 				)
 
+	def test_chart_sources_answer_only_for_their_own_chart(self):
+		"""Each source serves its own chart, refuses every other one and stamps nothing on a read."""
+		self._make_todo(status="Open", allocated_to="Administrator")
+
+		for source, own_chart, foreign_chart in (
+			(get_created_vs_completed, TREND_CHART, TOP_OWNERS_CHART),
+			(get_top_owners_chart, TOP_OWNERS_CHART, TREND_CHART),
+		):
+			with self.subTest(chart=own_chart):
+				for chart_name in (own_chart, foreign_chart):
+					frappe.db.set_value(
+						"Dashboard Chart", chart_name, "last_synced_on", None, update_modified=False
+					)
+
+				with self.assertRaises(frappe.DoesNotExistError):
+					source(chart_name=foreign_chart, refresh=1)
+
+				self.assertIsNone(
+					frappe.db.get_value("Dashboard Chart", foreign_chart, "last_synced_on"),
+					msg=f"{foreign_chart} was stamped by the source of {own_chart}",
+				)
+
+				self.assertIsNotNone(source(chart_name=own_chart))
+				self.assertIsNone(
+					frappe.db.get_value("Dashboard Chart", own_chart, "last_synced_on"),
+					msg=f"a plain read of {own_chart} recorded a write",
+				)
+
+				self.assertEqual(
+					frappe.allowed_http_methods_for_whitelisted_func[source],
+					READ_HTTP_METHODS,
+					msg=f"the source of {own_chart} accepts more than GET and POST",
+				)
+
 	def test_dashboard_loads_all_four_components(self):
 		"""The dashboard yields both cards and both charts, and every backing server call returns data."""
 		self._make_todo(status="Open", allocated_to="Administrator")
@@ -125,7 +160,13 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 			self.assertEqual(row.width, "Full", msg=f"Chart {row.chart} is not rendered at full width")
 
 		for source_name in (TREND_CHART, TOP_OWNERS_CHART):
-			self.assertTrue(get_config(source_name), msg=f"Chart source {source_name} ships no client config")
+			config = get_config(source_name)
+			self.assertTrue(config, msg=f"Chart source {source_name} ships no client config")
+			self.assertIn(
+				"filters: []",
+				config,
+				msg=f"Chart source {source_name} does not register an empty filter list",
+			)
 
 		trend = get_created_vs_completed(chart_name=TREND_CHART, no_cache=1)
 		self.assertIn("labels", trend)
@@ -172,3 +213,22 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 			self.assertEqual(
 				len(get_permitted_charts(DASHBOARD)), 2, msg=f"{DESK_USER} is not permitted both charts"
 			)
+
+	def test_chart_source_configs_are_permission_scoped(self):
+		"""The client configs load for a Desk user and are refused to a user without Desk access."""
+		self.addCleanup(self._set_user_type, DESK_USER, frappe.db.get_value("User", DESK_USER, "user_type"))
+
+		self._set_user_type(DESK_USER, "System User")
+		with self.set_user(DESK_USER):
+			self.assertNotIn("System Manager", frappe.get_roles(), msg=f"{DESK_USER} is a System Manager")
+			for source_name in (TREND_CHART, TOP_OWNERS_CHART):
+				self.assertTrue(
+					get_config(source_name),
+					msg=f"{DESK_USER} cannot load the client config of chart source {source_name}",
+				)
+
+		self._set_user_type(DESK_USER, "Website User")
+		with self.set_user(DESK_USER):
+			self.assertNotIn("Desk User", frappe.get_roles(), msg=f"{DESK_USER} still holds Desk access")
+			for source_name in (TREND_CHART, TOP_OWNERS_CHART):
+				self.assertRaises(frappe.PermissionError, get_config, source_name)

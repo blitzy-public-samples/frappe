@@ -7,16 +7,18 @@ from typing import Any
 import frappe
 from frappe import _
 from frappe.desk.doctype.dashboard_chart.dashboard_chart import get_result
-from frappe.utils import get_datetime, getdate, now_datetime
+from frappe.utils import cint, get_datetime, getdate, now_datetime
 from frappe.utils.dashboard import cache_source
 from frappe.utils.data import format_date
 from frappe.utils.dateutils import get_from_date_from_timespan, get_period, get_period_beginning
 
+SOURCE_NAME = "ToDo Created vs Completed"
 DEFAULT_TIMESPAN = "Last Week"
 DEFAULT_TIME_INTERVAL = "Daily"
 MAX_PERIODS = 10000
 DATE_STRING_LENGTH = 10
 WINDOW_FIELDS = ["timespan", "time_interval", "from_date", "to_date"]
+CHART_FIELDS = ["source", *WINDOW_FIELDS]
 PERIOD_LENGTH_IN_DAYS = {
 	"Daily": 1,
 	"Weekly": 7,
@@ -26,7 +28,7 @@ PERIOD_LENGTH_IN_DAYS = {
 }
 
 
-@frappe.whitelist()
+@frappe.whitelist(methods=["GET", "POST"])
 def get(
 	chart_name: str | None = None,
 	chart: str | dict[str, Any] | None = None,
@@ -47,9 +49,13 @@ def get(
 	`modified` of ToDos whose `status` is "Closed"), zero-filled for periods without
 	activity.
 
-	Both arguments are validated before any cached result is looked up: a `chart` payload
-	that is not a JSON object raises `frappe.ValidationError`, and so does a request that
-	names no chart at all while asking for the cached result.
+	Both arguments are validated before the chart is loaded: a `chart` payload that is not
+	a JSON object raises `frappe.ValidationError`, and so does a request that names no
+	chart at all while asking for the stored result. A `chart_name` that does not name a
+	Dashboard Chart whose `source` is this source raises `frappe.DoesNotExistError`, and
+	the named chart is neither read further nor stamped.
+
+	The method answers GET and POST; every other HTTP verb is refused by the framework.
 	"""
 	chart = _parse_chart(chart)
 
@@ -62,7 +68,7 @@ def get(
 	return _get_chart_data(
 		chart_name=chart_name,
 		chart=chart,
-		no_cache=no_cache,
+		no_cache=_skips_shared_cache(no_cache, refresh),
 		filters=filters,
 		from_date=from_date,
 		to_date=to_date,
@@ -88,8 +94,10 @@ def _get_chart_data(
 ) -> dict[str, Any]:
 	"""Return the two trend datasets for the window the given arguments resolve to.
 
-	`cache_source` serves and stores the result under the chart's own cache key unless
-	`no_cache` is set, and calls this function with `chart_name` but without `chart`.
+	`cache_source` computes this result for every request and records the chart's
+	`last_synced_on` for a request that asks for a refresh, on which path it calls this
+	function with `chart_name` but without `chart`. The stored chart data is never read
+	for this source.
 	"""
 	chart = _load_window_fields(chart_name, chart)
 
@@ -138,19 +146,30 @@ def _parse_chart(chart: str | dict[str, Any] | None) -> frappe._dict | None:
 	return frappe._dict(chart)
 
 
+def _skips_shared_cache(no_cache: bool | int | None, refresh: bool | int | None) -> bool:
+	"""Return whether `cache_source` must compute the result instead of reading it.
+
+	Every request of this source is computed: one that asks for a refresh is computed by
+	`cache_source` itself, and every other one is computed directly. The chart data stored
+	under the chart's cache key is therefore never served by this source.
+	"""
+	return bool(no_cache) or not cint(refresh)
+
+
 def _load_window_fields(chart_name: str | None, chart: dict[str, Any] | None) -> Any:
 	"""Return the window fields the request resolves its window from.
 
-	With `chart_name` the saved chart's `timespan`, `time_interval`, `from_date` and
-	`to_date` are read in one query; otherwise the given payload is returned as a dict. A
-	`chart_name` that names no Dashboard Chart raises `frappe.DoesNotExistError`.
+	With `chart_name` the saved chart's `source`, `timespan`, `time_interval`, `from_date`
+	and `to_date` are read in one query; otherwise the given payload is returned as a
+	dict. A `chart_name` that names no Dashboard Chart, or one whose `source` is not this
+	source, raises `frappe.DoesNotExistError`.
 	"""
 	if not chart_name:
 		return frappe._dict(chart or {})
 
-	window = frappe.db.get_value("Dashboard Chart", chart_name, WINDOW_FIELDS, as_dict=True)
+	window = frappe.db.get_value("Dashboard Chart", chart_name, CHART_FIELDS, as_dict=True)
 
-	if not window:
+	if not window or window.source != SOURCE_NAME:
 		frappe.throw(
 			_("Dashboard Chart {0} not found").format(chart_name),
 			frappe.DoesNotExistError,

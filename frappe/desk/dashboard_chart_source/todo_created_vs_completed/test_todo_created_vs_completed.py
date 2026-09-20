@@ -33,6 +33,16 @@ ABUSIVE_TO_DATE = "9999-12-31"
 WIDE_FROM_DATE = "2020-01-01"
 MALFORMED_DATES = ("not-a-date", "Invalid date", "13-45-2026")
 MALFORMED_PAYLOADS = ("{not json", "[1,2,3]", '"just a string"')
+FOREIGN_CHARTS = ("ToDo Top Owners", "Login", "Email Activity")
+UNKNOWN_CHART = "_Test No Such Dashboard Chart"
+READ_HTTP_METHODS = ("GET", "POST", "QUERY")
+POISONED_CHART_DATA = {
+	"labels": ["_Test Poisoned Label"],
+	"datasets": [
+		{"name": "Created", "values": [4242]},
+		{"name": "Completed", "values": [4242]},
+	],
+}
 
 
 class TestToDoCreatedVsCompleted(IntegrationTestCase):
@@ -351,3 +361,65 @@ class TestToDoCreatedVsCompleted(IntegrationTestCase):
 			)
 
 		self.assertGreater(MAX_PERIODS, (getdate(NOW) - getdate(WIDE_FROM_DATE)).days + 1)
+
+	def test_rejects_a_chart_that_is_not_bound_to_this_source(self):
+		"""Only a chart whose `source` is this source is served, and no other chart is stamped."""
+		self._make_todo("2026-03-17 12:00:00")
+
+		self.assertEqual(frappe.db.get_value("Dashboard Chart", CHART_NAME, "source"), CHART_NAME)
+
+		foreign_charts = [name for name in FOREIGN_CHARTS if frappe.db.exists("Dashboard Chart", name)]
+
+		self.assertIn(FOREIGN_CHARTS[0], foreign_charts)
+
+		for chart_name in [*foreign_charts, UNKNOWN_CHART]:
+			with self.subTest(chart=chart_name):
+				stamp = frappe.db.get_value("Dashboard Chart", chart_name, "last_synced_on")
+
+				for kwargs in ({}, {"refresh": 1}, {"no_cache": 1}):
+					with self.subTest(arguments=kwargs), self.assertRaises(frappe.DoesNotExistError):
+						get(chart_name=chart_name, **kwargs)
+
+				self.assertEqual(
+					frappe.db.get_value("Dashboard Chart", chart_name, "last_synced_on"),
+					stamp,
+					msg=f"Dashboard Chart {chart_name} was stamped by a request this source refused",
+				)
+
+		self.assertEqual(sum(self._series(self._get_chart())[0]), 1)
+
+	def test_answers_only_read_http_methods(self):
+		"""The method is whitelisted for GET and POST alone, so PUT and DELETE never reach it."""
+		self.assertIn(get, frappe.whitelisted)
+		self.assertEqual(frappe.allowed_http_methods_for_whitelisted_func[get], READ_HTTP_METHODS)
+
+	def test_never_serves_the_stored_chart_data(self):
+		"""Chart data left under the chart's cache key is ignored, and a plain read stamps nothing."""
+		self._make_todo("2026-03-17 12:00:00")
+
+		frappe.cache.set_value(CHART_CACHE_KEY, POISONED_CHART_DATA)
+		self.addCleanup(frappe.cache.delete_keys, CHART_CACHE_KEY)
+		frappe.db.set_value("Dashboard Chart", CHART_NAME, "last_synced_on", None, update_modified=False)
+
+		with self.freeze_time(NOW):
+			plain_read = get(chart_name=CHART_NAME)
+
+		self.assertIsNone(
+			frappe.db.get_value("Dashboard Chart", CHART_NAME, "last_synced_on"),
+			msg="a plain read recorded last_synced_on",
+		)
+
+		with self.freeze_time(NOW):
+			refreshed = get(chart_name=CHART_NAME, refresh=1)
+
+		self.assertIsNotNone(frappe.db.get_value("Dashboard Chart", CHART_NAME, "last_synced_on"))
+
+		for result in (plain_read, refreshed):
+			created, completed = self._series(result)
+
+			self.assertNotEqual(result, POISONED_CHART_DATA)
+			self.assertEqual(len(result["labels"]), DAILY_BUCKETS)
+			self.assertEqual(created, [0, 0, 0, 0, 0, 0, 1, 0])
+			self.assertEqual(completed, [0] * DAILY_BUCKETS)
+
+		self.assertEqual(frappe.cache.get_value(CHART_CACHE_KEY), POISONED_CHART_DATA)
