@@ -376,15 +376,18 @@ export default class NumberCardWidget extends Widget {
 
 	set_card_actions(actions) {
 		this.card_actions = $(`<div class="card-actions dropdown pull-right">
-				<a data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+				<a data-toggle="dropdown" role="button" tabindex="0"
+					aria-haspopup="true" aria-expanded="false"
+					aria-label="${__("Card Actions")}" title="${__("Card Actions")}">
 				...
 				</a>
-				<ul class="dropdown-menu" style="max-height: 300px; overflow-y: auto;">
+				<ul class="dropdown-menu" role="menu" style="max-height: 300px; overflow-y: auto;">
 					${actions
 						.map(
 							(action) =>
-								`<li class="dropdown-item">
-									<a data-action="${action.action}">${action.label}</a>
+								`<li role="none">
+									<a class="dropdown-item" role="menuitem" tabindex="-1"
+										data-action="${action.action}">${action.label}</a>
 								</li>`
 						)
 						.join("")}
@@ -395,6 +398,8 @@ export default class NumberCardWidget extends Widget {
 			const action = o.dataset.action;
 			$(o).click(actions.find((a) => a.action === action));
 		});
+
+		frappe.dashboard_utils.make_dropdown_keyboard_operable(this.card_actions);
 
 		this.action_area.html(this.card_actions);
 	}

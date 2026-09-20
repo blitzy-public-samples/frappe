@@ -8,12 +8,12 @@ from werkzeug.test import EnvironBuilder
 from werkzeug.wrappers import Request
 
 import frappe
-from frappe.auth import LoginAttemptTracker
+from frappe.auth import HTTPRequest, LoginAttemptTracker, get_hostname
 from frappe.frappeclient import AuthError, FrappeClient
 from frappe.sessions import Session, get_expired_sessions, get_expiry_in_seconds
 from frappe.tests import IntegrationTestCase, UnitTestCase
 from frappe.tests.test_api import FrappeAPITestCase
-from frappe.utils import get_datetime, get_site_url, now
+from frappe.utils import get_datetime, get_site_url, now, set_request
 from frappe.utils.data import add_to_date
 from frappe.www.login import _generate_temporary_login_link
 
@@ -302,3 +302,182 @@ class TestSessionExpiry(FrappeAPITestCase):
 		frappe.local.response["session_expired"] = 1
 		with self.assertRaises(frappe.PermissionError):
 			frappe.is_whitelisted(not_whitelisted)
+
+
+class TestCSRFTokenValidation(IntegrationTestCase):
+	"""Cover `HTTPRequest.validate_csrf_token` for sessions that hold a CSRF token and for sessions
+	that do not, such as a cookie session created by `POST /api/method/login`."""
+
+	SITE_HOST = "csrf-host.example"
+	SITE_ORIGIN = f"http://{SITE_HOST}"
+	FOREIGN_ORIGIN = "http://evil.example.com"
+	SESSION_TOKEN = "a-stored-session-csrf-token"
+
+	def setUp(self):
+		self.addCleanup(
+			self.restore_request_context,
+			getattr(frappe.local, "request", None),
+			getattr(frappe.local, "session", None),
+			getattr(frappe.local, "form_dict", None),
+		)
+		for key in ("ignore_csrf", "allow_cors", "allowed_referrers"):
+			self.addCleanup(self.restore_conf, key, frappe.conf.get(key))
+		self.addCleanup(frappe.cache.delete_value, "allowed_referrers")
+		self.addCleanup(frappe.clear_messages)
+		self.addCleanup(frappe.flags.pop, "disable_traceback", None)
+
+		frappe.conf.ignore_csrf = None
+		frappe.conf.allow_cors = None
+		frappe.conf.allowed_referrers = []
+		frappe.cache.delete_value("allowed_referrers")
+
+	@staticmethod
+	def restore_request_context(request, session, form_dict):
+		frappe.local.request = request
+		frappe.local.session = session
+		frappe.local.form_dict = form_dict
+
+	@staticmethod
+	def restore_conf(key, value):
+		if value is None:
+			frappe.conf.pop(key, None)
+		else:
+			frappe.conf[key] = value
+
+	def validate(
+		self,
+		*,
+		method: str = "POST",
+		headers: dict | None = None,
+		session_token: str | None = None,
+		user: str = "Administrator",
+		sid_cookie: bool = True,
+		form_dict: dict | None = None,
+	) -> None:
+		"""Run `validate_csrf_token` against a synthesised request, session and form dict."""
+		request_headers = dict(headers or {})
+		if sid_cookie:
+			request_headers.setdefault("Cookie", "sid=a-session-id")
+
+		set_request(
+			path="/api/resource/ToDo",
+			base_url=self.SITE_ORIGIN,
+			method=method,
+			headers=request_headers,
+		)
+		frappe.local.session = frappe._dict(user=user, data=frappe._dict(csrf_token=session_token))
+		frappe.local.form_dict = frappe._dict(form_dict or {})
+
+		HTTPRequest.validate_csrf_token(HTTPRequest.__new__(HTTPRequest))
+
+	def assertRejected(self, **kwargs) -> None:
+		with self.assertRaises(frappe.CSRFTokenError):
+			self.validate(**kwargs)
+
+	def test_cross_site_origin_rejected_when_session_has_no_token(self):
+		self.assertRejected(headers={"Origin": self.FOREIGN_ORIGIN})
+
+	def test_every_unsafe_method_rejected_cross_site_when_session_has_no_token(self):
+		for method in ("POST", "PUT", "DELETE", "PATCH"):
+			with self.subTest(method=method):
+				self.assertRejected(method=method, headers={"Origin": self.FOREIGN_ORIGIN})
+
+	def test_cross_site_fetch_metadata_rejected_when_session_has_no_token(self):
+		for fetch_site in ("cross-site", "same-site"):
+			with self.subTest(fetch_site=fetch_site):
+				self.assertRejected(headers={"Sec-Fetch-Site": fetch_site})
+
+	def test_foreign_referrer_rejected_when_session_has_no_token(self):
+		self.assertRejected(headers={"Referer": f"{self.FOREIGN_ORIGIN}/attack.html"})
+
+	def test_opaque_origin_rejected_when_session_has_no_token(self):
+		self.assertRejected(headers={"Origin": "null"})
+
+	def test_same_origin_request_allowed_when_session_has_no_token(self):
+		self.validate(headers={"Origin": self.SITE_ORIGIN})
+		self.validate(headers={"Origin": self.SITE_ORIGIN, "Sec-Fetch-Site": "same-origin"})
+		self.validate(headers={"Referer": f"{self.SITE_ORIGIN}/desk/todo"})
+		self.validate(headers={"Sec-Fetch-Site": "none"})
+
+	def test_configured_host_name_counts_as_same_origin(self):
+		self.addCleanup(self.restore_conf, "host_name", frappe.conf.get("host_name"))
+		frappe.conf.host_name = "https://portal.example.com"
+
+		self.validate(headers={"Origin": "https://portal.example.com"})
+		self.assertRejected(headers={"Origin": "https://portal.example.net"})
+
+	def test_request_without_browser_origin_allowed_when_session_has_no_token(self):
+		"""A non-browser client, such as `FrappeClient`, sends no origin, referrer or fetch metadata."""
+		self.validate()
+
+	def test_guest_session_allowed_when_session_has_no_token(self):
+		self.validate(user="Guest", headers={"Origin": self.FOREIGN_ORIGIN})
+
+	def test_request_without_session_cookie_allowed_when_session_has_no_token(self):
+		self.validate(sid_cookie=False, headers={"Origin": self.FOREIGN_ORIGIN})
+
+	def test_allowed_referrers_conf_allows_cross_site_request_without_token(self):
+		frappe.conf.allowed_referrers = [self.FOREIGN_ORIGIN]
+		frappe.cache.delete_value("allowed_referrers")
+
+		self.validate(headers={"Origin": self.FOREIGN_ORIGIN})
+		self.validate(headers={"Referer": f"{self.FOREIGN_ORIGIN}/embedded.html"})
+
+	def test_allow_cors_conf_allows_cross_site_request_without_token(self):
+		for allow_cors in (self.FOREIGN_ORIGIN, [self.FOREIGN_ORIGIN, "http://other.example"], "*"):
+			with self.subTest(allow_cors=allow_cors):
+				frappe.conf.allow_cors = allow_cors
+				self.validate(headers={"Origin": self.FOREIGN_ORIGIN})
+
+		frappe.conf.allow_cors = ["http://other.example"]
+		self.assertRejected(headers={"Origin": self.FOREIGN_ORIGIN})
+
+	def test_safe_methods_are_never_validated(self):
+		for method in ("GET", "HEAD", "OPTIONS", "QUERY"):
+			with self.subTest(method=method):
+				self.validate(method=method, headers={"Origin": self.FOREIGN_ORIGIN})
+				self.validate(
+					method=method,
+					headers={"Origin": self.FOREIGN_ORIGIN},
+					session_token=self.SESSION_TOKEN,
+				)
+
+	def test_ignore_csrf_conf_skips_validation(self):
+		frappe.conf.ignore_csrf = 1
+
+		self.validate(headers={"Origin": self.FOREIGN_ORIGIN})
+		self.validate(headers={"Origin": self.FOREIGN_ORIGIN}, session_token=self.SESSION_TOKEN)
+
+	def test_session_with_token_requires_a_matching_token(self):
+		self.assertRejected(session_token=self.SESSION_TOKEN)
+		self.assertRejected(session_token=self.SESSION_TOKEN, headers={"Origin": self.SITE_ORIGIN})
+		self.assertRejected(
+			session_token=self.SESSION_TOKEN, headers={"X-Frappe-CSRF-Token": "a-wrong-token"}
+		)
+
+	def test_session_with_token_accepts_a_matching_token(self):
+		self.validate(
+			session_token=self.SESSION_TOKEN,
+			headers={"X-Frappe-CSRF-Token": self.SESSION_TOKEN, "Origin": self.FOREIGN_ORIGIN},
+		)
+
+		self.validate(session_token=self.SESSION_TOKEN, form_dict={"csrf_token": self.SESSION_TOKEN})
+		self.assertNotIn("csrf_token", frappe.local.form_dict)
+
+	def test_supplied_token_is_removed_from_the_form_dict(self):
+		self.validate(form_dict={"csrf_token": "a-token-for-a-token-less-session"})
+		self.assertNotIn("csrf_token", frappe.local.form_dict)
+
+
+class TestHostname(UnitTestCase):
+	def test_get_hostname_normalizes_urls_origins_and_hosts(self):
+		self.assertEqual(get_hostname("http://example.com/desk/todo"), "example.com")
+		self.assertEqual(get_hostname("https://Example.COM"), "example.com")
+		self.assertEqual(get_hostname("https://www.example.com:8000"), "example.com")
+		self.assertEqual(get_hostname("example.com:8000"), "example.com")
+		self.assertEqual(get_hostname("null"), "null")
+
+	def test_get_hostname_returns_empty_string_for_unusable_input(self):
+		self.assertEqual(get_hostname(""), "")
+		self.assertEqual(get_hostname(None), "")
+		self.assertEqual(get_hostname("http://["), "")

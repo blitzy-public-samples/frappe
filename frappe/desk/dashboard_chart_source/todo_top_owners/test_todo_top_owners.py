@@ -10,7 +10,6 @@ from frappe.desk.dashboard_chart_source.todo_top_owners.todo_top_owners import (
 	get_top_owners,
 )
 from frappe.tests import IntegrationTestCase
-from frappe.utils import escape_html
 
 EXTRA_TEST_RECORD_DEPENDENCIES = ["User"]
 
@@ -21,12 +20,28 @@ UNNAMED_CHART_CACHE_KEY = "chart-data:None"
 DATASET_NAME = "Open ToDos"
 UNKNOWN_USER = "ghost@example.com"
 MARKUP_USER = "<img src=x onerror=window.__xss2=1>@example.com"
+MARKUP_USER_LABEL = "@example.com"
 
-MARKUP_FULL_NAMES = [
-	"<img src=x onerror=window.__xss=1>",
-	'"><svg onload=window.__xss3=1>',
-	"<script>window.__xss4=1</script>",
-]
+HTML_ENTITIES = ("&apos;", "&amp;", "&quot;", "&lt;", "&gt;")
+
+# Markup full names mapped to the label of each. An empty label marks a full name that is markup
+# alone, for which the label is the user id.
+MARKUP_FULL_NAMES = {
+	"<img src=x onerror=window.__xss=1>": "",
+	'"><svg onload=window.__xss3=1>': '"',
+	"<script>window.__xss4=1</script>": "window.__xss4=1",
+	"A < B > C": "A  C",
+}
+
+# Owners paired with a full name carrying an apostrophe, an ampersand and a double quote. The
+# apostrophe pair is the full name the User test records ship, and is read rather than written.
+APOSTROPHE_OWNER = "test'5@example.com"
+APOSTROPHE_FULL_NAME = "_Test'5"
+VERBATIM_FULL_NAMES = (
+	(APOSTROPHE_OWNER, APOSTROPHE_FULL_NAME),
+	("test1@example.com", "Smith & Sons"),
+	("test2@example.com", '"Bobby" Tables'),
+)
 
 FIVE_OWNERS = [
 	"test1@example.com",
@@ -35,8 +50,9 @@ FIVE_OWNERS = [
 	"test4@example.com",
 	"testperm@example.com",
 ]
-OWNER_LOOKUP_WARM_QUERY_LIMIT = 2
-CACHED_OWNER_LABEL_QUERY_LIMIT = 0
+TOP_OWNERS_QUERY_LIMIT = 2
+OWNER_LABELS_QUERY_LIMIT = 1
+NO_OWNER_LABELS_QUERY_LIMIT = 0
 FOREIGN_CHARTS = ("ToDo Created vs Completed", "Login", "Email Activity")
 UNKNOWN_CHART = "_Test No Such Dashboard Chart"
 READ_HTTP_METHODS = ("GET", "POST", "QUERY")
@@ -77,7 +93,8 @@ class TestToDoTopOwners(IntegrationTestCase):
 		return frappe.db.get_value("User", user, "full_name")
 
 	def _label(self, user):
-		return escape_html(self._full_name(user))
+		"""Return the label expected for `user`: its stored full name, which no fixture marks up."""
+		return self._full_name(user)
 
 	def _set_full_name(self, user, full_name):
 		frappe.db.set_value("User", user, "full_name", full_name)
@@ -165,40 +182,73 @@ class TestToDoTopOwners(IntegrationTestCase):
 		self.assertEqual(result["labels"], [self._label(owner)])
 		self.assertEqual(result["datasets"][0]["values"], [1])
 
+		self.assertEqual(self._full_name(APOSTROPHE_OWNER), APOSTROPHE_FULL_NAME)
+
+		for verbatim_owner, full_name in VERBATIM_FULL_NAMES:
+			with self.subTest(full_name=full_name):
+				stored = self._full_name(verbatim_owner)
+
+				if stored != full_name:
+					self.addCleanup(self._set_full_name, verbatim_owner, stored)
+					self._set_full_name(verbatim_owner, full_name)
+
+				frappe.db.delete("ToDo")
+				self._seed(verbatim_owner)
+
+				verbatim_result = self._chart()
+
+				self.assertEqual(verbatim_result["labels"], [full_name])
+				self.assertEqual(verbatim_result["datasets"][0]["values"], [1])
+				self.assertEqual([row.label for row in get_top_owners()], [full_name])
+				self.assertEqual(_owner_label(verbatim_owner), full_name)
+				self.assertEqual(_owner_labels([verbatim_owner]), {verbatim_owner: full_name})
+
+				payload = frappe.as_json(verbatim_result)
+
+				for entity in HTML_ENTITIES:
+					self.assertNotIn(entity, payload)
+
 	def test_label_falls_back_to_user_id(self):
 		self.assertFalse(frappe.db.exists("User", UNKNOWN_USER))
 		self.assertEqual(_owner_label(UNKNOWN_USER), UNKNOWN_USER)
 
-	def test_labels_escape_markup_in_full_name(self):
+	def test_labels_remove_markup_from_full_name(self):
 		owner = "test4@example.com"
 		self._seed(owner)
 		self.addCleanup(self._set_full_name, owner, self._full_name(owner))
 
-		for full_name in MARKUP_FULL_NAMES:
+		for full_name, plain_name in MARKUP_FULL_NAMES.items():
 			with self.subTest(full_name=full_name):
 				self._set_full_name(owner, full_name)
 
-				escaped = escape_html(full_name)
+				label = plain_name or owner
 				result = self._chart()
 
-				self.assertNotEqual(escaped, full_name)
-				self.assertNotIn("<", escaped)
-				self.assertNotIn(">", escaped)
-				self.assertEqual(result["labels"], [escaped])
-				self.assertEqual(result["datasets"][0]["values"], [1])
-				self.assertEqual([row.label for row in get_top_owners()], [escaped])
-				self.assertEqual(_owner_label(owner), escaped)
-				self.assertEqual(_owner_labels([owner]), {owner: escaped})
+				self.assertNotEqual(label, full_name)
+				self.assertNotIn("<", label)
+				self.assertNotIn(">", label)
 
-	def test_label_escapes_markup_in_user_id_fallback(self):
+				for entity in HTML_ENTITIES:
+					self.assertNotIn(entity, label)
+
+				self.assertEqual(result["labels"], [label])
+				self.assertEqual(result["datasets"][0]["values"], [1])
+				self.assertEqual([row.label for row in get_top_owners()], [label])
+				self.assertEqual(_owner_label(owner), label)
+				self.assertEqual(_owner_labels([owner]), {owner: label})
+
+	def test_label_removes_markup_from_user_id_fallback(self):
 		self.assertFalse(frappe.db.exists("User", MARKUP_USER))
 
 		label = _owner_label(MARKUP_USER)
 
-		self.assertEqual(label, escape_html(MARKUP_USER))
+		self.assertEqual(label, MARKUP_USER_LABEL)
 		self.assertNotEqual(label, MARKUP_USER)
 		self.assertNotIn("<", label)
 		self.assertNotIn(">", label)
+
+		for entity in HTML_ENTITIES:
+			self.assertNotIn(entity, label)
 
 	def test_unidentifiable_chart_raises_client_error(self):
 		self._seed("test1@example.com")
@@ -236,46 +286,44 @@ class TestToDoTopOwners(IntegrationTestCase):
 		self.assertEqual(get(chart={"timespan": "Last Week"}, refresh=1), expected)
 		self.assertEqual(get(chart_name=CHART_NAME, refresh=1), expected)
 
-	def test_owner_labels_load_one_user_document_per_distinct_owner(self):
+	def test_owner_labels_load_every_name_in_one_query(self):
 		for owner in FIVE_OWNERS:
 			self._seed(owner)
 
 		self.assertEqual([row.name for row in get_top_owners()], FIVE_OWNERS)
 
-		user_document_queries = 1 + len(frappe.get_meta("User").get_table_fields())
-		owner_lookup_query_limit = 1 + TOP_N * user_document_queries
+		expected_labels = [self._label(owner) for owner in FIVE_OWNERS]
 
 		self._clear_user_document_cache()
 
-		with self.assertQueryCount(owner_lookup_query_limit):
+		with self.assertQueryCount(TOP_OWNERS_QUERY_LIMIT):
 			cold_rows = get_top_owners()
 
-		with self.assertQueryCount(OWNER_LOOKUP_WARM_QUERY_LIMIT):
+		with self.assertQueryCount(TOP_OWNERS_QUERY_LIMIT):
 			warm_rows = get_top_owners()
-
-		expected_labels = [self._label(owner) for owner in FIVE_OWNERS]
 
 		for rows in (cold_rows, warm_rows):
 			self.assertEqual([row.name for row in rows], FIVE_OWNERS)
 			self.assertEqual([row.label for row in rows], expected_labels)
 
-		with self.assertQueryCount(CACHED_OWNER_LABEL_QUERY_LIMIT):
-			cached_labels = _owner_labels(FIVE_OWNERS)
-
-		self.assertEqual([cached_labels[owner] for owner in FIVE_OWNERS], expected_labels)
-
 		self._clear_user_document_cache()
 
-		with self.assertQueryCount(TOP_N * user_document_queries):
+		with self.assertQueryCount(OWNER_LABELS_QUERY_LIMIT):
+			cold_labels = _owner_labels(FIVE_OWNERS)
+
+		with self.assertQueryCount(OWNER_LABELS_QUERY_LIMIT):
 			repeated_labels = _owner_labels([*FIVE_OWNERS, *FIVE_OWNERS])
 
-		self.assertEqual([repeated_labels[owner] for owner in FIVE_OWNERS], expected_labels)
+		for labels in (cold_labels, repeated_labels):
+			self.assertEqual([labels[owner] for owner in FIVE_OWNERS], expected_labels)
 
-		labels = _owner_labels([*FIVE_OWNERS, UNKNOWN_USER])
+		with self.assertQueryCount(NO_OWNER_LABELS_QUERY_LIMIT):
+			self.assertEqual(_owner_labels([]), {})
 
-		self.assertEqual(labels[UNKNOWN_USER], UNKNOWN_USER)
-		self.assertEqual([labels[owner] for owner in FIVE_OWNERS], expected_labels)
-		self.assertEqual(_owner_labels([]), {})
+		unknown_labels = _owner_labels([*FIVE_OWNERS, UNKNOWN_USER])
+
+		self.assertEqual(unknown_labels[UNKNOWN_USER], UNKNOWN_USER)
+		self.assertEqual([unknown_labels[owner] for owner in FIVE_OWNERS], expected_labels)
 
 	def test_rejects_a_chart_that_is_not_bound_to_this_source(self):
 		"""Only a chart whose `source` is this source is served, and no other chart is stamped."""

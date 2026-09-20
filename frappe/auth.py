@@ -30,6 +30,26 @@ UNSAFE_HTTP_METHODS = frozenset(("POST", "PUT", "DELETE", "PATCH"))
 assert SAFE_HTTP_METHODS.isdisjoint(UNSAFE_HTTP_METHODS), "a HTTP method cannot be both safe and unsafe"
 MAX_PASSWORD_SIZE = 512
 
+# `Sec-Fetch-Site` values that report an initiator which is not another site.
+SAME_SITE_FETCH_SITES = frozenset(("same-origin", "none"))
+
+
+def get_hostname(url: str | None) -> str:
+	"""Return the lower-cased host of `url` without a leading `www.`, or an empty string.
+
+	Accepts an absolute URL (`https://example.com/x`), an origin (`https://example.com`) and a
+	bare host with an optional port (`example.com:8000`).
+	"""
+	if not url:
+		return ""
+
+	try:
+		hostname = urlparse(url if "//" in url else f"//{url}").hostname or ""
+	except ValueError:
+		return ""
+
+	return hostname.lower().removeprefix("www.")
+
 
 class HTTPRequest:
 	def __init__(self):
@@ -85,13 +105,17 @@ class HTTPRequest:
 			or frappe.request.method not in UNSAFE_HTTP_METHODS
 			or frappe.conf.ignore_csrf
 			or not frappe.session
-			or not (saved_token := frappe.session.data.csrf_token)
-			or (
-				(frappe.get_request_header("X-Frappe-CSRF-Token") or frappe.form_dict.pop("csrf_token", None))
-				== saved_token
-			)
-			or self.is_allowed_referrer()
 		):
+			return
+
+		supplied_token = frappe.get_request_header("X-Frappe-CSRF-Token") or frappe.form_dict.pop(
+			"csrf_token", None
+		)
+
+		if saved_token := frappe.session.data.csrf_token:
+			if supplied_token == saved_token or self.is_allowed_referrer():
+				return
+		elif self.is_allowed_without_csrf_token():
 			return
 
 		frappe.flags.disable_traceback = True
@@ -99,6 +123,67 @@ class HTTPRequest:
 
 	def set_lang(self):
 		frappe.local.lang = get_language()
+
+	def is_allowed_without_csrf_token(self) -> bool:
+		"""Return whether an unsafe request whose session holds no CSRF token may proceed.
+
+		It may proceed when the session is not an ambient cookie session of a logged-in user, when
+		no request header reports a cross-site initiator, or when the referrer or origin is
+		allow-listed through the `allowed_referrers` or `allow_cors` site configuration.
+		"""
+		if frappe.session.user == "Guest" or not frappe.request.cookies.get("sid"):
+			return True
+
+		return self.is_same_site_request() or self.is_allowed_referrer() or self.is_allowed_cors_origin()
+
+	def is_same_site_request(self) -> bool:
+		"""Return whether no request header reports an initiator outside this site.
+
+		`Sec-Fetch-Site` is read first, then `Origin`, then `Referer`. A request that carries none
+		of them - a non-browser client - is reported as same-site.
+		"""
+		fetch_site = frappe.get_request_header("Sec-Fetch-Site")
+		if fetch_site and fetch_site not in SAME_SITE_FETCH_SITES:
+			return False
+
+		for header in ("Origin", "Referer"):
+			if value := frappe.get_request_header(header):
+				return get_hostname(value) in self.site_hostnames
+
+		return True
+
+	@property
+	def site_hostnames(self) -> set[str]:
+		"""Return the non-empty hosts this site answers on: request host, site name, `host_name`."""
+		if getattr(self, "_site_hostnames", None) is None:
+			self._site_hostnames = {
+				hostname
+				for candidate in (
+					frappe.request.host,
+					frappe.local.site,
+					frappe.local.conf.host_name,
+					frappe.local.conf.hostname,
+				)
+				if (hostname := get_hostname(candidate))
+			}
+
+		return self._site_hostnames
+
+	def is_allowed_cors_origin(self) -> bool:
+		"""Return whether the request `Origin` is permitted by the site's `allow_cors` setting."""
+		if not (origin := frappe.get_request_header("Origin")):
+			return False
+
+		if not (allowed_origins := frappe.conf.allow_cors):
+			return False
+
+		if allowed_origins == "*":
+			return True
+
+		if not isinstance(allowed_origins, list):
+			allowed_origins = [allowed_origins]
+
+		return origin in allowed_origins
 
 	def is_allowed_referrer(self):
 		referrer = frappe.get_request_header("Referer")

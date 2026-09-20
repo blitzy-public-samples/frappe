@@ -593,6 +593,101 @@ def after_request(*args, **kwargs):
 	_test_REQ_HOOK["after_request"] = time()
 
 
+class TestCSRFProtection(FrappeAPITestCase):
+	"""Exercise CSRF enforcement for a cookie session that has never rendered an HTML page, which is
+	the session `POST /api/method/login` creates and which therefore holds no CSRF token."""
+
+	FOREIGN_ORIGIN = "http://evil.example.com"
+	PROBE_DESCRIPTION = "csrf protection probe"
+
+	def setUp(self):
+		self.todo = frappe.get_doc(doctype="ToDo", description=self.PROBE_DESCRIPTION).insert()
+		frappe.db.commit()
+		self.addCleanup(self.delete_todo, self.todo.name)
+
+	@staticmethod
+	def delete_todo(name: str) -> None:
+		frappe.db.rollback()
+		frappe.delete_doc_if_exists("ToDo", name, force=True)
+		frappe.db.commit()
+
+	@cached_property
+	def cookie_client(self):
+		"""A client that keeps no cookie jar, so every request carries only the cookies it is given."""
+		return get_test_client(use_cookies=False)
+
+	def cookie_request(self, method: str, path: str, data: dict, headers: dict | None = None):
+		return make_request(
+			target=getattr(self.cookie_client, method),
+			args=(path,),
+			kwargs={"json": data, "headers": {"Cookie": f"sid={self.sid}", **(headers or {})}},
+		)
+
+	def stored_description(self) -> str:
+		frappe.db.rollback()
+		return frappe.db.get_value("ToDo", self.todo.name, "description")
+
+	def test_cross_origin_request_without_csrf_token_is_rejected(self):
+		response = self.cookie_request(
+			"put",
+			self.resource("ToDo", self.todo.name),
+			{"description": "forged from another site"},
+			{"Origin": self.FOREIGN_ORIGIN},
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json.get("exc_type"), "CSRFTokenError")
+		self.assertEqual(self.stored_description(), self.PROBE_DESCRIPTION)
+
+	def test_cross_origin_document_creation_without_csrf_token_is_rejected(self):
+		description = "created from another site"
+		response = self.cookie_request(
+			"post",
+			self.resource("ToDo"),
+			{"description": description},
+			{"Origin": self.FOREIGN_ORIGIN},
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json.get("exc_type"), "CSRFTokenError")
+		frappe.db.rollback()
+		self.assertFalse(frappe.db.exists("ToDo", {"description": description}))
+
+	def test_same_origin_request_without_csrf_token_is_accepted(self):
+		description = "updated from the site itself"
+		response = self.cookie_request(
+			"put",
+			self.resource("ToDo", self.todo.name),
+			{"description": description},
+			{"Origin": get_url(), "Sec-Fetch-Site": "same-origin"},
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(self.stored_description(), description)
+
+	def test_request_without_browser_origin_is_accepted(self):
+		description = "updated by a non-browser client"
+		response = self.cookie_request(
+			"put", self.resource("ToDo", self.todo.name), {"description": description}
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(self.stored_description(), description)
+
+	def test_login_is_not_blocked_for_a_cross_origin_request(self):
+		response = make_request(
+			target=self.cookie_client.post,
+			args=(self.method("login"),),
+			kwargs={
+				"json": {"usr": "csrf-probe-no-such-user@example.com", "pwd": "an-invalid-password"},
+				"headers": {"Origin": self.FOREIGN_ORIGIN},
+			},
+		)
+
+		self.assertNotEqual(response.json.get("exc_type"), "CSRFTokenError")
+		self.assertEqual(response.status_code, 401)
+
+
 class TestAPIResponse(FrappeAPITestCase):
 	def test_generate_pdf_v1(self):
 		response = self.get(

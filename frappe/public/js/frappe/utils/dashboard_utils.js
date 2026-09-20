@@ -13,21 +13,21 @@ frappe.dashboard_utils = {
 			}
 
 			let chart_filter_html = `<div class="${button_class} ${filter_class} btn-group dropdown pull-right">
-					<a data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
-						<button class="btn btn-secondary btn-xs">
-							${icon_html}
-							<span class="filter-label">${__(filter.label)}</span>
-							${frappe.utils.icon("chevrons-up-down", "xs")}
-						</button>
-				</a>`;
+					<button class="btn btn-secondary btn-xs" data-toggle="dropdown"
+						aria-haspopup="true" aria-expanded="false"
+						style="border-radius: var(--radius);">
+						${icon_html}
+						<span class="filter-label">${__(filter.label)}</span>
+						${frappe.utils.icon("chevrons-up-down", "xs")}
+					</button>`;
 			let options_html;
 
 			if (filter.fieldnames) {
 				options_html = filter.options
 					.map(
 						(option, i) =>
-							`<li>
-						<a class="dropdown-item" data-fieldname="${
+							`<li role="none">
+						<a class="dropdown-item" role="menuitem" tabindex="-1" data-fieldname="${
 							filter.fieldnames[i]
 						}" data-option="${encodeURIComponent(option)}">${__(option)}</a>
 					</li>`
@@ -37,15 +37,15 @@ frappe.dashboard_utils = {
 				options_html = filter.options
 					.map(
 						(option) =>
-							`<li><a class="dropdown-item" data-option="${encodeURIComponent(
-								option
-							)}">${__(option)}</a></li>`
+							`<li role="none"><a class="dropdown-item" role="menuitem" tabindex="-1"
+								data-option="${encodeURIComponent(option)}">${__(option)}</a></li>`
 					)
 					.join("");
 			}
 
 			let dropdown_html =
-				chart_filter_html + `<ul class="dropdown-menu">${options_html}</ul></div>`;
+				chart_filter_html +
+				`<ul class="dropdown-menu" role="menu">${options_html}</ul></div>`;
 			let $chart_filter = $(dropdown_html);
 
 			if (append) {
@@ -63,6 +63,35 @@ frappe.dashboard_utils = {
 				$el.parents(`.${button_class}`).find(".filter-label").html(__(selected_item));
 				filter.action(selected_item, fieldname);
 			});
+
+			this.make_dropdown_keyboard_operable($chart_filter);
+		});
+	},
+
+	// Activates dropdown items on Enter or Space and moves focus back to the toggle afterwards,
+	// for triggers and items that are anchors rather than buttons.
+	make_dropdown_keyboard_operable($dropdown) {
+		const is_activation_key = (event) => [" ", "Enter"].includes(event.key);
+		const $toggle = $dropdown.find('[data-toggle="dropdown"]');
+
+		$toggle.not("button, input").on("keydown", (e) => {
+			if (!is_activation_key(e)) return;
+			e.preventDefault();
+			$(e.currentTarget).trigger("click");
+		});
+
+		$dropdown.find(".dropdown-menu").on("keydown", '[role="menuitem"]', (e) => {
+			if (!is_activation_key(e)) return;
+			e.preventDefault();
+
+			const $item = $(e.currentTarget);
+			const menu = $item.closest(".dropdown-menu")[0];
+			$item.trigger("click");
+
+			const focused = document.activeElement;
+			if (!focused || focused === document.body || menu.contains(focused)) {
+				$toggle.trigger("focus");
+			}
 		});
 	},
 

@@ -1,8 +1,12 @@
 # Copyright (c) 2020, Frappe Technologies and Contributors
 # License: MIT. See LICENSE
+from unittest.mock import patch
+
 import frappe
 from frappe.desk.doctype.number_card.number_card import get_cards_for_user
 from frappe.tests import IntegrationTestCase
+
+STANDARD_TODO_CARD = "ToDo Total Open"
 
 
 class TestNumberCard(IntegrationTestCase):
@@ -135,3 +139,72 @@ class TestNumberCard(IntegrationTestCase):
 
 		self.assertEqual([row[0] for row in blocked_results], [])
 		self.assertEqual([row[0] for row in allowed_results], [allowed_card_name])
+
+	def _make_standard_card(self, card_name):
+		"""Insert a non-standard ToDo count card and promote it to a standard Desk module record."""
+		frappe.set_user("Administrator")
+		frappe.delete_doc("Number Card", card_name, ignore_missing=True, force=True)
+
+		def remove_card():
+			if frappe.db.exists("Number Card", card_name):
+				frappe.db.set_value("Number Card", card_name, "is_standard", 0, update_modified=False)
+			frappe.delete_doc("Number Card", card_name, ignore_missing=True, force=True)
+
+		self.addCleanup(remove_card)
+
+		card = frappe.get_doc(
+			{
+				"doctype": "Number Card",
+				"label": card_name,
+				"type": "Document Type",
+				"document_type": "ToDo",
+				"function": "Count",
+				"module": "Desk",
+				"show_percentage_stats": 0,
+			}
+		).insert(ignore_permissions=True)
+
+		frappe.db.set_value("Number Card", card.name, "is_standard", 1, update_modified=False)
+		card.reload()
+		self.assertEqual(card.is_standard, 1)
+		self.assertEqual(card.show_percentage_stats, 0)
+
+		return card
+
+	def test_standard_card_is_not_writable_without_developer_mode(self):
+		card = self._make_standard_card("Test Standard Guard Number Card")
+		card.show_percentage_stats = 1
+
+		with patch.dict(frappe.conf, {"developer_mode": 0}):
+			with self.assertRaisesRegex(frappe.ValidationError, "Cannot edit Standard"):
+				card.save(ignore_permissions=True)
+
+		self.assertEqual(frappe.db.get_value("Number Card", card.name, "show_percentage_stats"), 0)
+
+	def test_shipped_standard_card_is_not_writable_without_developer_mode(self):
+		frappe.set_user("Administrator")
+
+		card = frappe.get_doc("Number Card", STANDARD_TODO_CARD)
+		self.assertEqual(card.is_standard, 1)
+		card.show_percentage_stats = 1
+
+		with patch.dict(frappe.conf, {"developer_mode": 0}):
+			with self.assertRaisesRegex(frappe.ValidationError, "Cannot edit Standard"):
+				card.save(ignore_permissions=True)
+
+		self.assertEqual(frappe.db.get_value("Number Card", STANDARD_TODO_CARD, "show_percentage_stats"), 0)
+
+	def test_standard_card_is_writable_in_developer_mode(self):
+		card = self._make_standard_card("Test Developer Mode Guard Number Card")
+		card.show_percentage_stats = 1
+
+		with (
+			patch.dict(frappe.conf, {"developer_mode": 1}),
+			patch("frappe.desk.doctype.number_card.number_card.export_to_files") as export_to_files,
+		):
+			card.save(ignore_permissions=True)
+
+		export_to_files.assert_called_once_with(
+			record_list=[["Number Card", card.name]], record_module="Desk"
+		)
+		self.assertEqual(frappe.db.get_value("Number Card", card.name, "show_percentage_stats"), 1)

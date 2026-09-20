@@ -6,7 +6,7 @@ from typing import Any
 
 import frappe
 from frappe import _
-from frappe.utils import cint, escape_html
+from frappe.utils import cint, strip_html
 from frappe.utils.dashboard import cache_source
 
 SOURCE_NAME = "ToDo Top Owners"
@@ -33,25 +33,37 @@ def get_top_owners(limit: int = TOP_N) -> list[dict[str, Any]]:
 
 
 def _owner_labels(users: list[str]) -> dict[str, str]:
-	"""Return each user id in `users` mapped to the HTML-escaped full name of that user.
+	"""Return each user id in `users` mapped to the plain-text full name of that user.
 
-	Names are read once per distinct user id. A user id whose full name does not resolve — an unknown,
-	deleted or unnamed user — maps to the HTML-escaped user id itself.
+	The full names of every distinct user id are read in one query, without permission checks.
+	A user id whose full name does not resolve — an unknown, deleted or unnamed user — or whose
+	full name is nothing but markup maps to the plain-text user id itself.
 
-	e.g. `_owner_labels(["a@example.com"])` -> `{'a@example.com': '&lt;b&gt;A&lt;/b&gt;'}` for the
-	full name `<b>A</b>`.
+	e.g. `_owner_labels(["a@example.com"])` -> `{'a@example.com': 'A'}` for the full name `<b>A</b>`,
+	and `-> {'a@example.com': 'a@example.com'}` for the full name `<img src=x>`.
 	"""
 	if not users:
 		return {}
 
-	full_names = {user: frappe.get_cached_value("User", user, "full_name") for user in dict.fromkeys(users)}
+	full_names = dict(
+		frappe.db.get_values("User", {"name": ("in", list(dict.fromkeys(users)))}, ["name", "full_name"])
+		or []
+	)
 
-	return {user: escape_html(full_names[user] or user) for user in users}
+	return {user: _plain_text(full_names.get(user)) or _plain_text(user) for user in users}
 
 
 def _owner_label(user: str) -> str:
-	"""Return the HTML-escaped full name of `user`, or the escaped user id when no name resolves."""
+	"""Return the plain-text full name of `user`, or the plain-text user id when no name resolves."""
 	return _owner_labels([user])[user]
+
+
+def _plain_text(value: str | None) -> str:
+	"""Return `value` with HTML markup removed and surrounding whitespace stripped."""
+	if not value:
+		return ""
+
+	return strip_html(value).replace("<", "").replace(">", "").strip()
 
 
 @frappe.whitelist(methods=["GET", "POST"])

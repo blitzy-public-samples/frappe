@@ -2,6 +2,7 @@
 # License: MIT. See LICENSE
 
 import json
+from pathlib import Path
 
 import frappe
 from frappe.desk.dashboard_chart_source.todo_created_vs_completed.todo_created_vs_completed import (
@@ -11,6 +12,7 @@ from frappe.desk.dashboard_chart_source.todo_top_owners.todo_top_owners import g
 from frappe.desk.doctype.dashboard.dashboard import get_permitted_cards, get_permitted_charts
 from frappe.desk.doctype.dashboard_chart_source.dashboard_chart_source import get_config
 from frappe.desk.doctype.number_card.number_card import get_result
+from frappe.modules.export_file import strip_default_fields
 from frappe.tests import IntegrationTestCase
 from frappe.utils import cint
 
@@ -44,6 +46,15 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 	def _set_user_type(self, user, user_type):
 		frappe.db.set_value("User", user, "user_type", user_type, update_modified=False)
 		frappe.clear_cache(user=user)
+
+	def _chart_record_path(self, chart_name):
+		folder = frappe.scrub(chart_name)
+		return Path(frappe.get_app_path("frappe", "desk", "dashboard_chart", folder, f"{folder}.json"))
+
+	def _exported_chart_json(self, chart_name):
+		doc = frappe.get_doc("Dashboard Chart", chart_name)
+		export = strip_default_fields(doc, doc.as_dict(no_nulls=True, ignore_computed_child_tables=True))
+		return frappe.as_json(export) + "\n"
 
 	def test_open_and_closed_cards_count_seeded_todos(self):
 		for _ in range(3):
@@ -145,6 +156,58 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 					msg=f"the source of {own_chart} accepts more than GET and POST",
 				)
 
+	def test_chart_records_carry_last_synced_on_and_match_the_exporter(self):
+		"""Both chart record JSONs ship last_synced_on and are byte-identical to the exporter output."""
+		for chart_name in (TREND_CHART, TOP_OWNERS_CHART):
+			with self.subTest(chart=chart_name):
+				committed = self._chart_record_path(chart_name).read_text()
+				record = json.loads(committed)
+				self.assertIn(
+					"last_synced_on",
+					record,
+					msg=f"Dashboard Chart {chart_name} omits last_synced_on from its record JSON",
+				)
+
+				self.addCleanup(
+					frappe.db.set_value,
+					"Dashboard Chart",
+					chart_name,
+					"last_synced_on",
+					record["last_synced_on"],
+					update_modified=False,
+				)
+				frappe.db.set_value(
+					"Dashboard Chart",
+					chart_name,
+					"last_synced_on",
+					record["last_synced_on"],
+					update_modified=False,
+				)
+				self.assertEqual(
+					self._exported_chart_json(chart_name),
+					committed,
+					msg=f"the exporter output of {chart_name} differs from its committed record JSON",
+				)
+
+				frappe.db.set_value(
+					"Dashboard Chart",
+					chart_name,
+					"last_synced_on",
+					"2026-01-02 03:04:05.678901",
+					update_modified=False,
+				)
+				stamped = json.loads(self._exported_chart_json(chart_name))
+				self.assertEqual(
+					stamped["last_synced_on"],
+					"2026-01-02 03:04:05.678901",
+					msg=f"the export of {chart_name} dropped the recorded sync timestamp",
+				)
+				self.assertEqual(
+					{key: value for key, value in stamped.items() if key != "last_synced_on"},
+					{key: value for key, value in record.items() if key != "last_synced_on"},
+					msg=f"a widget refresh changed more than last_synced_on in the export of {chart_name}",
+				)
+
 	def test_dashboard_loads_all_four_components(self):
 		"""The dashboard yields both cards and both charts, and every backing server call returns data."""
 		self._make_todo(status="Open", allocated_to="Administrator")
@@ -163,9 +226,9 @@ class TestToDoAnalyticsDashboard(IntegrationTestCase):
 			config = get_config(source_name)
 			self.assertTrue(config, msg=f"Chart source {source_name} ships no client config")
 			self.assertIn(
-				"filters: []",
+				"filters: null",
 				config,
-				msg=f"Chart source {source_name} does not register an empty filter list",
+				msg=f"Chart source {source_name} does not register a falsy filter list",
 			)
 
 		trend = get_created_vs_completed(chart_name=TREND_CHART, no_cache=1)

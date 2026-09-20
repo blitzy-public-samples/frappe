@@ -1494,6 +1494,11 @@ Object.assign(frappe.utils, {
 
 	format_chart_axis_number(label, country) {
 		const default_country = frappe.sys_defaults.country;
+		// the number zero formats as "0"; null, undefined, "" and NaN are not numbers here
+		// and keep shorten_number's empty string
+		if (typeof label === "number" && label === 0) {
+			return "0";
+		}
 		return frappe.utils.shorten_number(label, country || default_country, 3);
 	},
 	set_space_label_ratio(chart_args) {

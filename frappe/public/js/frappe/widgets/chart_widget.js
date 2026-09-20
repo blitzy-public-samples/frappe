@@ -105,11 +105,17 @@ export default class ChartWidget extends Widget {
 			}
 			this.setup_container();
 			if (!this.in_customize_mode) {
+				const restore_control_focus = this.action_area_holds_focus();
+
 				this.action_area.empty();
 				this.prepare_chart_actions();
 
 				if (this.chart_doc.timeseries) {
 					this.render_time_series_filters();
+				}
+
+				if (restore_control_focus) {
+					this.chart_actions.find(".chart-menu").trigger("focus");
 				}
 			}
 			frappe.run_serially([
@@ -385,9 +391,10 @@ export default class ChartWidget extends Widget {
 			this.chart_doc.chart_type !== "Report" && this.chart_doc.chart_type !== "Custom";
 
 		this.filter_button = $(
-			`<div class="filter-chart btn btn-xs pull-right">
+			`<button type="button" class="filter-chart btn btn-xs pull-right"
+				aria-haspopup="true" aria-label="${__("Set Filters")}" title="${__("Set Filters")}">
 				${frappe.utils.icon("funnel", "sm")}
-			</div>`
+			</button>`
 		);
 
 		this.filter_button.appendTo(this.action_area);
@@ -507,21 +514,21 @@ export default class ChartWidget extends Widget {
 	set_chart_actions(actions) {
 		this.chart_actions = $(`<div class="chart-actions dropdown pull-right">
 			<button data-toggle="dropdown"
-				aria-haspopup="true"aria-expanded="false"
+				aria-haspopup="true" aria-expanded="false"
+				aria-label="${__("Chart Actions")}" title="${__("Chart Actions")}"
 				class="btn btn-xs btn-secondary chart-menu"
 			>
-				<svg class="icon icon-sm">
+				<svg class="icon icon-sm" aria-hidden="true">
 					<use href="#icon-ellipsis">
 					</use>
 				</svg>
 			</button>
-			<ul class="dropdown-menu dropdown-menu-right">
+			<ul class="dropdown-menu dropdown-menu-right" role="menu">
 				${actions
 					.map(
 						(action) =>
-							`<li><a class="dropdown-item" data-action="${action.action}">${__(
-								action.label
-							)}</a></li>`
+							`<li role="none"><a class="dropdown-item" role="menuitem" tabindex="-1"
+								data-action="${action.action}">${__(action.label)}</a></li>`
 					)
 					.join("")}
 			</ul>
@@ -533,7 +540,17 @@ export default class ChartWidget extends Widget {
 			const action = o.dataset.action;
 			$(o).click(actions.find((a) => a.action === action));
 		});
+		frappe.dashboard_utils.make_dropdown_keyboard_operable(this.chart_actions);
 		this.chart_actions.appendTo(this.action_area);
+	}
+
+	// True while the keyboard sits on one of this widget's controls, which a chart action that
+	// rebuilds the control row would otherwise drop.
+	action_area_holds_focus() {
+		const focused = document.activeElement;
+		const area = this.action_area && this.action_area[0];
+
+		return Boolean(focused && area && area.contains(focused));
 	}
 
 	fetch(filters, refresh = false, args) {
@@ -597,6 +614,8 @@ export default class ChartWidget extends Widget {
 			} else {
 				this.dashboard_chart.update(this.data);
 			}
+
+			this.bind_plot_area_tooltip();
 		};
 
 		if (!this.data || !this.data.labels || !Object.keys(this.data).length) {
@@ -621,6 +640,35 @@ export default class ChartWidget extends Widget {
 			this.width == "Full" && this.summary && this.set_summary();
 			this.chart_doc.type == "Heatmap" && this.render_heatmap_legend();
 		}
+	}
+
+	// Makes the whole plot area a tooltip target on charts that print their values over points.
+	bind_plot_area_tooltip() {
+		const chart = this.dashboard_chart;
+
+		if (!chart || !chart.config || !chart.config.valuesOverPoints) {
+			return;
+		}
+
+		const has_axis_tooltip =
+			typeof chart.mapTooltipXPosition === "function" && chart.container && chart.tip;
+
+		if (!has_axis_tooltip || chart.plot_area_tooltip_bound) {
+			return;
+		}
+
+		chart.plot_area_tooltip_bound = true;
+		chart.container.addEventListener("mousemove", (event) => {
+			const container_rect = chart.container.getBoundingClientRect();
+			const tip_offset = chart.tip.offset || { x: 0, y: 0 };
+			const plot_area_y = event.clientY - container_rect.top - tip_offset.y;
+
+			if (plot_area_y < 0 || plot_area_y > chart.height) {
+				return;
+			}
+
+			chart.mapTooltipXPosition(event.clientX - container_rect.left - tip_offset.x);
+		});
 	}
 
 	get_chart_args() {
