@@ -167,7 +167,9 @@ class TestResourceAPIV2(FrappeAPITestCase):
 	def test_delete_document_non_existing_v2(self):
 		non_existent_doc = frappe.generate_hash(length=12)
 		with suppress_stdout():
-			response = self.delete(self.resource(self.DOCTYPE, non_existent_doc))
+			response = self.delete(
+				self.resource(self.DOCTYPE, non_existent_doc), query_string={"sid": self.sid}
+			)
 		self.assertEqual(response.status_code, 404)
 		self.assertEqual(response.json["errors"][0]["type"], "DoesNotExistError")
 		# 404s dont return exceptions
@@ -287,7 +289,8 @@ class TestMethodAPIV2(FrappeAPITestCase):
 	def test_add_comment_v2(self):
 		comment_txt = frappe.generate_hash()
 		response = self.post(
-			self.resource("User", "Administrator", "method", "add_comment"), {"text": comment_txt}
+			self.resource("User", "Administrator", "method", "add_comment"),
+			{"text": comment_txt, "sid": self.sid},
 		).json
 		self.assertEqual(response["data"]["content"], comment_txt)
 

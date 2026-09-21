@@ -22,14 +22,25 @@ frappe.dashboard_utils = {
 					</button>`;
 			let options_html;
 
+			// The label of a chart filter always shows the setting that is currently applied,
+			// so the option matching it is the checked option of the menu.
+			const applied_label = filter.label == null ? "" : String(__(filter.label));
+			const is_applied = (option) =>
+				applied_label !== "" &&
+				[String(option), String(__(option))].includes(applied_label);
+			const option_class = (option) =>
+				is_applied(option) ? "dropdown-item active" : "dropdown-item";
+			const option_checked = (option) => (is_applied(option) ? "true" : "false");
+
 			if (filter.fieldnames) {
 				options_html = filter.options
 					.map(
 						(option, i) =>
 							`<li role="none">
-						<a class="dropdown-item" role="menuitem" tabindex="-1" data-fieldname="${
-							filter.fieldnames[i]
-						}" data-option="${encodeURIComponent(option)}">${__(option)}</a>
+						<a class="${option_class(option)}" role="menuitemradio"
+							aria-checked="${option_checked(option)}" tabindex="-1"
+							data-fieldname="${filter.fieldnames[i]}"
+							data-option="${encodeURIComponent(option)}">${__(option)}</a>
 					</li>`
 					)
 					.join("");
@@ -37,7 +48,11 @@ frappe.dashboard_utils = {
 				options_html = filter.options
 					.map(
 						(option) =>
-							`<li role="none"><a class="dropdown-item" role="menuitem" tabindex="-1"
+							`<li role="none"><a class="${option_class(
+								option
+							)}" role="menuitemradio" aria-checked="${option_checked(
+								option
+							)}" tabindex="-1"
 								data-option="${encodeURIComponent(option)}">${__(option)}</a></li>`
 					)
 					.join("");
@@ -62,37 +77,176 @@ frappe.dashboard_utils = {
 				let selected_item = decodeURIComponent($el.data("option"));
 				$el.parents(`.${button_class}`).find(".filter-label").html(__(selected_item));
 				filter.action(selected_item, fieldname);
+
+				// keep focus where the action moved it when it leaves this dropdown
+				const focused = document.activeElement;
+				const focus_moved =
+					focused &&
+					focused !== document.body &&
+					focused !== document.documentElement &&
+					!$chart_filter[0].contains(focused);
+
+				if (!focus_moved) {
+					$chart_filter.find('[data-toggle="dropdown"]').trigger("focus");
+				}
 			});
 
 			this.make_dropdown_keyboard_operable($chart_filter);
 		});
 	},
 
-	// Activates dropdown items on Enter or Space and moves focus back to the toggle afterwards,
-	// for triggers and items that are anchors rather than buttons.
-	make_dropdown_keyboard_operable($dropdown) {
-		const is_activation_key = (event) => [" ", "Enter"].includes(event.key);
-		const $toggle = $dropdown.find('[data-toggle="dropdown"]');
+	// Selector for the focusable options of a widget menu, covering command items
+	// (`menuitem`) and single-selection options (`menuitemradio`).
+	MENU_ITEM_SELECTOR: '[role="menuitem"], [role="menuitemradio"]',
 
-		$toggle.not("button, input").on("keydown", (e) => {
-			if (!is_activation_key(e)) return;
+	/**
+	 * Makes one widget menu (chart actions, card actions, timespan / interval / heatmap-year
+	 * dropdown) fully operable from the keyboard and restores focus to its toggle whenever the
+	 * menu closes.
+	 *
+	 * Behaviour installed on `$dropdown` (a Bootstrap `.dropdown` container holding one
+	 * `[data-toggle="dropdown"]` toggle and one `.dropdown-menu`):
+	 *  - Enter, Space and ArrowDown on the toggle open the menu and focus its first option;
+	 *    ArrowUp opens it and focuses the last option.
+	 *  - ArrowDown / ArrowUp move between options and wrap around; Home and End jump to the
+	 *    first and last option.
+	 *  - Enter and Space activate the focused option.
+	 *  - Escape closes the menu; Tab and Shift+Tab close it and let focus continue along the
+	 *    document's own tab order.
+	 *  - On `hidden.bs.dropdown` — which covers Escape, an outside click, option activation and
+	 *    a programmatic close — focus returns to the toggle when focus is on `body`, inside the
+	 *    menu that just closed, or nowhere. Focus that an action moved elsewhere (a dialog, a
+	 *    new route) is left where the action put it.
+	 *  - The menu is given `role="menu"` and is labelled by its toggle through `aria-labelledby`.
+	 *
+	 * Usage: call once per rendered dropdown, e.g.
+	 * `frappe.dashboard_utils.make_dropdown_keyboard_operable(this.chart_actions)`.
+	 *
+	 * @param {Object} $dropdown jQuery object wrapping the `.dropdown` container.
+	 */
+	make_dropdown_keyboard_operable($dropdown) {
+		const $toggle = $dropdown.find('[data-toggle="dropdown"]').first();
+		const $menu = $dropdown.find(".dropdown-menu").first();
+
+		if (!$toggle.length || !$menu.length) return;
+		// One binding per rendered dropdown: widgets rebuild their action area on refresh,
+		// which discards the old nodes together with their handlers.
+		if ($dropdown.data("keyboard-operable")) return;
+		$dropdown.data("keyboard-operable", true);
+
+		this.label_dropdown_menu($toggle, $menu);
+
+		const items = () => $menu.find(this.MENU_ITEM_SELECTOR).filter(":visible").toArray();
+		const is_open = () => $dropdown.hasClass("show");
+		// Bootstrap's own `hide()` leaves `aria-expanded` untouched, so the menu is always
+		// closed through the toggle, which routes through `Dropdown._clearMenus`.
+		const open_menu = () => !is_open() && $toggle.trigger("click");
+		const close_menu = () => is_open() && $toggle.trigger("click");
+
+		const focus_item = (index) => {
+			const list = items();
+			if (!list.length) return;
+			list[((index % list.length) + list.length) % list.length].focus();
+		};
+
+		// Set while a Tab keypress closes the menu, so that the close does not pull focus
+		// back to the toggle and cancel the browser's own focus move.
+		let leaving_by_tab = false;
+
+		$toggle.on("keydown", (e) => {
+			if (e.key === "Tab") {
+				if (!is_open()) return;
+				leaving_by_tab = true;
+				close_menu();
+				leaving_by_tab = false;
+				return;
+			}
+
+			if (!["Enter", " ", "ArrowDown", "ArrowUp", "Escape"].includes(e.key)) return;
+
 			e.preventDefault();
-			$(e.currentTarget).trigger("click");
+			e.stopPropagation();
+
+			if (e.key === "Escape") {
+				close_menu();
+				return;
+			}
+
+			open_menu();
+			focus_item(e.key === "ArrowUp" ? -1 : 0);
 		});
 
-		$dropdown.find(".dropdown-menu").on("keydown", '[role="menuitem"]', (e) => {
-			if (!is_activation_key(e)) return;
-			e.preventDefault();
-
+		$menu.on("keydown", this.MENU_ITEM_SELECTOR, (e) => {
 			const $item = $(e.currentTarget);
-			const menu = $item.closest(".dropdown-menu")[0];
-			$item.trigger("click");
 
-			const focused = document.activeElement;
-			if (!focused || focused === document.body || menu.contains(focused)) {
-				$toggle.trigger("focus");
+			if (e.key === "Tab") {
+				leaving_by_tab = true;
+				close_menu();
+				leaving_by_tab = false;
+				return;
+			}
+
+			if (!["Enter", " ", "ArrowDown", "ArrowUp", "Home", "End", "Escape"].includes(e.key)) {
+				return;
+			}
+
+			e.preventDefault();
+			e.stopPropagation();
+
+			const list = items();
+			const index = list.indexOf($item[0]);
+
+			if (e.key === "ArrowDown") {
+				focus_item(index + 1);
+			} else if (e.key === "ArrowUp") {
+				focus_item(index - 1);
+			} else if (e.key === "Home") {
+				focus_item(0);
+			} else if (e.key === "End") {
+				focus_item(-1);
+			} else if (e.key === "Escape") {
+				close_menu();
+			} else {
+				$item.trigger("click");
 			}
 		});
+
+		// Keeps the selected option of a single-selection menu marked for assistive
+		// technology after a mouse or keyboard activation.
+		$menu.on("click", '[role="menuitemradio"]', (e) => {
+			this.mark_selected_dropdown_option($menu, $(e.currentTarget));
+		});
+
+		$dropdown.on("hidden.bs.dropdown", () => {
+			if (leaving_by_tab) return;
+
+			const toggle = $toggle[0];
+			if (!toggle.isConnected) return;
+
+			const focused = document.activeElement;
+			if (!focused || focused === document.body || $menu[0].contains(focused)) {
+				toggle.focus();
+			}
+		});
+	},
+
+	// Gives the menu `role="menu"` and names it after its toggle, assigning the toggle an id
+	// when it has none.
+	label_dropdown_menu($toggle, $menu) {
+		if (!$menu.attr("role")) {
+			$menu.attr("role", "menu");
+		}
+
+		$menu.attr("aria-labelledby", frappe.dom.set_unique_id($toggle[0]));
+	},
+
+	// Marks `$selected` as the applied option of a single-selection menu and unmarks the rest,
+	// both programmatically (`aria-checked`) and visually (`.active`).
+	mark_selected_dropdown_option($menu, $selected) {
+		const $options = $menu.find('[role="menuitemradio"]');
+
+		$options.attr("aria-checked", "false").removeClass("active");
+		$selected && $selected.length && $selected.attr("aria-checked", "true").addClass("active");
 	},
 
 	get_filters_for_chart_type: function (chart) {
@@ -230,9 +384,33 @@ frappe.dashboard_utils = {
 		return fields;
 	},
 
+	// A filter value counts as unset when it is undefined, null, an empty or whitespace-only
+	// string, or an array that holds nothing but such values. 0 and false are set values.
+	is_unset_filter_value(value) {
+		if (value === undefined || value === null) {
+			return true;
+		}
+
+		if (typeof value === "string") {
+			return value.trim() === "";
+		}
+
+		if (Array.isArray(value)) {
+			return (
+				!value.length ||
+				value.every((entry) => frappe.dashboard_utils.is_unset_filter_value(entry))
+			);
+		}
+
+		return false;
+	},
+
+	// Evaluates the dynamic filters of a chart or card and merges them into its static filters.
+	// A dynamic filter whose expression evaluates to an unset value is left out of the result:
+	// the list-shaped row is omitted and the dict-shaped key is not written.
 	get_all_filters(doc) {
-		let filters = doc.filters_json ? JSON.parse(doc.filters_json) : null;
-		let dynamic_filters = doc.dynamic_filters_json
+		const filters = doc.filters_json ? JSON.parse(doc.filters_json) : null;
+		const dynamic_filters = doc.dynamic_filters_json
 			? JSON.parse(doc.dynamic_filters_json)
 			: null;
 
@@ -245,36 +423,55 @@ frappe.dashboard_utils = {
 		}
 
 		if (!Array.isArray(dynamic_filters)) {
+			const evaluated_filters = {};
+
 			Object.keys(dynamic_filters).forEach((key) => {
+				let value;
 				try {
-					dynamic_filters[key] = eval(dynamic_filters[key]);
+					value = eval(dynamic_filters[key]);
 				} catch (e) {
 					frappe.throw(__("Invalid expression set in filter {0}", [key]));
 				}
+
+				if (!this.is_unset_filter_value(value)) {
+					evaluated_filters[key] = value;
+				}
 			});
 
-			return filters ? Object.assign(filters, dynamic_filters) : dynamic_filters;
+			return filters ? Object.assign({}, filters, evaluated_filters) : evaluated_filters;
 		}
 
+		const evaluated_filters = [];
+
 		dynamic_filters.forEach((f) => {
+			let value;
 			try {
-				f[3] = eval(f[3]);
+				value = eval(f[3]);
 			} catch (e) {
 				frappe.throw(__("Invalid expression set in filter {0} ({1})", [f[1], f[0]]));
+			}
+
+			if (!this.is_unset_filter_value(value)) {
+				const evaluated_filter = [...f];
+				evaluated_filter[3] = value;
+				evaluated_filters.push(evaluated_filter);
 			}
 		});
 
 		if (!filters) {
-			filters = dynamic_filters;
-		} else if (Array.isArray(filters)) {
-			filters = [...filters, ...dynamic_filters];
-		} else {
-			dynamic_filters.forEach((f) => {
-				filters[f[1]] = f[3];
-			});
+			return evaluated_filters;
 		}
 
-		return filters;
+		if (Array.isArray(filters)) {
+			return [...filters, ...evaluated_filters];
+		}
+
+		const merged_filters = Object.assign({}, filters);
+		evaluated_filters.forEach((f) => {
+			merged_filters[f[1]] = f[3];
+		});
+
+		return merged_filters;
 	},
 	get_dashboard_link_field() {
 		let field = {

@@ -9,6 +9,17 @@ export default class ChartWidget extends Widget {
 		opts.shadow = true;
 		super(opts);
 		this.height = this.height || 240;
+		this.chart_settings = this.clone_value(this.chart_settings) || {};
+	}
+
+	// Returns a copy that shares no object with the value passed in. Documents and settings
+	// held elsewhere are not modified through this widget.
+	clone_value(value) {
+		if (value === null || value === undefined) {
+			return value;
+		}
+
+		return JSON.parse(JSON.stringify(value));
 	}
 
 	get_config() {
@@ -23,8 +34,15 @@ export default class ChartWidget extends Widget {
 
 	refresh() {
 		delete this.dashboard_chart;
+		this.clear_date_range_field();
 		this.set_body();
 		this.make_chart();
+	}
+
+	delete(animate = true, dismissed = false) {
+		this.clear_date_range_field();
+		delete this.dashboard_chart;
+		super.delete(animate, dismissed);
 	}
 
 	set_chart_title() {
@@ -63,13 +81,56 @@ export default class ChartWidget extends Widget {
 		this.error_state = $(
 			`<div class="chart-loading-state text-danger" style="height: ${this.height}px;"></div>`
 		);
+		this.setup_error_state_content();
 		this.error_state.hide().appendTo(this.body);
 
 		this.chart_wrapper = $(`<div></div>`);
 		this.chart_wrapper.appendTo(this.body);
 
+		// mirrors the plot-area tooltip for screen readers during keyboard navigation
+		this.chart_announcer = $(
+			`<div class="sr-only chart-tooltip-announcer" aria-live="polite" aria-atomic="true"></div>`
+		);
+		this.chart_announcer.appendTo(this.body);
+
 		this.$heatmap_legend = null;
 		this.set_chart_title();
+	}
+
+	// Fills the error container with the message region screen readers announce and the Retry
+	// control that re-fetches the chart. Runs once per error container: repeated calls keep the
+	// existing nodes, so no duplicate button and no duplicate handler can accumulate.
+	setup_error_state_content() {
+		if (!this.error_state) {
+			return;
+		}
+
+		if (this.error_message && this.error_message.parent().is(this.error_state)) {
+			return;
+		}
+
+		const chart_label = __(
+			this.chart_doc.chart_name || this.chart_doc.name || this.label || this.name || ""
+		);
+
+		this.error_state.empty();
+		this.error_message = $(`<div class="chart-error-message" role="alert"></div>`);
+		this.retry_button = $(
+			`<button type="button" class="btn btn-xs btn-default chart-retry"
+				aria-label="${frappe.utils.escape_html(__("Retry loading {0}", [chart_label]))}"
+			>${__("Retry")}</button>`
+		);
+
+		this.retry_button.on("click", () => this.retry_fetch());
+		this.retry_button.on("keydown", (event) => {
+			// preventDefault stops the browser's own button activation from firing a second retry
+			if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
+				event.preventDefault();
+				this.retry_fetch();
+			}
+		});
+
+		this.error_state.append(this.error_message).append(this.retry_button);
 	}
 
 	setup_heatmap_container() {
@@ -105,7 +166,7 @@ export default class ChartWidget extends Widget {
 			}
 			this.setup_container();
 			if (!this.in_customize_mode) {
-				const restore_control_focus = this.action_area_holds_focus();
+				this.pending_focus_control = this.get_focused_control();
 
 				this.action_area.empty();
 				this.prepare_chart_actions();
@@ -113,22 +174,52 @@ export default class ChartWidget extends Widget {
 				if (this.chart_doc.timeseries) {
 					this.render_time_series_filters();
 				}
-
-				if (restore_control_focus) {
-					this.chart_actions.find(".chart-menu").trigger("focus");
-				}
 			}
 			frappe.run_serially([
 				() => this.prepare_chart_object(),
 				() => this.setup_filter_button(),
+				() => this.restore_rebuilt_control_focus(),
 				() => this.fetch_and_update_chart(),
 			]);
 		});
 	}
 
 	render_time_series_filters() {
+		this.clear_date_range_field();
+
 		let filters = this.get_time_series_filters();
 		frappe.dashboard_utils.render_chart_filters(filters, "chart-actions", this.action_area, 0);
+
+		if (
+			this.chart_doc.type != "Heatmap" &&
+			this.get_time_window().timespan === "Select Date Range"
+		) {
+			this.render_date_range_field(false);
+		}
+	}
+
+	// The window the controls display: this instance's live selection, else this user's saved
+	// setting, else the chart record's own value.
+	get_time_window() {
+		return {
+			timespan:
+				this.selected_timespan ||
+				this.chart_settings.timespan ||
+				this.chart_doc.timespan ||
+				null,
+			time_interval:
+				this.selected_time_interval ||
+				this.chart_settings.time_interval ||
+				this.chart_doc.time_interval ||
+				null,
+			from_date: this.selected_from_date || this.chart_settings.from_date || null,
+			to_date: this.selected_to_date || this.chart_settings.to_date || null,
+			heatmap_year:
+				this.selected_heatmap_year ||
+				this.chart_settings.heatmap_year ||
+				this.chart_doc.heatmap_year ||
+				null,
+		};
 	}
 
 	get_time_series_filters() {
@@ -140,8 +231,11 @@ export default class ChartWidget extends Widget {
 					options: frappe.dashboard_utils.get_years_since_creation(
 						frappe.boot.user.creation
 					),
+					class: "heatmap-year-filter",
 					action: (selected_item) => {
 						this.selected_heatmap_year = selected_item;
+						this.selection_focus_control =
+							'.heatmap-year-filter [data-toggle="dropdown"]';
 						this.save_chart_config_for_user({
 							heatmap_year: this.selected_heatmap_year,
 						});
@@ -159,8 +253,14 @@ export default class ChartWidget extends Widget {
 					class: "time-interval-filter",
 					action: (selected_item) => {
 						this.selected_time_interval = selected_item;
+						this.selection_focus_control =
+							'.time-interval-filter [data-toggle="dropdown"]';
+						const time_window = this.get_time_window();
 						this.save_chart_config_for_user({
+							timespan: time_window.timespan,
 							time_interval: this.selected_time_interval,
+							from_date: time_window.from_date,
+							to_date: time_window.to_date,
 						});
 						this.fetch_and_update_chart();
 					},
@@ -179,12 +279,15 @@ export default class ChartWidget extends Widget {
 						this.selected_timespan = selected_item;
 
 						if (this.selected_timespan === "Select Date Range") {
-							this.render_date_range_field();
+							this.selection_focus_control = ".dashboard-date-field input";
+							this.render_date_range_field(true);
 						} else {
+							this.selection_focus_control =
+								'.timespan-filter [data-toggle="dropdown"]';
 							this.selected_from_date = null;
 							this.selected_to_date = null;
 							if (this.date_field_wrapper) {
-								this.date_field_wrapper.hide();
+								this.clear_date_range_field();
 
 								// Title maybe hidden becuase of date range fields
 								// in half width chart
@@ -195,6 +298,7 @@ export default class ChartWidget extends Widget {
 
 							this.save_chart_config_for_user({
 								timespan: this.selected_timespan,
+								time_interval: this.get_time_window().time_interval,
 								from_date: null,
 								to_date: null,
 							});
@@ -208,15 +312,17 @@ export default class ChartWidget extends Widget {
 	}
 
 	fetch_and_update_chart() {
-		this.args = {
-			timespan: this.selected_timespan || this.chart_settings.timespan,
-			time_interval: this.selected_time_interval || this.chart_settings.time_interval,
-			from_date: this.selected_from_date || this.chart_settings.from_date,
-			to_date: this.selected_to_date || this.chart_settings.to_date,
-			heatmap_year: this.selected_heatmap_year || this.chart_settings.heatmap_year,
-		};
+		this.args = this.get_time_window();
 
-		this.fetch(this.filters, true, this.args).then((data) => {
+		const request_sequence = (this.fetch_sequence = (this.fetch_sequence || 0) + 1);
+		const focus_control = this.selection_focus_control;
+		this.selection_focus_control = null;
+
+		return this.fetch(this.filters, true, this.args).then((data) => {
+			if (request_sequence !== this.fetch_sequence) {
+				return;
+			}
+
 			if (this.chart_doc.chart_type == "Report") {
 				this.report_result = data;
 				this.summary = data.report_summary;
@@ -225,51 +331,78 @@ export default class ChartWidget extends Widget {
 
 			this.update_chart_object();
 			this.data = data;
-			this.render();
+			return this.render().then(() => this.restore_selection_focus(focus_control));
 		});
 	}
 
-	render_date_range_field() {
-		if (!this.date_field_wrapper || !this.date_field_wrapper.is(":visible")) {
-			this.date_field_wrapper = $(
-				`<div class="dashboard-date-field pull-right"></div>`
-			).insertAfter(this.action_area.find(".timespan-filter"));
+	render_date_range_field(focus_input = true) {
+		if (this.date_field_wrapper && this.date_field_wrapper.is(":visible")) {
+			focus_input && this.date_range_field && this.date_range_field.$input.focus();
+			return;
+		}
 
-			if (this.width !== "Full" && this.widget.width() < 700) {
-				this.title_field.hide();
-				this.subtitle_field.hide();
-				this.head.css("flex-direction", "row-reverse");
-			}
+		this.clear_date_range_field();
 
-			this.date_range_field = frappe.ui.form.make_control({
-				df: {
-					fieldtype: "DateRange",
-					fieldname: "from_date",
-					placeholder: __("Date Range"),
-					input_class: "input-xs",
-					default: [this.chart_settings.from_date, this.chart_settings.to_date],
-					value: [this.chart_settings.from_date, this.chart_settings.to_date],
-					reqd: 1,
-					change: () => {
-						let selected_date_range = this.date_range_field.get_value();
-						this.selected_from_date = selected_date_range[0];
-						this.selected_to_date = selected_date_range[1];
+		const time_window = this.get_time_window();
 
-						if (selected_date_range && selected_date_range.length == 2) {
-							this.save_chart_config_for_user({
-								timespan: this.selected_timespan,
-								from_date: this.selected_from_date,
-								to_date: this.selected_to_date,
-							});
-							this.fetch_and_update_chart();
-						}
-					},
+		this.date_field_wrapper = $(
+			`<div class="dashboard-date-field pull-right"></div>`
+		).insertAfter(this.action_area.find(".timespan-filter"));
+
+		if (this.width !== "Full" && this.widget.width() < 700) {
+			this.title_field.hide();
+			this.subtitle_field.hide();
+			this.head.css("flex-direction", "row-reverse");
+		}
+
+		this.date_range_field = frappe.ui.form.make_control({
+			df: {
+				fieldtype: "DateRange",
+				fieldname: "from_date",
+				placeholder: __("Date Range"),
+				input_class: "input-xs",
+				default: [time_window.from_date, time_window.to_date],
+				value: [time_window.from_date, time_window.to_date],
+				reqd: 1,
+				change: () => {
+					let selected_date_range = this.date_range_field.get_value();
+					this.selected_from_date = selected_date_range[0];
+					this.selected_to_date = selected_date_range[1];
+					this.selection_focus_control = ".dashboard-date-field input";
+
+					if (selected_date_range && selected_date_range.length == 2) {
+						this.save_chart_config_for_user({
+							timespan: this.selected_timespan,
+							time_interval: this.get_time_window().time_interval,
+							from_date: this.selected_from_date,
+							to_date: this.selected_to_date,
+						});
+						this.fetch_and_update_chart();
+					}
 				},
-				parent: this.date_field_wrapper,
-				render_input: 1,
-			});
+			},
+			parent: this.date_field_wrapper,
+			render_input: 1,
+		});
 
-			this.date_range_field.$input.focus();
+		if (time_window.from_date && time_window.to_date) {
+			this.date_range_field.set_input(time_window.from_date, time_window.to_date);
+		}
+
+		focus_input && this.date_range_field.$input.focus();
+	}
+
+	// Removes this instance's date range control, its datepicker and the references to both.
+	clear_date_range_field() {
+		if (this.date_range_field) {
+			const datepicker = this.date_range_field.datepicker;
+			datepicker && datepicker.destroy && datepicker.destroy();
+			this.date_range_field = null;
+		}
+
+		if (this.date_field_wrapper) {
+			this.date_field_wrapper.remove();
+			this.date_field_wrapper = null;
 		}
 	}
 
@@ -392,12 +525,16 @@ export default class ChartWidget extends Widget {
 
 		this.filter_button = $(
 			`<button type="button" class="filter-chart btn btn-xs pull-right"
-				aria-haspopup="true" aria-label="${__("Set Filters")}" title="${__("Set Filters")}">
+				aria-haspopup="dialog" aria-label="${__("Set Filters")}" title="${__("Set Filters")}">
 				${frappe.utils.icon("funnel", "sm")}
 			</button>`
 		);
 
 		this.filter_button.appendTo(this.action_area);
+
+		this.filter_button.on("hidden.bs.popover", () => {
+			this.restore_focus_to_filter_button(this.filter_group && this.filter_group.wrapper);
+		});
 
 		if (this.is_document_type) {
 			if (this.filter_group) {
@@ -459,6 +596,12 @@ export default class ChartWidget extends Widget {
 			primary_action_label: __("Set"),
 		});
 
+		// Bound to `hidden.bs.modal` rather than the dialog's `onhide`: the Desk's global
+		// Escape handler blurs the active element while the dialog is still hiding.
+		dialog.$wrapper.on("hidden.bs.modal", () =>
+			this.restore_focus_to_filter_button(dialog.$wrapper)
+		);
+
 		dialog.show();
 
 		if (this.chart_doc.chart_type == "Report") {
@@ -471,16 +614,19 @@ export default class ChartWidget extends Widget {
 	}
 
 	reset_chart() {
-		this.save_chart_config_for_user(null, 1);
 		this.chart_settings = {};
 		this.filters = null;
 		this.selected_time_interval = null;
 		this.selected_timespan = null;
 		this.selected_heatmap_year = null;
+		this.selected_from_date = null;
+		this.selected_to_date = null;
+		this.clear_date_range_field();
+		this.save_chart_config_for_user(null, 1);
 	}
 
 	save_chart_config_for_user(config, reset = 0) {
-		Object.assign(this.chart_settings, config);
+		this.chart_settings = Object.assign({}, this.chart_settings, config);
 		frappe.xcall(
 			"frappe.desk.doctype.dashboard_settings.dashboard_settings.save_chart_config",
 			{
@@ -544,6 +690,27 @@ export default class ChartWidget extends Widget {
 		this.chart_actions.appendTo(this.action_area);
 	}
 
+	/**
+	 * Returns focus to this widget's filter button after the dialog or filter popover it opened
+	 * has closed, so the keyboard is not dropped on `body`. Focus that the closing control moved
+	 * somewhere else on purpose is left where it is.
+	 *
+	 * @param {Object} [$closed] jQuery object wrapping the container that just closed.
+	 */
+	restore_focus_to_filter_button($closed) {
+		const button = this.filter_button && this.filter_button[0];
+		if (!button || !button.isConnected) return;
+
+		const focused = document.activeElement;
+		const focus_inside_closed = Boolean(
+			$closed && $closed.length && focused && $closed[0].contains(focused)
+		);
+
+		if (!focused || focused === document.body || focus_inside_closed) {
+			button.focus();
+		}
+	}
+
 	// True while the keyboard sits on one of this widget's controls, which a chart action that
 	// rebuilds the control row would otherwise drop.
 	action_area_holds_focus() {
@@ -551,6 +718,58 @@ export default class ChartWidget extends Widget {
 		const area = this.action_area && this.action_area[0];
 
 		return Boolean(focused && area && area.contains(focused));
+	}
+
+	// The selector of the control in this widget's action area that holds the keyboard, matched
+	// again in the rebuilt action area by restore_rebuilt_control_focus().
+	get_focused_control() {
+		if (!this.action_area_holds_focus()) {
+			return null;
+		}
+
+		const $focused = $(document.activeElement);
+		const $group = $focused.closest(
+			".timespan-filter, .time-interval-filter, .heatmap-year-filter, .chart-actions"
+		);
+
+		if (!$group.length) {
+			return $focused.closest(".dashboard-date-field").length
+				? ".dashboard-date-field input"
+				: ".filter-chart";
+		}
+
+		const filter_class = [
+			"timespan-filter",
+			"time-interval-filter",
+			"heatmap-year-filter",
+		].find((chart_filter) => $group.hasClass(chart_filter));
+
+		return filter_class ? `.${filter_class} [data-toggle="dropdown"]` : ".chart-menu";
+	}
+
+	focus_control(selector) {
+		if (!selector) {
+			return;
+		}
+
+		const $control = this.action_area.find(selector).first();
+		$control.length && $control.trigger("focus");
+	}
+
+	restore_rebuilt_control_focus() {
+		const selector = this.pending_focus_control;
+		this.pending_focus_control = null;
+		this.focus_control(selector);
+	}
+
+	// Returns the keyboard to the control a selection was made from once its re-render is done,
+	// for the selections that leave focus nowhere.
+	restore_selection_focus(selector) {
+		const focused = document.activeElement;
+		const focus_lost =
+			!focused || focused === document.body || focused === document.documentElement;
+
+		focus_lost && this.focus_control(selector);
 	}
 
 	fetch(filters, refresh = false, args) {
@@ -574,18 +793,126 @@ export default class ChartWidget extends Widget {
 				heatmap_year: args && args.heatmap_year ? args.heatmap_year : null,
 			};
 		}
+
+		this.last_fetch_response = null;
+
 		return frappe.xcall(method, args, undefined, {
 			silent: true,
+			// The request layer hands this the parsed response body for both outcomes, and hands
+			// the error callback below nothing at all on 401/403/404/413/500/502/504/508.
+			always: (response) => {
+				this.last_fetch_response = response;
+			},
 			error: (err) => {
-				const message = JSON.parse(JSON.parse(err._server_messages)[0])?.message;
-				this.chart_wrapper.hide();
-				this.loading.hide();
-				this.$summary && this.$summary.hide();
-				this.empty.hide();
-				this.error_state.text(message);
-				this.error_state.show();
+				this.show_error_state(this.get_fetch_error_message(err));
 			},
 		});
+	}
+
+	// Reads a displayable message out of whatever the request layer has: the argument passed to
+	// the error callback (a parsed response, a jqXHR, or nothing), then the response body of this
+	// request, and finally a generic message.
+	get_fetch_error_message(err) {
+		const responses = [err, err && err.responseJSON, this.last_fetch_response].filter(
+			(response) => response && typeof response === "object"
+		);
+
+		for (const response of responses) {
+			const server_message = this.parse_server_message(response._server_messages);
+
+			if (server_message) {
+				return server_message;
+			}
+		}
+
+		for (const response of responses) {
+			if (typeof response.message === "string" && response.message.trim()) {
+				return strip_html(response.message).trim();
+			}
+
+			if (typeof response.exc_type === "string" && response.exc_type) {
+				return __("Could not load chart data ({0})", [response.exc_type]);
+			}
+
+			if (response.status) {
+				return __("Could not load chart data (HTTP {0})", [response.status]);
+			}
+		}
+
+		return __("Could not load chart data");
+	}
+
+	// Returns the first message carried by a _server_messages payload, or "" when it carries none.
+	parse_server_message(server_messages) {
+		if (!server_messages) {
+			return "";
+		}
+
+		try {
+			const messages = JSON.parse(server_messages);
+			const message = messages.length ? JSON.parse(messages[0])?.message : null;
+
+			return message ? strip_html(String(message)).trim() : "";
+		} catch (e) {
+			return "";
+		}
+	}
+
+	// Replaces the chart with the error message and its Retry control.
+	show_error_state(message) {
+		if (!this.error_state) {
+			return;
+		}
+
+		const focus_retry = this.retry_focus_pending || this.widget_holds_focus();
+		this.retry_focus_pending = false;
+
+		this.chart_wrapper && this.chart_wrapper.hide();
+		this.loading && this.loading.hide();
+		this.$summary && this.$summary.hide();
+		this.empty && this.empty.hide();
+
+		this.setup_error_state_content();
+		this.error_message.text(message || __("Could not load chart data"));
+		this.error_state.show();
+
+		if (focus_retry) {
+			this.retry_button.trigger("focus");
+		}
+	}
+
+	// Re-fetches the chart data from the error state. fetch_and_update_chart() requests with
+	// refresh: 1 and renders, and render() hides the error state once data arrives.
+	retry_fetch() {
+		this.retry_focus_pending = this.widget_holds_focus();
+
+		this.error_state.hide();
+		this.loading.show();
+		this.fetch_and_update_chart();
+	}
+
+	// Returns the keyboard to the chart's action menu after a retry that started from the keyboard
+	// or the mouse inside this widget, which hiding the Retry button would otherwise drop on body.
+	restore_focus_after_retry() {
+		if (!this.retry_focus_pending) {
+			return;
+		}
+
+		this.retry_focus_pending = false;
+
+		const $menu = this.chart_actions && this.chart_actions.find(".chart-menu");
+
+		if ($menu && $menu.length) {
+			$menu.trigger("focus");
+		}
+	}
+
+	// True while the keyboard sits on one of this widget's own elements.
+	widget_holds_focus() {
+		const focused = document.activeElement;
+		const widget = this.widget && this.widget[0];
+
+		return Boolean(focused && widget && widget.contains(focused));
 	}
 
 	async get_source_doctype() {
@@ -608,14 +935,20 @@ export default class ChartWidget extends Widget {
 			if (!this.dashboard_chart) {
 				this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
 			} else if (is_circular_chart) {
-				this.chart_wrapper.empty();
-				delete this.dashboard_chart;
-				this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
+				this.recreate_chart(chart_args);
 			} else {
-				this.dashboard_chart.update(this.data);
+				try {
+					this.dashboard_chart.update(this.data);
+				} catch (error) {
+					console.warn("Chart update failed, redrawing the chart", error);
+					this.recreate_chart(chart_args);
+				}
 			}
 
 			this.bind_plot_area_tooltip();
+			this.make_chart_keyboard_accessible();
+			this.watch_chart_value_labels();
+			this.bind_axis_label_resize();
 		};
 
 		if (!this.data || !this.data.labels || !Object.keys(this.data).length) {
@@ -624,6 +957,7 @@ export default class ChartWidget extends Widget {
 			this.$summary && this.$summary.hide();
 			this.empty.show();
 			this.error_state.hide();
+			this.restore_focus_after_retry();
 		} else {
 			this.loading.hide();
 			this.empty.hide();
@@ -639,7 +973,15 @@ export default class ChartWidget extends Widget {
 
 			this.width == "Full" && this.summary && this.set_summary();
 			this.chart_doc.type == "Heatmap" && this.render_heatmap_legend();
+			this.restore_focus_after_retry();
 		}
+	}
+
+	// Draws a new chart from the current arguments in place of the rendered one.
+	recreate_chart(chart_args) {
+		this.chart_wrapper.empty();
+		delete this.dashboard_chart;
+		this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
 	}
 
 	// Makes the whole plot area a tooltip target on charts that print their values over points.
@@ -671,6 +1013,305 @@ export default class ChartWidget extends Widget {
 		});
 	}
 
+	// Pixels frappe-charts has for the plot area of this widget, measured on the chart wrapper and
+	// falling back to the widget and to the column of the widget group while either is unrendered.
+	get_chart_plot_width() {
+		const measured =
+			(this.chart_wrapper && this.chart_wrapper.width()) ||
+			(this.widget && this.widget.width()) ||
+			(this.widget && this.widget.parent().width()) ||
+			0;
+
+		return frappe.utils.get_chart_plot_width(measured);
+	}
+
+	// Axis options that keep the x labels of this widget legible at its current width.
+	get_axis_label_options() {
+		if (!["Line", "Bar"].includes(this.chart_doc.type)) {
+			return {};
+		}
+
+		const ratio = frappe.utils.get_axis_label_space_ratio(
+			this.data?.labels,
+			this.get_chart_plot_width(),
+			Boolean(this.chart_doc.timeseries)
+		);
+
+		return ratio ? { seriesLabelSpaceRatio: ratio } : {};
+	}
+
+	// Re-applies the x label density of this widget after the window has been resized, and drops the
+	// listener once the widget has left the document.
+	bind_axis_label_resize() {
+		if (!this.dashboard_chart || this.axis_label_resize_handler) {
+			return;
+		}
+
+		this.axis_label_resize_handler = frappe.utils.debounce(() => {
+			if (!this.dashboard_chart || !this.widget || !document.body.contains(this.widget[0])) {
+				this.release_chart_watchers();
+				return;
+			}
+
+			this.update_axis_label_density();
+		}, 200);
+
+		$(window).on("resize", this.axis_label_resize_handler);
+	}
+
+	release_chart_watchers() {
+		if (this.axis_label_resize_handler) {
+			$(window).off("resize", this.axis_label_resize_handler);
+			delete this.axis_label_resize_handler;
+		}
+
+		if (this.value_label_observer) {
+			this.value_label_observer.disconnect();
+			delete this.value_label_observer;
+		}
+	}
+
+	update_axis_label_density() {
+		const chart = this.dashboard_chart;
+		const ratio = this.get_axis_label_options().seriesLabelSpaceRatio;
+
+		if (!chart || !chart.config || !ratio) {
+			return;
+		}
+
+		if (chart.config.seriesLabelSpaceRatio === ratio) {
+			return;
+		}
+
+		chart.config.seriesLabelSpaceRatio = ratio;
+		chart.update(this.data);
+		this.format_chart_value_labels();
+	}
+
+	// Keeps the values printed over points in the number format of the axis ticks, including after
+	// frappe-charts has re-rendered them at the end of an animation.
+	watch_chart_value_labels() {
+		const chart = this.dashboard_chart;
+
+		if (!chart || !chart.config || !chart.config.valuesOverPoints) {
+			return;
+		}
+
+		this.format_chart_value_labels();
+
+		if (typeof MutationObserver !== "function") {
+			return;
+		}
+
+		if (this.value_label_observer) {
+			this.value_label_observer.disconnect();
+		}
+
+		this.value_label_observer = new MutationObserver(() => this.format_chart_value_labels());
+		this.value_label_observer.observe(this.chart_wrapper[0], {
+			childList: true,
+			subtree: true,
+		});
+	}
+
+	format_chart_value_labels() {
+		const chart = this.dashboard_chart;
+
+		if (!chart || !chart.config || !chart.config.valuesOverPoints) {
+			return;
+		}
+
+		// a stacked bar prints cumulative totals rather than its own dataset values
+		if (chart.barOptions && chart.barOptions.stacked) {
+			return;
+		}
+
+		const datasets = (this.data && this.data.datasets) || [];
+
+		this.chart_wrapper.find("g.dataset-units").each((_index, layer) => {
+			const dataset = (layer.getAttribute("class") || "").match(/\bdataset-(\d+)\b/);
+			const values = dataset && datasets[cint(dataset[1])]?.values;
+
+			if (!values) {
+				return;
+			}
+
+			layer.querySelectorAll("text.data-point-value").forEach((node) => {
+				const point_index = node.parentNode?.getAttribute("data-point-index");
+
+				if (point_index === null || point_index === undefined) {
+					return;
+				}
+
+				const value = values[cint(point_index)];
+
+				if (typeof value !== "number") {
+					return;
+				}
+
+				const formatted = frappe.utils.format_chart_axis_number(value);
+
+				if (node.textContent !== formatted) {
+					node.textContent = formatted;
+				}
+			});
+		});
+	}
+
+	// True when the rendered chart exposes the axis tooltip the keyboard handler drives.
+	chart_supports_tooltip_navigation(chart) {
+		return !!(
+			chart &&
+			chart.tip &&
+			typeof chart.mapTooltipXPosition === "function" &&
+			chart.state &&
+			chart.state.xAxis &&
+			chart.state.xAxis.positions &&
+			chart.state.xAxis.positions.length
+		);
+	}
+
+	// Turns the plot area into a labelled focus stop whose arrow keys walk the tooltip.
+	make_chart_keyboard_accessible() {
+		const chart = this.dashboard_chart;
+
+		if (!this.chart_wrapper || !this.chart_supports_tooltip_navigation(chart)) {
+			return;
+		}
+
+		const plot_area = this.chart_wrapper[0];
+
+		this.chart_wrapper.addClass("chart-plot-area").attr({
+			tabindex: "0",
+			role: "group",
+			"aria-label": __("{0} chart. Use the arrow keys to read values.", [
+				__(this.chart_doc.chart_name),
+			]),
+		});
+
+		// re-bounds the stored index to the label count of the chart as it now stands
+		this.clamp_tooltip_index();
+
+		if (plot_area.plot_area_keyboard_bound) {
+			return;
+		}
+
+		plot_area.plot_area_keyboard_bound = true;
+
+		this.chart_wrapper.on("keydown", (event) => this.handle_plot_area_keydown(event));
+		this.chart_wrapper.on("blur", () => this.hide_plot_area_tooltip());
+	}
+
+	handle_plot_area_keydown(event) {
+		const chart = this.dashboard_chart;
+
+		if (!this.chart_supports_tooltip_navigation(chart)) {
+			return;
+		}
+
+		const last_index = chart.state.xAxis.positions.length - 1;
+		const current_index = this.tooltip_index;
+		let next_index;
+
+		switch (event.key) {
+			case "ArrowRight":
+				next_index = current_index == null ? 0 : Math.min(current_index + 1, last_index);
+				break;
+			case "ArrowLeft":
+				next_index = current_index == null ? last_index : Math.max(current_index - 1, 0);
+				break;
+			case "Home":
+				next_index = 0;
+				break;
+			case "End":
+				next_index = last_index;
+				break;
+			case "Enter":
+			case " ":
+			case "Spacebar":
+				next_index = current_index == null ? 0 : current_index;
+				break;
+			case "Escape":
+				event.preventDefault();
+				this.hide_plot_area_tooltip();
+				return;
+			default:
+				// every other key, Tab included, keeps its default behaviour
+				return;
+		}
+
+		event.preventDefault();
+		this.move_tooltip_to(next_index);
+	}
+
+	// Shows the same tooltip the pointer shows, for the data point at `index`.
+	move_tooltip_to(index) {
+		const chart = this.dashboard_chart;
+
+		if (!this.chart_supports_tooltip_navigation(chart)) {
+			return;
+		}
+
+		const positions = chart.state.xAxis.positions;
+		const bounded_index = Math.min(Math.max(index, 0), positions.length - 1);
+		const value_label_offset = chart.config && chart.config.valuesOverPoints ? -20 : 0;
+
+		this.tooltip_index = bounded_index;
+		chart.mapTooltipXPosition(positions[bounded_index], value_label_offset);
+		this.announce_tooltip(bounded_index);
+	}
+
+	hide_plot_area_tooltip() {
+		const chart = this.dashboard_chart;
+
+		if (chart && chart.tip && typeof chart.tip.hideTip === "function") {
+			chart.tip.hideTip();
+		}
+
+		this.chart_announcer && this.chart_announcer.text("");
+	}
+
+	clamp_tooltip_index() {
+		const point_count = this.dashboard_chart?.state?.xAxis?.positions?.length || 0;
+
+		if (!point_count) {
+			this.tooltip_index = null;
+			return;
+		}
+
+		if (this.tooltip_index != null && this.tooltip_index > point_count - 1) {
+			this.tooltip_index = point_count - 1;
+		}
+	}
+
+	announce_tooltip(index) {
+		this.chart_announcer && this.chart_announcer.text(this.get_tooltip_announcement(index));
+	}
+
+	get_tooltip_announcement(index) {
+		const data_point = this.dashboard_chart?.dataByIndex?.[index];
+
+		if (!data_point) {
+			return "";
+		}
+
+		const title = strip_html(
+			String(data_point.formattedLabel ?? data_point.label ?? "")
+		).trim();
+		const values = (data_point.values || [])
+			.map((dataset_value) => {
+				const value = dataset_value.formatted ?? dataset_value.value;
+				const formatted_value = strip_html(String(value ?? "")).trim();
+				return dataset_value.title
+					? `${dataset_value.title} ${formatted_value}`
+					: formatted_value;
+			})
+			.filter((text) => text.length)
+			.join(", ");
+
+		return values ? `${title}: ${values}` : title;
+	}
+
 	get_chart_args() {
 		let colors = this.get_chart_colors();
 		let fieldtype, options;
@@ -692,10 +1333,13 @@ export default class ChartWidget extends Widget {
 			height: this.height,
 			maxSlices: this.chart_doc.number_of_groups || max_slices,
 			truncateLegends: 0,
-			axisOptions: {
-				xIsSeries: this.chart_doc.timeseries,
-				shortenYAxisNumbers: 1,
-			},
+			axisOptions: Object.assign(
+				{
+					xIsSeries: this.chart_doc.timeseries,
+					shortenYAxisNumbers: 1,
+				},
+				this.get_axis_label_options()
+			),
 		};
 
 		if (this.chart_doc.document_type) {
@@ -830,7 +1474,7 @@ export default class ChartWidget extends Widget {
 
 	update_chart_object() {
 		frappe.db.get_doc("Dashboard Chart", this.chart_doc.name).then((doc) => {
-			this.chart_doc = doc;
+			this.chart_doc = this.clone_value(doc);
 			this.update_last_synced();
 		});
 	}
@@ -887,7 +1531,7 @@ export default class ChartWidget extends Widget {
 	get_settings() {
 		return frappe.model.with_doc("Dashboard Chart", this.chart_name).then((chart_doc) => {
 			if (chart_doc) {
-				this.chart_doc = chart_doc;
+				this.chart_doc = this.clone_value(chart_doc);
 				if (this.chart_doc.chart_type == "Custom") {
 					// custom source
 					if (frappe.dashboards.chart_sources[this.chart_doc.source]) {

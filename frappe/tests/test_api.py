@@ -121,6 +121,19 @@ class FrappeAPITestCase(IntegrationTestCase):
 		finally:
 			frappe.local.request = original_request
 
+	def login_through_test_client(self) -> str:
+		"""Log in over `POST /api/method/login` so `TEST_CLIENT`'s cookie jar holds that session.
+
+		Returns the CSRF token the login response carries, which unsafe requests made through the
+		jar's `sid` cookie must send as `X-Frappe-CSRF-Token`.
+		"""
+		response = make_request(
+			target=self.TEST_CLIENT.post,
+			args=(self.method("login"),),
+			kwargs={"json": {"usr": "Administrator", "pwd": frappe.conf.admin_password or "admin"}},
+		)
+		return response.json["csrf_token"]
+
 	def get(self, path: str, params: dict | None = None, **kwargs) -> TestResponse:
 		return make_request(target=self.TEST_CLIENT.get, args=(path,), kwargs={"json": params, **kwargs})
 
@@ -287,7 +300,7 @@ class TestResourceAPI(FrappeAPITestCase):
 
 	def test_delete_document_v1(self):
 		doc_to_delete = choice(self.GENERATED_DOCUMENTS)
-		response = self.delete(self.resource(self.DOCTYPE, doc_to_delete))
+		response = self.delete(self.resource(self.DOCTYPE, doc_to_delete), query_string={"sid": self.sid})
 		self.assertEqual(response.status_code, 202)
 		self.assertDictEqual(response.json, {"data": "ok"})
 
@@ -408,7 +421,9 @@ class TestMethodAPI(FrappeAPITestCase):
 		method = "frappe.tests.test_api.test_array"
 
 		test_data = list(range(5))
-		response = self.post(self.method(method), test_data)
+		# a JSON array body carries no `sid`, so this request is authenticated by the jar's cookie
+		csrf_token = self.login_through_test_client()
+		response = self.post(self.method(method), test_data, headers={"X-Frappe-CSRF-Token": csrf_token})
 
 		self.assertEqual(response.json["message"], test_data)
 
@@ -616,12 +631,56 @@ class TestCSRFProtection(FrappeAPITestCase):
 		"""A client that keeps no cookie jar, so every request carries only the cookies it is given."""
 		return get_test_client(use_cookies=False)
 
+	@cached_property
+	def token_less_sid(self) -> str:
+		"""Return this test's `sid`, with the CSRF token removed from its session.
+
+		`login_as` mints a token for every session it creates, so a session that holds none - one
+		created before this site was upgraded - is synthesised by clearing the stored token in both
+		the `Sessions` table and the session cache.
+		"""
+		sid = self.sid
+		Sessions = frappe.qb.DocType("Sessions")
+		stored = (frappe.qb.from_(Sessions).select(Sessions.sessiondata).where(Sessions.sid == sid)).run()[0][
+			0
+		]
+
+		session_data = frappe.parse_json(stored)
+		session_data.pop("csrf_token", None)
+		(
+			frappe.qb.update(Sessions)
+			.where(Sessions.sid == sid)
+			.set(Sessions.sessiondata, frappe.as_json(session_data, indent=None, separators=(",", ":")))
+		).run()
+		frappe.db.commit()
+
+		if cached_session := frappe.cache.hget("session", sid):
+			cached_session["data"].pop("csrf_token", None)
+			frappe.cache.hset("session", sid, cached_session)
+
+		return sid
+
 	def cookie_request(self, method: str, path: str, data: dict, headers: dict | None = None):
 		return make_request(
 			target=getattr(self.cookie_client, method),
 			args=(path,),
-			kwargs={"json": data, "headers": {"Cookie": f"sid={self.sid}", **(headers or {})}},
+			kwargs={"json": data, "headers": {"Cookie": f"sid={self.token_less_sid}", **(headers or {})}},
 		)
+
+	def login_with_cookie_jar(self):
+		"""Log in over `POST /api/method/login` with a client that keeps the session cookie.
+
+		Returns the client and the CSRF token the login response carries.
+		"""
+		client = get_test_client(use_cookies=True)
+		response = make_request(
+			target=client.post,
+			args=(self.method("login"),),
+			kwargs={"json": {"usr": "Administrator", "pwd": frappe.conf.admin_password or "admin"}},
+		)
+		self.assertEqual(response.status_code, 200)
+
+		return client, response.json.get("csrf_token")
 
 	def stored_description(self) -> str:
 		frappe.db.rollback()
@@ -665,14 +724,68 @@ class TestCSRFProtection(FrappeAPITestCase):
 		self.assertEqual(response.status_code, 200)
 		self.assertEqual(self.stored_description(), description)
 
-	def test_request_without_browser_origin_is_accepted(self):
-		description = "updated by a non-browser client"
+	def test_request_without_browser_origin_is_rejected(self):
+		"""A non-browser client on a token-less cookie session carries no same-site evidence."""
 		response = self.cookie_request(
-			"put", self.resource("ToDo", self.todo.name), {"description": description}
+			"put", self.resource("ToDo", self.todo.name), {"description": "updated by a non-browser client"}
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json.get("exc_type"), "CSRFTokenError")
+		self.assertEqual(self.stored_description(), self.PROBE_DESCRIPTION)
+
+	def test_allow_cors_wildcard_does_not_exempt_token_less_session(self):
+		self.addCleanup(update_site_config, "allow_cors", "None")
+		update_site_config("allow_cors", "*")
+
+		response = self.cookie_request(
+			"put",
+			self.resource("ToDo", self.todo.name),
+			{"description": "forged from any origin"},
+			{"Origin": self.FOREIGN_ORIGIN},
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json.get("exc_type"), "CSRFTokenError")
+		self.assertEqual(self.stored_description(), self.PROBE_DESCRIPTION)
+
+	def test_login_response_carries_csrf_token(self):
+		response = make_request(
+			target=self.cookie_client.post,
+			args=(self.method("login"),),
+			kwargs={"json": {"usr": "Administrator", "pwd": frappe.conf.admin_password or "admin"}},
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(response.json.get("message"), "Logged In")
+		self.assertIsInstance(response.json.get("csrf_token"), str)
+		self.assertTrue(response.json["csrf_token"])
+
+	def test_token_from_login_is_accepted_on_cookie_session(self):
+		client, csrf_token = self.login_with_cookie_jar()
+		description = "updated with the token from the login response"
+
+		response = make_request(
+			target=client.put,
+			args=(self.resource("ToDo", self.todo.name),),
+			kwargs={"json": {"description": description}, "headers": {"X-Frappe-CSRF-Token": csrf_token}},
 		)
 
 		self.assertEqual(response.status_code, 200)
 		self.assertEqual(self.stored_description(), description)
+
+	def test_login_token_session_rejects_unsafe_request_without_token(self):
+		client, _ = self.login_with_cookie_jar()
+
+		response = make_request(
+			target=client.put,
+			args=(self.resource("ToDo", self.todo.name),),
+			kwargs={"json": {"description": "updated without the session's token"}},
+		)
+
+		self.assertEqual(response.status_code, 400)
+		self.assertEqual(response.json.get("exc_type"), "CSRFTokenError")
+		self.assertEqual(self.stored_description(), self.PROBE_DESCRIPTION)
 
 	def test_login_is_not_blocked_for_a_cross_origin_request(self):
 		response = make_request(

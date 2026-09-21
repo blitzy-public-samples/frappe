@@ -33,6 +33,9 @@ MAX_PASSWORD_SIZE = 512
 # `Sec-Fetch-Site` values that report an initiator which is not another site.
 SAME_SITE_FETCH_SITES = frozenset(("same-origin", "none"))
 
+# The request path that authenticates a user and creates their session.
+LOGIN_PATH = "/api/method/login"
+
 
 def get_hostname(url: str | None) -> str:
 	"""Return the lower-cased host of `url` without a leading `www.`, or an empty string.
@@ -100,6 +103,13 @@ class HTTPRequest:
 		frappe.local.login_manager = LoginManager()
 
 	def validate_csrf_token(self):
+		"""Reject an unsafe request that cannot be attributed to this site's own session.
+
+		Only an ambient cookie session of a logged-in user is validated. Such a request must
+		supply the session's CSRF token, and a session that holds no token must instead carry
+		positive same-site evidence (`is_allowed_without_csrf_token`). The login request is not
+		validated: its session is created by the request instead of carried into it.
+		"""
 		if (
 			not frappe.request
 			or frappe.request.method not in UNSAFE_HTTP_METHODS
@@ -111,6 +121,9 @@ class HTTPRequest:
 		supplied_token = frappe.get_request_header("X-Frappe-CSRF-Token") or frappe.form_dict.pop(
 			"csrf_token", None
 		)
+
+		if frappe.request.path == LOGIN_PATH or not self.is_ambient_cookie_session():
+			return
 
 		if saved_token := frappe.session.data.csrf_token:
 			if supplied_token == saved_token or self.is_allowed_referrer():
@@ -124,23 +137,35 @@ class HTTPRequest:
 	def set_lang(self):
 		frappe.local.lang = get_language()
 
+	def is_ambient_cookie_session(self) -> bool:
+		"""Return whether this request is authenticated by a logged-in user's `sid` cookie.
+
+		A Guest session, and a session identified by an `sid` in the body or query string, by an
+		`Authorization` header or by an OAuth bearer token, is not ambient: the caller had to know
+		the credential, so the request cannot be a cross-site replay of a cookie the browser holds.
+		"""
+		if frappe.session.user == "Guest" or not frappe.request.cookies.get("sid"):
+			return False
+
+		session_obj = getattr(frappe.local, "session_obj", None)
+
+		return not (session_obj and getattr(session_obj, "sid_from_request_parameter", False))
+
 	def is_allowed_without_csrf_token(self) -> bool:
 		"""Return whether an unsafe request whose session holds no CSRF token may proceed.
 
-		It may proceed when the session is not an ambient cookie session of a logged-in user, when
-		no request header reports a cross-site initiator, or when the referrer or origin is
-		allow-listed through the `allowed_referrers` or `allow_cors` site configuration.
+		It may proceed when a request header positively reports this site as the initiator, or
+		when the referrer or origin is allow-listed through the `allowed_referrers` site
+		configuration or named by an explicit `allow_cors` origin list.
 		"""
-		if frappe.session.user == "Guest" or not frappe.request.cookies.get("sid"):
-			return True
-
 		return self.is_same_site_request() or self.is_allowed_referrer() or self.is_allowed_cors_origin()
 
 	def is_same_site_request(self) -> bool:
-		"""Return whether no request header reports an initiator outside this site.
+		"""Return whether a request header positively reports this site as the initiator.
 
-		`Sec-Fetch-Site` is read first, then `Origin`, then `Referer`. A request that carries none
-		of them - a non-browser client - is reported as same-site.
+		`Sec-Fetch-Site` is read first, then `Origin`, then `Referer`. A request that reports an
+		initiator outside this site, and a request that carries none of the three headers - a
+		non-browser client - are both reported as not same-site.
 		"""
 		fetch_site = frappe.get_request_header("Sec-Fetch-Site")
 		if fetch_site and fetch_site not in SAME_SITE_FETCH_SITES:
@@ -150,7 +175,7 @@ class HTTPRequest:
 			if value := frappe.get_request_header(header):
 				return get_hostname(value) in self.site_hostnames
 
-		return True
+		return bool(fetch_site)
 
 	@property
 	def site_hostnames(self) -> set[str]:
@@ -170,15 +195,16 @@ class HTTPRequest:
 		return self._site_hostnames
 
 	def is_allowed_cors_origin(self) -> bool:
-		"""Return whether the request `Origin` is permitted by the site's `allow_cors` setting."""
+		"""Return whether the request `Origin` is named by the site's `allow_cors` setting.
+
+		A wildcard `allow_cors` of `"*"` names no origin and never permits a request that carries
+		no CSRF token; only an explicitly configured origin does.
+		"""
 		if not (origin := frappe.get_request_header("Origin")):
 			return False
 
-		if not (allowed_origins := frappe.conf.allow_cors):
+		if not (allowed_origins := frappe.conf.allow_cors) or allowed_origins == "*":
 			return False
-
-		if allowed_origins == "*":
-			return True
 
 		if not isinstance(allowed_origins, list):
 			allowed_origins = [allowed_origins]
@@ -213,7 +239,7 @@ class LoginManager:
 		self.full_name = None
 		self.user_type = None
 
-		if frappe.local.request.path == "/api/method/login":
+		if frappe.local.request.path == LOGIN_PATH:
 			if self.login() is False:
 				return
 			self.resume = False
@@ -253,6 +279,9 @@ class LoginManager:
 				return False
 		frappe.form_dict.pop("pwd", None)
 		self.post_login()
+
+		# the API login response carries the new session's CSRF token for non-browser clients
+		frappe.local.response["csrf_token"] = frappe.session.data.csrf_token
 
 	def post_login(self, session_end: str | None = None, audit_user: str | None = None):
 		self.run_trigger("on_login")

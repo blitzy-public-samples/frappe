@@ -8,6 +8,8 @@ import json
 import frappe
 from frappe.utils.data import cstr
 
+CSRF_TOKEN_HEADER = "X-Frappe-CSRF-Token"
+
 
 class AuthError(Exception):
 	pass
@@ -71,6 +73,7 @@ class FrappeClient:
 		)
 
 		if r.status_code == 200 and r.json().get("message") in ("Logged In", "No App"):
+			self.set_csrf_token(r.json().get("csrf_token"))
 			return r.json()
 		elif r.status_code == 502:
 			raise SiteUnreachableError
@@ -83,6 +86,15 @@ class FrappeClient:
 				error = r.text
 				print(error)
 			raise AuthError
+
+	def set_csrf_token(self, csrf_token):
+		"""Send `csrf_token` with every subsequent request of this cookie session.
+
+		A server that returns no token - one older than this client - leaves the header unset, and
+		key-authenticated clients never reach this method because they hold no session cookie.
+		"""
+		if csrf_token:
+			self.headers[CSRF_TOKEN_HEADER] = csrf_token
 
 	def setup_key_authentication_headers(self):
 		if self.api_key and self.api_secret:
@@ -106,6 +118,7 @@ class FrappeClient:
 			verify=self.verify,
 			headers=self.headers,
 		)
+		self.headers.pop(CSRF_TOKEN_HEADER, None)
 
 	def get_list(
 		self,

@@ -23,7 +23,8 @@ export default class NumberCardWidget extends Widget {
 	}
 
 	set_body() {
-		this.widget.addClass("number-widget-box");
+		// widget-shadow carries the tile's hover elevation
+		this.widget.addClass("number-widget-box widget-shadow");
 		this.make_card();
 	}
 
@@ -65,6 +66,37 @@ export default class NumberCardWidget extends Widget {
 	set_events() {
 		$(this.body).click(() => {
 			if (this.in_customize_mode) return;
+			this.set_route();
+		});
+
+		if (this.in_customize_mode) return;
+
+		this.make_tile_operable();
+	}
+
+	/**
+	 * Makes the tile itself keyboard-operable: it carries a link role, an accessible name and
+	 * a tab stop, and Enter or Space performs the same navigation as a click on the tile body.
+	 *
+	 * The keydown binding is namespaced and rebound on every render, and it handles only
+	 * events whose target is the tile element - keys pressed on the card actions dropdown
+	 * nested inside the tile are left to that control.
+	 */
+	make_tile_operable() {
+		const tile_label = this.title || this.label || this.name;
+
+		this.widget.attr({
+			role: "link",
+			tabindex: 0,
+			"aria-label": __("{0}: open list", [__(tile_label)]),
+		});
+
+		this.widget.off("keydown.number_card").on("keydown.number_card", (e) => {
+			if (e.target !== this.widget[0]) return;
+			if (this.in_customize_mode) return;
+			if (!["Enter", " ", "Spacebar"].includes(e.key)) return;
+
+			e.preventDefault();
 			this.set_route();
 		});
 	}
@@ -376,11 +408,11 @@ export default class NumberCardWidget extends Widget {
 
 	set_card_actions(actions) {
 		this.card_actions = $(`<div class="card-actions dropdown pull-right">
-				<a data-toggle="dropdown" role="button" tabindex="0"
-					aria-haspopup="true" aria-expanded="false"
+				<button type="button" class="btn btn-xs card-menu" data-toggle="dropdown"
+					tabindex="0" aria-haspopup="true" aria-expanded="false"
 					aria-label="${__("Card Actions")}" title="${__("Card Actions")}">
 				...
-				</a>
+				</button>
 				<ul class="dropdown-menu" role="menu" style="max-height: 300px; overflow-y: auto;">
 					${actions
 						.map(

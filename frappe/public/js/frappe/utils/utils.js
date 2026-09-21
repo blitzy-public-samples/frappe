@@ -8,6 +8,95 @@ frappe.provide("frappe.utils");
 
 const eval_function_cache = new Map();
 
+// pixels one character of the 10px axis label text of a chart occupies
+const CHART_AXIS_LABEL_CHAR_WIDTH = 5.6;
+// pixels kept clear between two neighbouring axis labels
+const CHART_AXIS_LABEL_GAP = 8;
+// share of a label's own width added on top of it when every label is rendered in full
+const CHART_AXIS_LABEL_HEADROOM = 1.02;
+// pixels frappe-charts reserves horizontally around its plot area: margins 20 + 20, paddings 30 + 10
+const CHART_PLOT_EXTRA_WIDTH = 80;
+// divisor frappe-charts applies to the pixels per label to get the characters per label
+const CHART_AXIS_LABEL_CHAR_DIVISOR = 7;
+// absolute value from which an axis tick may carry a number system symbol such as K, M, L or Cr
+const CHART_AXIS_ABBREVIATION_THRESHOLD = 1000;
+// absolute value from which an abbreviated axis tick may carry two decimals instead of one
+const CHART_AXIS_TWO_DECIMAL_ABBREVIATION_THRESHOLD = 1.0e6;
+// decimals an axis tick is printed with at most
+const CHART_AXIS_MAX_DECIMALS = 2;
+// decimals binary representation noise is dropped beyond
+const CHART_AXIS_VALUE_PRECISION = 6;
+// site number formats that carry no decimal separator, and the variant of each that does
+const CHART_AXIS_DECIMAL_NUMBER_FORMATS = {
+	"#,###": "#,###.##",
+	"#.###": "#.###,##",
+};
+
+// The finite number an axis tick holds with representation noise dropped, or null when the tick
+// holds no number.
+function chart_axis_value(label) {
+	if (label === null || label === undefined || label === "") {
+		return null;
+	}
+
+	const value = typeof label === "number" ? label : Number(label);
+
+	if (!isFinite(value)) {
+		return null;
+	}
+
+	return parseFloat(value.toFixed(CHART_AXIS_VALUE_PRECISION));
+}
+
+// The site number format, replaced by its decimal-carrying variant for a tick that has decimals.
+function chart_axis_number_format(decimals) {
+	const format = frappe.boot?.sysdefaults?.number_format || "#,###.##";
+
+	if (decimals && frappe.number_format_info?.[format]?.decimal_str === "") {
+		return CHART_AXIS_DECIMAL_NUMBER_FORMATS[format] || "#,###.##";
+	}
+
+	return format;
+}
+
+// An axis tick written out in full with the group separator of the site number format.
+function group_chart_axis_number(value) {
+	const decimals = Math.min(frappe.utils.get_number_of_decimals(value), CHART_AXIS_MAX_DECIMALS);
+
+	if (typeof format_number !== "function" || !frappe.boot?.sysdefaults) {
+		return value.toFixed(decimals);
+	}
+
+	return format_number(value, chart_axis_number_format(decimals), decimals);
+}
+
+// An axis tick abbreviated in the number system of `country`, or null when the abbreviation would
+// not carry the tick exactly.
+function abbreviate_chart_axis_number(value, country) {
+	const magnitude = Math.abs(value);
+
+	if (magnitude < CHART_AXIS_ABBREVIATION_THRESHOLD) {
+		return null;
+	}
+
+	const number_system = frappe.utils.get_number_system(country);
+	const rounded_magnitude = Math.abs(Math.round(value));
+	const map = number_system.find((entry) => rounded_magnitude >= entry.divisor);
+
+	if (!map) {
+		return null;
+	}
+
+	const decimals = magnitude >= CHART_AXIS_TWO_DECIMAL_ABBREVIATION_THRESHOLD ? 2 : 1;
+	const scaled = (value / map.divisor) * Math.pow(10, decimals);
+
+	if (Math.abs(scaled - Math.round(scaled)) > 1e-9) {
+		return null;
+	}
+
+	return frappe.utils.shorten_number(value, country, 4, decimals);
+}
+
 // Array de duplicate
 if (!Array.prototype.uniqBy) {
 	Object.defineProperty(Array.prototype, "uniqBy", {
@@ -1488,22 +1577,104 @@ Object.assign(frappe.utils, {
 				chart_args[key] = custom_options[key];
 			}
 		}
-		frappe.utils.set_space_label_ratio(chart_args);
+		const wrapper_width = wrapper?.clientWidth || wrapper?.offsetWidth || 0;
+		frappe.utils.set_space_label_ratio(
+			chart_args,
+			frappe.utils.get_chart_plot_width(wrapper_width)
+		);
 		return new frappe.Chart(wrapper, chart_args);
 	},
 
 	format_chart_axis_number(label, country) {
-		const default_country = frappe.sys_defaults.country;
-		// the number zero formats as "0"; null, undefined, "" and NaN are not numbers here
-		// and keep shorten_number's empty string
-		if (typeof label === "number" && label === 0) {
+		const value = chart_axis_value(label);
+
+		// null, undefined, "" and every value that is not a finite number carry no tick text
+		if (value === null) {
+			return "";
+		}
+
+		if (value === 0) {
 			return "0";
 		}
-		return frappe.utils.shorten_number(label, country || default_country, 3);
+
+		const country_of_number_system = country || frappe.sys_defaults?.country;
+		const abbreviated = abbreviate_chart_axis_number(value, country_of_number_system);
+
+		return abbreviated === null ? group_chart_axis_number(value) : abbreviated;
 	},
-	set_space_label_ratio(chart_args) {
-		if (chart_args.data.labels.length > 10) {
-			chart_args["axisOptions"]["seriesLabelSpaceRatio"] = 0.9;
+
+	// Pixels frappe-charts has for its plot area inside a wrapper `container_width` pixels wide.
+	get_chart_plot_width(container_width) {
+		return Math.max((cint(container_width) || 0) - CHART_PLOT_EXTRA_WIDTH, 0);
+	},
+
+	/**
+	 * The `axisOptions.seriesLabelSpaceRatio` that keeps `labels` legible in `plot_width` pixels,
+	 * or null when the labels cannot be measured. frappe-charts allows
+	 * `plot_width / labels.length * ratio / 7` characters per label; a series axis blanks every
+	 * label that is longer than that except every `ceil(longest / characters)`-th one and the last,
+	 * while a non-series axis truncates them.
+	 */
+	get_axis_label_space_ratio(labels, plot_width, is_series = true) {
+		const count = Array.isArray(labels) ? labels.length : 0;
+
+		if (!count || !plot_width || plot_width <= 0) {
+			return null;
+		}
+
+		const longest = Math.max(...labels.map((label) => String(label ?? "").length));
+
+		if (!longest) {
+			return null;
+		}
+
+		const slot = plot_width / count;
+		const characters_that_fit = (slot - CHART_AXIS_LABEL_GAP) / CHART_AXIS_LABEL_CHAR_WIDTH;
+		const ratio_for = (characters) =>
+			(CHART_AXIS_LABEL_CHAR_DIVISOR * count * Math.max(characters, 0.5)) / plot_width;
+
+		if (count === 1 || longest <= characters_that_fit) {
+			return ratio_for(longest * CHART_AXIS_LABEL_HEADROOM);
+		}
+
+		// a truncated label loses three characters and gains the four of " ..."
+		if (!is_series) {
+			return ratio_for(Math.max(characters_that_fit - 1, 1));
+		}
+
+		const min_stride = Math.ceil(
+			(longest * CHART_AXIS_LABEL_CHAR_WIDTH + CHART_AXIS_LABEL_GAP) / slot
+		);
+		let stride = min_stride;
+
+		// the last label is always rendered, so the stride must either land on it or clear it
+		while (
+			stride < count - 1 &&
+			(count - 1) % stride !== 0 &&
+			(count - 1) % stride < min_stride
+		) {
+			stride += 1;
+		}
+
+		return ratio_for(longest / (stride - 0.5));
+	},
+
+	set_space_label_ratio(chart_args, plot_width) {
+		const labels = chart_args?.data?.labels;
+
+		if (!labels || chart_args.axisOptions?.seriesLabelSpaceRatio) {
+			return;
+		}
+
+		const ratio = frappe.utils.get_axis_label_space_ratio(
+			labels,
+			plot_width,
+			Boolean(chart_args.axisOptions?.xIsSeries)
+		);
+
+		if (ratio) {
+			chart_args.axisOptions = chart_args.axisOptions || {};
+			chart_args.axisOptions.seriesLabelSpaceRatio = ratio;
 		}
 	},
 	generate_route(item) {

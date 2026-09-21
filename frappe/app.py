@@ -250,6 +250,33 @@ def log_request(request, response):
 
 NO_CACHE_HEADERS = {"Cache-Control": "no-store,no-cache,must-revalidate,max-age=0"}
 
+# Baseline security response headers applied to every dynamic response.
+DEFAULT_X_FRAME_OPTIONS = "SAMEORIGIN"
+DEFAULT_X_CONTENT_TYPE_OPTIONS = "nosniff"
+DEFAULT_REFERRER_POLICY = "strict-origin-when-cross-origin"
+DEFAULT_CONTENT_SECURITY_POLICY = (
+	"default-src 'self'; "
+	"script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
+	"style-src 'self' 'unsafe-inline' https:; "
+	"img-src 'self' data: blob: https:; "
+	"font-src 'self' data: https:; "
+	"connect-src 'self' ws: wss: https:; "
+	"frame-src 'self' https:; "
+	"media-src 'self' data: blob: https:; "
+	"worker-src 'self' blob:; "
+	"object-src 'none'; "
+	"base-uri 'self'; "
+	"frame-ancestors 'self'"
+)
+
+# Site config key -> (header name, default value). An empty configured value omits the header.
+SECURITY_HEADER_CONFIG_KEYS = {
+	"x_frame_options": ("X-Frame-Options", DEFAULT_X_FRAME_OPTIONS),
+	"content_security_policy": ("Content-Security-Policy", DEFAULT_CONTENT_SECURITY_POLICY),
+	"x_content_type_options": ("X-Content-Type-Options", DEFAULT_X_CONTENT_TYPE_OPTIONS),
+	"referrer_policy": ("Referrer-Policy", DEFAULT_REFERRER_POLICY),
+}
+
 
 def process_response(response: Response):
 	if not response:
@@ -271,6 +298,9 @@ def process_response(response: Response):
 
 	if response.status_code in (401, 403) and is_oauth_metadata_enabled("resource"):
 		set_authenticate_headers(response)
+
+	# Security headers, applied before the per-request headers are merged
+	set_security_headers(response)
 
 	# Update custom headers added during request processing
 	response.headers.update(frappe.local.response_headers)
@@ -319,6 +349,86 @@ def set_cors_headers(response):
 			cors_headers["Access-Control-Max-Age"] = "86400"
 
 	response.headers.update(cors_headers)
+
+
+def set_security_headers(response: Response):
+	"""Add the baseline security headers to `response`.
+
+	Each header is added with `setdefault`, so a header already set on the response - e.g. the
+	`frame-ancestors` Content-Security-Policy a Web Form with allowed embedding domains sets - is
+	kept as it is. Every header can be overridden per site through the site config keys in
+	`SECURITY_HEADER_CONFIG_KEYS`; an empty or null configured value omits that header, and
+	`disable_security_headers` omits all of them.
+
+	    # site_config.json
+	    {"referrer_policy": "same-origin", "x_frame_options": "DENY"}
+	"""
+	conf = getattr(frappe.local, "conf", None) or {}
+
+	if cint(conf.get("disable_security_headers")):
+		return
+
+	request_headers = getattr(frappe.local, "response_headers", None) or {}
+	explicit_csp = response.headers.get("Content-Security-Policy") or request_headers.get(
+		"Content-Security-Policy"
+	)
+
+	for config_key, (header, default) in SECURITY_HEADER_CONFIG_KEYS.items():
+		value = conf[config_key] if config_key in conf else default
+		if not value:
+			continue
+
+		value = str(value)
+
+		if header == "Content-Security-Policy":
+			if explicit_csp:
+				continue
+			value = add_dev_socketio_source(value)
+		elif header == "X-Frame-Options" and explicit_csp and frame_ancestors_allow_other_hosts(explicit_csp):
+			# omitted while the response's own policy allows framing by other hosts
+			continue
+
+		response.headers.setdefault(header, value)
+
+
+def frame_ancestors_allow_other_hosts(policy: str) -> bool:
+	"""Return whether `policy`'s frame-ancestors directive names a host beyond 'self'/'none'."""
+	for directive in policy.split(";"):
+		sources = directive.split()
+		if sources and sources[0].lower() == "frame-ancestors":
+			return any(source.strip("'\"").lower() not in ("self", "none") for source in sources[1:])
+
+	return False
+
+
+def add_dev_socketio_source(policy: str) -> str:
+	"""Return `policy` with the development server's socketio origin added to connect-src.
+
+	The Desk realtime client connects to `window.location.origin` behind a reverse proxy, but to
+	`<scheme>://<hostname>:<socketio_port>` when served by the development server.
+	"""
+	if not frappe._dev_server:
+		return policy
+
+	conf = getattr(frappe.local, "conf", None) or {}
+	socketio_port = conf.get("socketio_port")
+	request = getattr(frappe.local, "request", None)
+
+	if not (socketio_port and request):
+		return policy
+
+	source = f"{request.scheme}://{request.host.split(':')[0]}:{socketio_port}"
+	directives = [directive.strip() for directive in policy.split(";") if directive.strip()]
+
+	for index, directive in enumerate(directives):
+		sources = directive.split()
+		if sources[0].lower() == "connect-src":
+			if source in sources:
+				return policy
+			directives[index] = f"{directive} {source}"
+			return "; ".join(directives)
+
+	return policy
 
 
 def set_authenticate_headers(response: Response):

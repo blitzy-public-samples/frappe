@@ -247,10 +247,17 @@ body {
 
 		.chart-loading-state {
 			display: flex;
+			flex-direction: column;
+			gap: var(--margin-sm);
 			justify-content: center;
 			align-items: center;
 			border-radius: 7px;
 			background-color: var(--subtle-accent);
+
+			// restores the focus ring that `.dashboard-widget-box .btn-xs` removes
+			.chart-retry:focus-visible {
+				box-shadow: var(--focus-default);
+			}
 		}
 
 		.report-summary {
@@ -647,6 +654,19 @@ body {
 		min-height: 84px;
 		padding: 12px;
 		border: 1px solid var(--border-color);
+		transition: border-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
+
+		&:hover,
+		&:focus-visible,
+		&:focus-within {
+			border-color: var(--invert-neutral, currentColor);
+			box-shadow: var(--shadow-base);
+		}
+
+		&:focus-visible {
+			box-shadow: var(--focus-default), var(--shadow-base);
+			outline: 0;
+		}
 
 		.widget-head {
 			.widget-title {
@@ -1414,5 +1434,65 @@ body {
 
 	.dropdown-item-icon {
 		margin-right: 5px;
+	}
+}
+
+// WCAG AA contrast overrides, scoped to Desk dashboard and widget surfaces.
+// Decision Log rows RF-1 .. RF-7 in blitzy/documentation/PR Description.md section 6.
+
+// Re-declares --focus-default, --focus-outline-default and --placeholder-color
+// for these surfaces only. Ring geometry (2px light, 3px dark) is unchanged from
+// frappe/public/css/espresso/effects.css; the colour becomes var(--ink-gray-6).
+.dashboard-page,
+.widget-group,
+.widget {
+	--focus-default: 0px 0px 0px 2px var(--ink-gray-6);
+	--focus-outline-default: 2px solid var(--ink-gray-6);
+	--placeholder-color: var(--ink-gray-6);
+}
+
+[data-theme="dark"] .dashboard-page,
+[data-theme="dark"] .widget-group,
+[data-theme="dark"] .widget {
+	--focus-default: 0px 0px 0px 3px var(--ink-gray-6);
+	--focus-outline-default: 3px solid var(--ink-gray-6);
+}
+
+.widget {
+	// Overrides `.form-control::placeholder { color: var(--gray-500) }`, which
+	// bootstrap compiles from $input-placeholder-color rather than from a token.
+	::placeholder {
+		color: var(--ink-gray-6);
+		opacity: 1;
+	}
+
+	// Overrides `.text-extra-muted { color: var(--ink-gray-5) !important }`
+	// from frappe/public/scss/desk/global.scss.
+	.text-extra-muted {
+		color: var(--ink-gray-6) !important;
+	}
+
+	// Restores the focus ring on widget controls that `.dashboard-widget-box
+	// .btn-xs { box-shadow: none }` above leaves without one.
+	.btn:focus-visible,
+	.btn-reset:focus-visible,
+	a:focus-visible,
+	[tabindex]:focus-visible {
+		box-shadow: var(--focus-default);
+		outline: none;
+	}
+}
+
+// Overrides bootstrap's `.text-danger { color: #e03636 !important }` utility,
+// emitted by its text-emphasis-variant mixin.
+.dashboard-widget-box .chart-loading-state.text-danger {
+	color: var(--ink-red-8) !important;
+}
+
+body[data-route^="dashboard-view"] .navbar-breadcrumbs a {
+	color: var(--ink-gray-6);
+
+	&:before {
+		color: var(--ink-gray-5);
 	}
 }

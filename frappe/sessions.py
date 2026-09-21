@@ -208,7 +208,16 @@ def generate_csrf_token():
 
 
 class Session:
-	__slots__ = ("_update_in_cache", "data", "full_name", "sid", "time_diff", "user", "user_type")
+	__slots__ = (
+		"_update_in_cache",
+		"data",
+		"full_name",
+		"sid",
+		"sid_from_request_parameter",
+		"time_diff",
+		"user",
+		"user_type",
+	)
 
 	def __init__(
 		self,
@@ -219,9 +228,10 @@ class Session:
 		session_end: str | None = None,
 		audit_user: str | None = None,
 	):
-		self.sid = cstr(
-			frappe.form_dict.pop("sid", None) or unquote(frappe.request.cookies.get("sid", "Guest"))
-		)
+		# an `sid` in the body or query string identifies the session instead of the cookie
+		request_parameter_sid = frappe.form_dict.pop("sid", None)
+		self.sid_from_request_parameter = bool(request_parameter_sid)
+		self.sid = cstr(request_parameter_sid or unquote(frappe.request.cookies.get("sid", "Guest")))
 		assert isinstance(self.sid, str), "sid must be a string after cstr normalization"
 		self.user = user
 		self.user_type = user_type
@@ -271,6 +281,7 @@ class Session:
 			self.data.data.audit_user = audit_user
 
 		if self.user != "Guest":
+			# a logged-in session holds a CSRF token from creation, before the first response is built
 			self.data.data.update(
 				{
 					"last_updated": frappe.utils.now(),
@@ -278,6 +289,7 @@ class Session:
 					"session_expiry": get_expiry_period(),
 					"full_name": self.full_name,
 					"user_type": self.user_type,
+					"csrf_token": frappe.generate_hash(),
 				}
 			)
 

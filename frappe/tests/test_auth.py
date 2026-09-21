@@ -319,6 +319,7 @@ class TestCSRFTokenValidation(IntegrationTestCase):
 			getattr(frappe.local, "request", None),
 			getattr(frappe.local, "session", None),
 			getattr(frappe.local, "form_dict", None),
+			getattr(frappe.local, "session_obj", None),
 		)
 		for key in ("ignore_csrf", "allow_cors", "allowed_referrers"):
 			self.addCleanup(self.restore_conf, key, frappe.conf.get(key))
@@ -332,10 +333,11 @@ class TestCSRFTokenValidation(IntegrationTestCase):
 		frappe.cache.delete_value("allowed_referrers")
 
 	@staticmethod
-	def restore_request_context(request, session, form_dict):
+	def restore_request_context(request, session, form_dict, session_obj):
 		frappe.local.request = request
 		frappe.local.session = session
 		frappe.local.form_dict = form_dict
+		frappe.local.session_obj = session_obj
 
 	@staticmethod
 	def restore_conf(key, value):
@@ -352,9 +354,15 @@ class TestCSRFTokenValidation(IntegrationTestCase):
 		session_token: str | None = None,
 		user: str = "Administrator",
 		sid_cookie: bool = True,
+		sid_in_request: bool = False,
 		form_dict: dict | None = None,
 	) -> None:
-		"""Run `validate_csrf_token` against a synthesised request, session and form dict."""
+		"""Run `validate_csrf_token` against a synthesised request, session and form dict.
+
+		`session_token` is the CSRF token the session holds, `None` synthesising a session created
+		before tokens were minted at login. `sid_in_request` synthesises a session identified by an
+		`sid` in the body or query string rather than by the cookie.
+		"""
 		request_headers = dict(headers or {})
 		if sid_cookie:
 			request_headers.setdefault("Cookie", "sid=a-session-id")
@@ -366,6 +374,7 @@ class TestCSRFTokenValidation(IntegrationTestCase):
 			headers=request_headers,
 		)
 		frappe.local.session = frappe._dict(user=user, data=frappe._dict(csrf_token=session_token))
+		frappe.local.session_obj = frappe._dict(sid_from_request_parameter=sid_in_request)
 		frappe.local.form_dict = frappe._dict(form_dict or {})
 
 		HTTPRequest.validate_csrf_token(HTTPRequest.__new__(HTTPRequest))
@@ -406,9 +415,39 @@ class TestCSRFTokenValidation(IntegrationTestCase):
 		self.validate(headers={"Origin": "https://portal.example.com"})
 		self.assertRejected(headers={"Origin": "https://portal.example.net"})
 
-	def test_request_without_browser_origin_allowed_when_session_has_no_token(self):
-		"""A non-browser client, such as `FrappeClient`, sends no origin, referrer or fetch metadata."""
-		self.validate()
+	def test_request_without_browser_origin_rejected_when_session_has_no_token(self):
+		"""A non-browser client on a token-less cookie session carries no same-site evidence."""
+		self.assertRejected()
+
+	def test_token_less_session_requires_positive_same_site_evidence(self):
+		self.validate(headers={"Sec-Fetch-Site": "same-origin"})
+		self.validate(headers={"Origin": self.SITE_ORIGIN})
+		self.validate(headers={"Referer": f"{self.SITE_ORIGIN}/desk/todo"})
+
+		self.assertRejected(headers={})
+		self.assertRejected(headers={"Sec-Fetch-Site": "cross-site", "Origin": self.SITE_ORIGIN})
+
+	def test_sid_in_form_dict_without_cookie_is_not_subject_to_csrf(self):
+		"""An `sid` supplied in the body or query string is not an ambient cookie credential."""
+		self.validate(
+			sid_cookie=False,
+			sid_in_request=True,
+			form_dict={"sid": "a-session-id"},
+			headers={"Origin": self.FOREIGN_ORIGIN},
+		)
+
+		# the cookie a previous response left behind does not make such a request ambient
+		self.validate(
+			sid_in_request=True,
+			form_dict={"sid": "a-session-id"},
+			headers={"Origin": self.FOREIGN_ORIGIN},
+		)
+		self.validate(
+			sid_in_request=True,
+			session_token=self.SESSION_TOKEN,
+			form_dict={"sid": "a-session-id"},
+			headers={"Origin": self.FOREIGN_ORIGIN},
+		)
 
 	def test_guest_session_allowed_when_session_has_no_token(self):
 		self.validate(user="Guest", headers={"Origin": self.FOREIGN_ORIGIN})
@@ -424,13 +463,18 @@ class TestCSRFTokenValidation(IntegrationTestCase):
 		self.validate(headers={"Referer": f"{self.FOREIGN_ORIGIN}/embedded.html"})
 
 	def test_allow_cors_conf_allows_cross_site_request_without_token(self):
-		for allow_cors in (self.FOREIGN_ORIGIN, [self.FOREIGN_ORIGIN, "http://other.example"], "*"):
+		"""An explicitly configured origin is an allow-list; the wildcard `"*"` is not."""
+		for allow_cors in (self.FOREIGN_ORIGIN, [self.FOREIGN_ORIGIN, "http://other.example"]):
 			with self.subTest(allow_cors=allow_cors):
 				frappe.conf.allow_cors = allow_cors
 				self.validate(headers={"Origin": self.FOREIGN_ORIGIN})
 
 		frappe.conf.allow_cors = ["http://other.example"]
 		self.assertRejected(headers={"Origin": self.FOREIGN_ORIGIN})
+
+		frappe.conf.allow_cors = "*"
+		self.assertRejected(headers={"Origin": self.FOREIGN_ORIGIN})
+		self.assertRejected()
 
 	def test_safe_methods_are_never_validated(self):
 		for method in ("GET", "HEAD", "OPTIONS", "QUERY"):
@@ -465,8 +509,71 @@ class TestCSRFTokenValidation(IntegrationTestCase):
 		self.assertNotIn("csrf_token", frappe.local.form_dict)
 
 	def test_supplied_token_is_removed_from_the_form_dict(self):
-		self.validate(form_dict={"csrf_token": "a-token-for-a-token-less-session"})
+		self.assertRejected(form_dict={"csrf_token": "a-token-for-a-token-less-session"})
 		self.assertNotIn("csrf_token", frappe.local.form_dict)
+
+		self.validate(
+			headers={"Sec-Fetch-Site": "same-origin"},
+			form_dict={"csrf_token": "a-token-for-a-token-less-session"},
+		)
+		self.assertNotIn("csrf_token", frappe.local.form_dict)
+
+
+class TestLoginMintsCSRFToken(IntegrationTestCase):
+	"""Cover the CSRF token that `POST /api/method/login` mints, stores and returns."""
+
+	def test_api_login_mints_stores_and_returns_a_csrf_token(self):
+		self.addCleanup(
+			self.restore_login_context,
+			getattr(frappe.local, "request", None),
+			getattr(frappe.local, "session", None),
+			getattr(frappe.local, "session_obj", None),
+			getattr(frappe.local, "login_manager", None),
+			getattr(frappe.local, "cookie_manager", None),
+			getattr(frappe.local, "request_ip", None),
+			frappe.local.response,
+			dict(frappe.local.form_dict),
+		)
+
+		set_request(path="/api/method/login", method="POST", base_url=get_site_url(frappe.local.site))
+		frappe.local.response = frappe._dict()
+		frappe.local.form_dict = frappe._dict(usr="Administrator", pwd=frappe.conf.admin_password or "admin")
+
+		# the whole request path: the login creates the session, then CSRF validation runs on it
+		HTTPRequest()
+		sid = frappe.session.sid
+		self.addCleanup(self.delete_session_record, sid)
+
+		token = frappe.session.data.csrf_token
+		self.assertIsInstance(token, str)
+		self.assertTrue(token)
+		self.assertEqual(frappe.local.response["csrf_token"], token)
+
+		Sessions = frappe.qb.DocType("Sessions")
+		stored = (frappe.qb.from_(Sessions).select(Sessions.sessiondata).where(Sessions.sid == sid)).run()[0][
+			0
+		]
+		self.assertEqual(frappe.parse_json(stored).csrf_token, token)
+		self.assertEqual(frappe.sessions.get_csrf_token(), token)
+
+	@staticmethod
+	def restore_login_context(
+		request, session, session_obj, login_manager, cookie_manager, request_ip, response, form_dict
+	):
+		frappe.local.request = request
+		frappe.local.session = session
+		frappe.local.session_obj = session_obj
+		frappe.local.login_manager = login_manager
+		frappe.local.cookie_manager = cookie_manager
+		frappe.local.request_ip = request_ip
+		frappe.local.response = response
+		frappe.local.form_dict = frappe._dict(form_dict)
+
+	@staticmethod
+	def delete_session_record(sid: str) -> None:
+		frappe.db.delete("Sessions", {"sid": sid})
+		frappe.db.commit()
+		frappe.cache.hdel("session", sid)
 
 
 class TestHostname(UnitTestCase):
