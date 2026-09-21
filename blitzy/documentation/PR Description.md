@@ -26,6 +26,88 @@ merged narrative. The units and the directives they implement:
 | H | D9, D10.8 | Empty dynamic filter values no longer written into a widget's filter state (`frappe/public/js/frappe/utils/dashboard_utils.js`). |
 | I | D11, D13 | CSRF token minted at API login, fail-closed rejection for token-less cookie sessions, `allow_cors: "*"` audit and tightening, shipped Python client sends the token. |
 | J | D12 | Security response-header baseline (`X-Frame-Options`, `Content-Security-Policy`, `X-Content-Type-Options`, `Referrer-Policy`) in `frappe/app.py`. |
+| K | D1, D2, D14 | Scope verification against the review's exclusions, the merged-tree regression run, and this document's §1/§2/§3 consolidation. |
+
+**Directive by directive.** Every change below is on branch
+`blitzy-2add1b35-3745-43e2-944e-dbba0015c106`; Units A–J landed together in commit `811ceb2cc3`
+("fix(desk,auth): refine ToDo Analytics dashboard widgets and harden CSRF and response headers") on top
+of the pre-refinement delivery `932cb6aae4`, and Unit K's verification and this document's consolidation
+follow in the `docs(desk)` commit.
+
+- **D1 — scope guard. Verified, nothing reverted.** All 39 paths in `git diff --name-status
+  a8824d994f..HEAD` fall into exactly three groups: the twelve Section C framework files, the eighteen
+  files of the feature's original delivery, and the nine additional paths listed in §3. Every area the
+  review excluded is untouched by the refinement: `frappe/utils/dashboard.py` (`cache_source`, the chart
+  data caching behind the HTTP 508 case), `frappe/desk/doctype/dashboard_chart/dashboard_chart.py` (the
+  `last_synced_on` write), the two chart-source modules' caching (the whole
+  `frappe/desk/dashboard_chart_source/` tree is absent from the refinement's diff), `pyproject.toml`,
+  `package.json`, `yarn.lock`, `.github/**` (no dependency-advisory or CI-gate work),
+  `frappe/patches.txt`, `frappe/hooks.py`, and `blitzy/documentation/Project Guide.md` (no decision-log
+  or test-inventory reconciliation — the refinement's own decisions live in §6 of this document
+  instead). No out-of-scope hunk was found, so no revert was needed.
+- **D2 — no regression. Verified on the merged tree** (bench with assets rebuilt, `migrate` run, web
+  server up): the 40 protected Python tests pass — 17 in
+  `frappe.desk.dashboard_chart_source.todo_created_vs_completed.test_todo_created_vs_completed`, 14 in
+  `…todo_top_owners.test_todo_top_owners`, 9 in `frappe.tests.test_todo_analytics_dashboard` — and
+  `cypress/integration/todo_analytics_dashboard.js` passes 10 of 10 `it` blocks, its original
+  "renders two cards and two charts" case included. The framework modules the refinement touches also
+  pass: `test_auth` 3 + 32, `test_api` 47, `test_cors` 4, `test_frappe_client` 14,
+  `test_security_headers` 19, `test_api_v2` 44, `test_oauth20` 8, `test_website` 24,
+  `web_form.test_web_form` 36, `test_number_card` 5, `test_dashboard_chart_source` 7,
+  `test_dashboard_chart` 11, `test_dashboard` 1, `test_todo` 6 — 301 Python tests in total, every module
+  `OK`. Every test file was extended, never replaced; the only removals are the two renamed,
+  expectation-flipped fail-open cases the CSRF directive required (see the O-5 note in §2 and rows RI-3
+  and RI-7). Full commands and counts are in §7 under "Unit K — merged-tree regression".
+- **D3 — axis label density and number formatting (Unit A).** `frappe/public/js/frappe/utils/utils.js`
+  gains `frappe.utils.format_chart_axis_number` (site group separator, at most two decimals, binary noise
+  rounded away, abbreviations only where exact) and a width-aware `set_space_label_ratio`;
+  `chart_widget.js` measures the plot width, derives the label stride, re-applies it on a debounced
+  resize and routes the values printed over points through the same formatter. Rows RA-1 … RA-5.
+- **D4 — time-window control lifecycle (Unit B).** In `chart_widget.js` (with helpers in
+  `dashboard_utils.js`) every timespan, interval and date-range selection issues exactly one fetch with
+  the selected arguments and redraws, responses are sequence-checked so a superseded one cannot
+  overwrite a newer, the chart document and the per-user chart settings are copied per widget so two
+  widgets never share state, and focus returns to the control the selection was made from. Rows
+  RB-1 … RB-8.
+- **D5 — chart error-state recovery (Unit C).** The error container in `chart_widget.js` now holds a
+  `role="alert"` message and a keyboard-operable `button.chart-retry` that re-fetches through the same
+  path the controls use (`refresh: 1`) and hides the error on success, with a focus ring added in
+  `desktop.scss`. Rows RC-1 … RC-7.
+- **D6 — keyboard and ARIA residuals (Units D and E).** Widget menus are keyboard-operable with focus
+  returned to the toggle on every close path, the applied option is marked programmatically
+  (`role="menuitemradio"` with `aria-checked`), the Card Actions toggle is a native button, and each
+  chart's plot area is focusable with arrow/Home/End/Enter/Escape tooltip navigation announced through a
+  per-widget live region. Rows RD-1 … RD-8 and RE-1 … RE-8.
+- **D7 — WCAG AA contrast tokens (Unit F).** `frappe/public/scss/desk/desktop.scss` overrides
+  `--focus-default`, `--focus-outline-default` and `--placeholder-color` and the placeholder, extra-muted,
+  danger and breadcrumb colours, scoped to the Desk dashboard and widget surfaces in both themes. The
+  four failures named in the review (focus ring 1.56:1, placeholder 3.93:1, error text 4.16:1,
+  breadcrumbs 4.17:1) and two more found while measuring now meet AA; no global token was changed. Rows
+  RF-1 … RF-8.
+- **D8 — Number Card tile hover affordance (Unit G).** `number_card_widget.js` applies the framework's
+  existing `widget-shadow` class and makes the tile a named, keyboard-operable `role="link"` with
+  `:hover`, `:focus-visible` and `:focus-within` parity in `desktop.scss`. Rows RG-1 … RG-3.
+- **D9 — empty filter write (Unit H).** `frappe.dashboard_utils.is_unset_filter_value` defines "unset"
+  and `get_all_filters` omits such dynamic filters from both the list- and dict-shaped filter state
+  while preserving `0` and `false`. Rows RH-1 … RH-6.
+- **D10 — coverage for every change (Units A–H, J; D10.9 Units D–G).** Nine `it` blocks were appended to
+  `cypress/integration/todo_analytics_dashboard.js`, one per change, and the checks a browser test
+  cannot make — what a screen reader actually announces — are listed in §4.
+- **D11 — CSRF coverage (Unit I).** `frappe/sessions.py` mints the session's token at creation,
+  `frappe/auth.py` exposes it in the `POST /api/method/login` response and fails closed for token-less
+  cookie sessions without same-site evidence, and `frappe/frappeclient.py` sends
+  `X-Frappe-CSRF-Token`; tests were added to `test_auth.py`, `test_api.py` and `test_frappe_client.py`.
+  Rows RI-1 … RI-7, RK-1, RK-2.
+- **D12 — security response-header baseline (Unit J).** `frappe/app.py::process_response` applies
+  `X-Frame-Options`, a Desk-tuned `Content-Security-Policy`, `X-Content-Type-Options: nosniff` and
+  `Referrer-Policy` with `setdefault`, overridable per site, covered by the new
+  `frappe/tests/test_security_headers.py`. Rows RJ-1 … RJ-9.
+- **D13 — `allow_cors: "*"` audit (Unit I).** The wildcard no longer exempts a request from CSRF, an
+  enumerated origin still does, and every retained `"*"` is documented with its reason in §5. Row RI-3.
+- **D14 — flag files outside the twelve (Unit K).** §3 lists all nine paths changed or added outside the
+  twelve Section C files and outside the feature's own eighteen, each with its directive and the reason
+  it was necessary, plus the Project Guide §5.2 maintainer sign-off note and a second table naming the
+  eight Section C files this refinement reopened.
 
 ### Unit B — time-window control lifecycle
 
@@ -65,6 +147,22 @@ still written. One Cypress `it` block was appended to `cypress/integration/todo_
 to prove it.
 
 ## 2. Behaviour changes and release notes
+
+What a user or an operator notices after this refinement, one sub-section per unit. The Desk changes
+(Units A–H) are visual and interaction changes on dashboard and widget surfaces and need no migration:
+charts label their axes legibly and format numbers consistently, the time-window controls redraw
+reliably and keep the keyboard where the user left it, a failed chart offers Retry instead of a page
+reload, every widget menu and both plot areas are operable from the keyboard with the applied option
+announced, Desk dashboard surfaces meet WCAG AA contrast, Number Card tiles respond to hover and focus,
+and a dynamic filter that resolves to nothing is dropped rather than sent as `null`. The security
+changes (Units I and J) alter server behaviour and carry the only breaking change in this refinement —
+an unsafe request on a token-less cookie session that presents no same-site evidence is now rejected —
+together with four new response headers that an operator can override per site. Each sub-section states
+the change, what an operator must do about it, and the AAP sections the review's directives overrode
+(O-1 to O-5 in the adjudication record): editing the shipped framework files, adding markup, ARIA and
+SCSS of the feature's own, extending the error container with a control, changing the login response and
+the CSRF and CORS posture, and growing the test files beyond their planned inventory are all directed by
+the review and are listed in §3 for maintainer sign-off.
 
 ### Unit A — axis density and number formatting
 
@@ -266,9 +364,17 @@ need maintainer sign-off before merge (Project Guide §5.2). The files below are
 addition* to those twelve and are flagged here rather than proceeding silently, as the review feedback
 requires. The same sign-off note applies to them.
 
+The table is derived from `git diff --name-status a8824d994f..HEAD` on the merged tree rather than from
+the units' own claims. Of the 39 changed paths, twelve are the Section C framework files (listed again
+under this table), eighteen are the feature's own files added by the original delivery — the package
+markers, records, server modules, client configs and collocated tests of the two chart sources under
+`frappe/desk/dashboard_chart_source/`, the two `frappe/desk/dashboard_chart/todo_*` records, the two
+`frappe/desk/number_card/todo_*` records, `frappe/desk/desk_dashboard/todo_analytics/todo_analytics.json`,
+`frappe/tests/test_todo_analytics_dashboard.py` and `cypress/integration/todo_analytics_dashboard.js`,
+which are the feature's own artefacts and need no flag — and the nine rows below are everything else.
+
 | Path | New or existing | Directive | Reason the change was necessary |
 | --- | --- | --- | --- |
-| `cypress/integration/todo_analytics_dashboard.js` | Existing (created by this feature's original delivery, AAP §0.6.1 Group 3 — not one of the twelve) | D10.1–D10.8 (Units A–H, J) | D2 requires extending the existing spec rather than replacing it, so each unit appended one `it` block for its change (axis formatting, time-window lifecycle, error retry, keyboard menus, keyboard tooltips, WCAG contrast, tile affordance, empty dynamic filters, security headers). The original `it` block still runs; the one assertion invalidated by the new option role was updated minimally (decision RD-6). |
 | `frappe/sessions.py` | Existing | D11 | `Session.start()` mints the session's CSRF token so a session created by `POST /api/method/login` holds one from creation, persisted by the session row's existing single insert. `Session.__init__` also records whether the `sid` came from the request body/query, which `frappe/auth.py` needs to keep explicit-`sid` requests outside the CSRF check. |
 | `frappe/frappeclient.py` | Existing | D11 | The shipped Python client must send `X-Frappe-CSRF-Token`; without it every cookie-session write from `FrappeClient` would be rejected by the fail-closed check. |
 | `frappe/tests/test_frappe_client.py` | Existing | D11 | Adds `test_client_sends_csrf_token_after_login`, the regression test for the client change above. |
@@ -277,8 +383,41 @@ requires. The same sign-off note applies to them.
 | `frappe/app.py` | Existing | D12 | `process_response()` is the single response layer every dynamic response passes through (Desk HTML via `get_response()`, API JSON, downloads, well-known endpoints, `OPTIONS` and error responses). The four security headers cannot be added anywhere else without missing response paths. |
 | `frappe/tests/test_security_headers.py` | New | D12 | Coverage for the header baseline: default values, the Desk-compatible policy, renderer/`response_headers` precedence, the per-site overrides and opt-out, presence on Desk page, dashboard, API, login and web-form responses, and presence on a CORS response for a site with `allow_cors: "*"`. No existing test module covers the response layer's headers. |
 | `blitzy/documentation/PR Description.md` | New | D10.9, D13.c, D14, Rule 1 | The feedback asks for notes "in the PR description" (manual screen-reader checks, the retained `allow_cors: "*"` cases, files outside the twelve) and Rule 1 requires a decision log. No such artefact existed in the repository, so this committed document is it (adjudication record I-1). |
+| `blitzy/documentation/Project Guide.md` | New, and added by the delivery this refinement reviews — **not changed by this refinement** | none (D1 excludes it) | Listed for completeness because `git diff a8824d994f..HEAD` contains it: the Project Guide was committed by the pre-refinement delivery (commit `932cb6aae4`) and `git diff 932cb6aae4..HEAD -- "blitzy/documentation/Project Guide.md"` is empty. D1 excludes reconciling its pending decision-log rows and its test inventory, so the refinement leaves the file untouched and records its own decisions in §6 of this document instead. |
+
+Per Project Guide Section 5.2 these are framework-wide changes and need maintainer sign-off before
+merge; the twelve Section C files were also modified further by D3–D11.
+
+### Section C files touched again by this refinement
+
+Eight of the twelve Section C files are modified again by this refinement (`git diff --name-status
+932cb6aae4..HEAD`); the other four were changed by the original delivery only and are untouched here.
+They are already covered by the Section 5.2 sign-off the Project Guide records, and are listed so the
+reviewer sees which directive reopened each one.
+
+| Path | Directive(s) in this refinement |
+| --- | --- |
+| `frappe/auth.py` | D11 (CSRF mint at API login, fail-closed rejection for token-less cookie sessions), D13 (`allow_cors: "*"` no longer exempts CSRF) |
+| `frappe/public/js/frappe/utils/utils.js` | D3 (`format_chart_axis_number`, exact abbreviations, `set_space_label_ratio` width awareness) |
+| `frappe/public/js/frappe/widgets/chart_widget.js` | D3 (axis formatter and density wiring), D4 (time-window control lifecycle), D5 (error state with Retry), D6.a/b (menu keyboard operability and focus restoration), D6.c (focusable plot area, keyboard tooltips, live region), D6.d (applied option marked) |
+| `frappe/public/js/frappe/widgets/number_card_widget.js` | D6.a/b (Card Actions toggle as a native button, focus restoration), D8 (tile hover and focus affordance, keyboard activation) |
+| `frappe/public/js/frappe/utils/dashboard_utils.js` | D4 (per-widget chart settings, single window accessor), D6.a/b/d (`make_dropdown_keyboard_operable`, `label_dropdown_menu`, `mark_selected_dropdown_option`), D9 (`is_unset_filter_value`, empty dynamic filters omitted) |
+| `frappe/public/scss/desk/desktop.scss` | D7 (WCAG AA contrast overrides scoped to the Desk dashboard and widget surfaces), D5 (`.chart-retry:focus-visible` ring, RC-7), D8 (tile hover, `:focus-visible` and `:focus-within` treatment) |
+| `frappe/tests/test_auth.py` | D11.d / D10 (CSRF mint, fail-closed and same-site-evidence coverage; the pre-refine fail-open case flipped per O-5) |
+| `frappe/tests/test_api.py` | D11.d / D10 (login token exposure, token-accepted and token-less rejection over real HTTP; the pre-refine fail-open case flipped per O-5) |
+| `frappe/desk/doctype/dashboard_chart_source/dashboard_chart_source.py` | none — unchanged by this refinement |
+| `frappe/desk/doctype/number_card/number_card.py` | none — unchanged by this refinement |
+| `frappe/desk/doctype/dashboard_chart_source/test_dashboard_chart_source.py` | none — unchanged by this refinement |
+| `frappe/desk/doctype/number_card/test_number_card.py` | none — unchanged by this refinement |
 
 Notes per unit:
+
+- `cypress/integration/todo_analytics_dashboard.js` is one of the eighteen feature files and therefore
+  needs no D14 flag, but it is the file every front-end unit extended: D2 requires extending the existing
+  spec rather than replacing it, so each unit appended one `it` block for its change (axis formatting,
+  time-window lifecycle, error retry, keyboard menus, keyboard tooltips, WCAG contrast, tile affordance,
+  empty dynamic filters, security headers). The original `it` block still runs; the one assertion
+  invalidated by the new option role was updated minimally (decision RD-6).
 
 - Units A, B, C, D, E and H changed only Section C files (`utils.js`, `chart_widget.js`,
   `dashboard_utils.js`, `number_card_widget.js`, `desktop.scss`) besides the spec and this document.
@@ -496,7 +635,7 @@ response — the baseline has no CORS exemption (test
 | RD-1 | The Number Card "Card Actions" toggle in `number_card_widget.set_card_actions` becomes `<button type="button" class="btn btn-xs card-menu" data-toggle="dropdown" tabindex="0">`, keeping the `.card-actions [data-toggle="dropdown"]` selector, the `aria-label` and the explicit `tabindex="0"`. | (a) Keep `<a role="button" tabindex="0">` and keep activating it from script on Enter and Space; (b) give the anchor an `href="#"` so the browser activates it; (c) keep the anchor and add `btn btn-secondary` styling. | A native button is activated by Enter and Space by the browser itself, is reachable by Tab without an explicit `tabindex`, and is exposed as a button by every screen reader, which removes the scripted key shim the anchor needed. (b) would add a history entry and a URL change; (c) would not fix activation. `btn btn-xs` alone keeps the transparent background of `.btn`, so the tile looks exactly as before; `btn-secondary` would have added a filled control to every card. | A stylesheet or test selecting `.card-actions a` for the toggle would need `.card-actions button`; the repository contains no such selector, and the class, the `data-toggle` selector, the accessible name and the tab stop are all preserved. |
 | RD-2 | The chart "Set Filters" button declares `aria-haspopup="dialog"`, and focus is returned to it from `hidden.bs.modal` on the filter dialog's wrapper (Custom and Report charts) and from `hidden.bs.popover` on the button (document-type charts). | (a) Leave `aria-haspopup="true"`, which means a menu; (b) use `aria-haspopup="menu"`; (c) hook the dialog's own `onhide` callback; (d) stop the dialog's Escape keydown from reaching the Desk's global handler. | The control opens a `frappe.ui.Dialog`, or a FilterGroup filter popover for a document-type chart — never a menu — so (a) and (b) misdescribe it to assistive technology; `"dialog"` also covers the non-modal popover. (c) was implemented first and failed: `onhide` runs on `hide.bs.modal`, and the Desk's global Escape handler (`frappe/public/js/frappe/ui/keyboard.js`) blurs the active element a few milliseconds later on the same keydown, leaving focus on `body`. `hidden.bs.modal` runs after that blur, so the restoration survives. (d) would have required changing shared dialog or keyboard code outside this refinement. | The filter popover of a document-type chart is still not dismissible with Escape (no Escape binding in `frappe/public/js/frappe/ui/filters/filter_list.js`), which is pre-existing behaviour this refinement does not change; the focus restoration applies once that popover closes by any other means. |
 | RD-3 | The applied option of a single-selection widget dropdown is marked with `role="menuitemradio"` and `aria-checked="true"`, the other options with `aria-checked="false"`, and the applied one additionally carries Bootstrap's `.active` class. | (a) `aria-current="true"` on the applied option, leaving `role="menuitem"`; (b) `aria-selected`; (c) a visible check icon only; (d) rely on the control's label, which already shows the applied value. | `menuitemradio` with `aria-checked` is the WAI-ARIA pattern for a menu whose options are mutually exclusive, and it is the one that makes readers announce both the state and its absence on the other options. `aria-current` describes a location rather than a choice; `aria-selected` is not defined for menu items outside a listbox or a tab list; (c) and (d) leave the state visual-only, which is what the review feedback asked to fix. | `.active` is the secondary, visual indicator only — the requirement is carried by `aria-checked`. The framework renders `.dropdown-item.active` as white text on `#7c7c7c` (about 3.9:1), below WCAG AA for normal text; the token is `$component-active-bg` in `frappe/public/scss/desk/variables.scss` and is reported to the work unit that owns the contrast tokens (directive D7) rather than changed here. |
-| RD-4 | `frappe.dashboard_utils.make_dropdown_keyboard_operable` handles the menu keys itself (Enter, Space, ArrowDown, ArrowUp, Home, End, Escape, Tab) and calls `stopPropagation`, instead of extending or relying on Bootstrap's own keydown handling. | (a) Rely on Bootstrap 4.6.2's `_dataApiKeydownHandler`; (b) keep Bootstrap's handling and add only the missing keys; (c) replace Bootstrap's dropdown plugin. | Bootstrap's handler reacts to ArrowUp, ArrowDown and Escape only (its key filter is `/38|40|27/`): it does not move focus into the menu when the menu opens, does not wrap at either end, has no Home or End, and reaches Space only for text inputs. Under (b) the two handlers would both act on the same key press and fight over the focused item; handling the keys locally and stopping propagation keeps one owner per key and leaves Bootstrap to open, close and position the menu. (c) would touch every dropdown in the Desk. | Keys handled on a widget menu no longer reach document-level handlers, which is the intent (Escape in a menu closes the menu and nothing else). A future Bootstrap upgrade that adds this behaviour would make the local handler redundant, not wrong. |
+| RD-4 | `frappe.dashboard_utils.make_dropdown_keyboard_operable` handles the menu keys itself (Enter, Space, ArrowDown, ArrowUp, Home, End, Escape, Tab) and calls `stopPropagation`, instead of extending or relying on Bootstrap's own keydown handling. | (a) Rely on Bootstrap 4.6.2's `_dataApiKeydownHandler`; (b) keep Bootstrap's handling and add only the missing keys; (c) replace Bootstrap's dropdown plugin. | Bootstrap's handler reacts to ArrowUp, ArrowDown and Escape only (its key filter is `/38\|40\|27/`): it does not move focus into the menu when the menu opens, does not wrap at either end, has no Home or End, and reaches Space only for text inputs. Under (b) the two handlers would both act on the same key press and fight over the focused item; handling the keys locally and stopping propagation keeps one owner per key and leaves Bootstrap to open, close and position the menu. (c) would touch every dropdown in the Desk. | Keys handled on a widget menu no longer reach document-level handlers, which is the intent (Escape in a menu closes the menu and nothing else). A future Bootstrap upgrade that adds this behaviour would make the local handler redundant, not wrong. |
 | RD-5 | Focus is restored from one `hidden.bs.dropdown` handler per dropdown, and only when the toggle is still in the document and focus is on `body`, inside the menu that just closed, or nowhere. | (a) Restore focus separately in each close path (Escape, outside click, activation); (b) restore unconditionally on every close; (c) restore nothing and let the browser decide. | `hidden.bs.dropdown` is the one event every close path goes through — Escape, an outside click, activating an option, and a programmatic close — so one handler covers them all and cannot miss a path, which (a) demonstrably did. The guard is what makes an action that deliberately moves focus (a dialog that takes it, a route change that discards the widget) keep it, which (b) would override. (c) is the reported defect: an outside click left the keyboard on `body`. | An action that moves focus asynchronously after the menu closes wins over the restoration, which is the intended order. A widget that rebuilds its control row (chart "Refresh") restores focus through the chart widget's own `action_area_holds_focus` path instead, because the original toggle is gone by then; both paths end with the toggle focused. |
 | RD-6 | The existing Cypress assertion `role="menuitem"` on the first timespan option was updated to `role="menuitemradio"`; every other existing assertion in that `it` block is untouched, and the block still runs. | (a) Keep `role="menuitem"` on the filter options and mark the applied one some other way; (b) add both roles; (c) delete or replace the original `it` block. | The option role is exactly what RD-3 changed, so the assertion encoded the pre-refinement value and had to follow it. (a) would have abandoned the chosen ARIA pattern to keep a test green; (b) is not valid ARIA; (c) is forbidden — the spec is extended, not replaced. | A reader of the original test sees the role change in the diff; the accompanying new `it` block asserts the full checked-state behaviour, so the change is covered rather than merely relaxed. |
 | RD-7 | A menu is always closed by triggering a click on its toggle, never by `$toggle.dropdown("hide")`. | (a) Call Bootstrap's `hide()` and fix `aria-expanded` afterwards; (b) remove the `show` classes directly. | In Bootstrap 4.6.2 only `Dropdown._clearMenus` resets `aria-expanded` to `false`; `hide()` leaves it at `true`, so (a) would announce an open menu to assistive technology after the menu closed, or would need the attribute patched in two more places. Clicking the toggle is the path Bootstrap itself uses for its Escape handling, and it fires `hidden.bs.dropdown` exactly once. | The synthetic click is dispatched through jQuery, whose own re-entrancy guard keeps the native click from running the handlers a second time. |
@@ -544,6 +683,8 @@ response — the baseline has no CORS exemption (test
 | RJ-9 | Cover the baseline in a new module `frappe/tests/test_security_headers.py` and one appended Cypress `it`, rather than extending `frappe/tests/test_cors.py` | (a) Add the cases to `test_cors.py`; (b) add them to `test_api.py`; (c) server-side tests only | `test_cors.py` is scoped to CORS reflection semantics and `test_api.py` to the REST surface; the header baseline spans both plus the website and Desk renderers, so a dedicated module keeps each suite's subject intact. The module reuses both existing harness patterns — `process_response` called directly for unit-level precedence cases, `FrappeAPITestCase` for real HTTP responses — and the Cypress case proves the Desk bundle still renders under the policy in a browser | One more test module to discover. The Cypress case runs only in the UI workflow |
 | RK-1 | `frappe/tests/test_oauth20.py`: the four authorization-code tests remove the `sid` cookie from the test client (`forget_sid_cookie`) after the authorize step and before posting to `frappe.integrations.oauth2.get_token` / `revoke_token`. | (a) Send the `login_as` session's token as `X-Frappe-CSRF-Token` on those posts; (b) exempt the OAuth token and revocation endpoints from `validate_csrf_token` in `frappe/auth.py`; (c) strip the token from the harness session as `TestCSRFProtection.token_less_sid` does and rely on same-site evidence. | The token and revocation endpoints are called by the OAuth client with its own credentials (client id / secret, PKCE verifier, bearer token), never by the resource owner's browser session, so a harness that carries the user's cookie into them models a request that does not occur in practice; dropping the cookie makes the tests exercise the bearer token alone. (a) and (c) keep the unrealistic ambient session; (b) widens the product's exemption list for a test-only need. | The module no longer covers an OAuth token request made from a logged-in browser session on the same origin; such a request needs the session's CSRF token, exactly like any other unsafe same-origin request. |
 | RK-2 | `frappe/tests/test_api_v2.py`: `test_add_comment_v2` sends `sid` in its JSON body and `test_delete_document_non_existing_v2` sends it in the query string, instead of relying on the cookie that the v2 harness login leaves in the shared test client. | (a) Log in through the test client and send the CSRF token (as `test_array_response_v1` does); (b) strip the token from the harness session. | Mirrors RI-7 for the v1 tests and the rest of the v2 module, every other request of which already passes `sid`; an explicit credential is outside the CSRF check by design (`is_ambient_cookie_session`). | None beyond RI-7's: the two requests are no longer ambient cookie requests, which is the credential shape the v2 module already uses everywhere else. |
+| RK-3 | The one comment added by the refinement that carried rationale — `frappe/public/js/frappe/utils/dashboard_utils.js` on the `leaving_by_tab` flag, which read "…so that the close does not pull focus back to the toggle and cancel the browser's own focus move" — was rewritten to state only what the flag is and to point at the decision row that holds the reasoning (RD-5). | (a) Leave the comment as it was, since it is short and accurate; (b) delete the comment outright; (c) move the sentence into RD-5 and leave no comment at all. | Rule 1 makes the decision log the single source of truth for "why" and forbids rationale in code comments, and O-7 records that comments in the edited framework files state WHAT only; the reasoning is already in RD-5, so keeping it in the code would duplicate it in the place the rule excludes. A reader still needs to know what the flag means while reading the handler, which is why (b) and (c) were rejected. | A reader of the file must open this document to learn why the flag exists; the pointer to RD-5 is what makes that possible. The audit that found it was a grep of the refinement's added comment lines for `because`, `so that`, `in order to`, `rationale` and `why`, so a rationale phrased without those words would not have been caught. |
+| RK-4 | Row RD-4's regex `/38\|40\|27/` is written with escaped pipes so the row renders as five cells. | (a) Leave the raw regex unescaped, which split the row into seven cells; (b) drop the regex from the row and describe the key filter in prose; (c) render the whole decision log as a definition list instead of a table. | Rule 1 requires the decision log to be a table whose columns are the decision, the alternatives, the reason and the risks, and a row that breaks into seven cells loses that structure — the "Why this choice" and "Risks" text lands in the wrong columns. Escaping is the minimal fix and keeps the exact library value the decision turns on, which (b) would blur. | Any future row that quotes a pipe must escape it too; the check is a column count over the rendered table, which is part of Unit K's verification. |
 
 ## 7. Test evidence
 
@@ -944,3 +1085,123 @@ Run on one bench against the complete change set (all units together), site `tes
 - `run-ui-tests frappe --headless --browser chrome --spec cypress/integration/todo_analytics_dashboard.js` — **10 passing, 0 failing** (the original case plus the nine cases added for D3–D9 and D12); `cypress/integration/dashboard.js` 1 passing; `cypress/integration/dashboard_chart.js` 1 passing. `package.json` and `yarn.lock` unchanged afterwards.
 - `run-tests --app frappe` (whole framework suite, 2347 tests, 21 min): every failure was classified. 81 are environmental on this host and fail identically without this change set — no RQ workers (`frappe.core.doctype.rq_job`, `rq_worker`, `prepared_report`, `submission_queue`, `bulk_update`, `test_background_jobs`, `test_recorder`, `test_delete_orphaned_doctypes`), no SMTP service (`frappe.email.*`, `frappe.tests.test_email`, `test_export_report_via_email`, `user_invitation`), the bench CLI refusing to run as root (`frappe.commands.test_commands`), and test-order database state (`test_docshare.test_list_permission`, `test_report`, `test_auto_repeat.test_submit_on_creation`, which pass on a fresh site with this change set). The remaining 6 — `test_oauth20` (4) and `test_api_v2` (2) — were harness requests that relied on the removed fail-open path and are updated per RK-1 / RK-2; both modules pass on a fresh site.
 - Headless Chrome on `/desk/dashboard-view/ToDo Analytics` (Administrator): two charts and two tiles render; console carries only the `/socket.io` 404s of a bench without a realtime service — zero other errors, zero `Refused to` CSP violations, zero `TypeError`. Selecting "Last Month" from the timespan menu re-fetched and redrew the trend chart (8 → 32 x labels), returned focus to the timespan toggle and left exactly one `aria-checked="true"` option ("Last Month"); the plot area took keyboard focus and ArrowRight / ArrowRight / End moved the tooltip (`opacity: 1`) with the live region reading "08-21-2026: Created 0, Completed 0" … "09-21-2026: Created 15, Completed 0", and Escape hid it; the first Number Card tile focused as `role="link"` "ToDo Total Open: open list" with the `rgb(82, 82, 82)` 2 px focus ring; "Reset Chart" restored "Last Week" / "Daily" and 8 labels; the dashboard HTML response carried `X-Frame-Options: SAMEORIGIN`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` and the Desk-tuned `Content-Security-Policy`.
+
+### Unit K — merged-tree regression
+
+Run on a bench provisioned from the merged tree (clone index 20, `/opt/frappe-bench-20`, database
+`test_frappe_20`, site `test_site`, web server on port 8300): `migrate` printed
+`Syncing dashboards... / Updating Dashboard for frappe`, `build --app frappe` completed in 3.9 s, the
+setup wizard was completed and the UI test user created. The HTTP-level modules and the Cypress specs
+ran against that server; it was started with `CI=true` because `frappe.tests.ui_test_helpers` is gated
+on `frappe.in_test`, a dev server with `allow_tests`, or the `CI` variable, and `form.js` /
+`list_view.js` otherwise fail in their `before all` hooks with HTTP 417 from
+`create_contact_records` / `setup_workflow`.
+
+**Scope verification (D1).**
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Every changed path classified | `git diff --name-status a8824d994f..HEAD` | 39 paths = 12 Section C + 18 feature files + the 9 rows of §3; nothing unclassified |
+| Chart data caching / telemetry untouched | `git diff a8824d994f..HEAD -- frappe/utils/dashboard.py frappe/desk/doctype/dashboard_chart/dashboard_chart.py` | empty |
+| Chart sources' caching untouched | `git diff 932cb6aae4..HEAD -- frappe/desk/dashboard_chart_source` | empty (no `cache_source`, `no_cache`, `chart-data` or `last_synced` line anywhere in the refinement's diff of that tree) |
+| Dependency advisories and CI gates untouched | `git diff a8824d994f..HEAD -- pyproject.toml package.json yarn.lock .github frappe/patches.txt frappe/hooks.py` | empty |
+| Decision-log / test-inventory reconciliation not attempted | `git diff 932cb6aae4..HEAD -- "blitzy/documentation/Project Guide.md"` | empty (the file was added by `932cb6aae4`, the pre-refinement delivery) |
+| Rationale kept out of code comments (Rule 1, O-7) | grep of the refinement's added comment lines for `because`, `so that`, `in order to`, `rationale`, `why` | one hit in `dashboard_utils.js`, rewritten WHAT-only (RK-3); re-grep clean |
+| Decision log well-formed (Rule 1) | column count over every §6 row | 73 rows, five filled columns each, after escaping the pipes in RD-4 (RK-4) |
+
+**Extend rather than replace (D2).** Test and `it` names were diffed between `932cb6aae4` and `HEAD`:
+
+| File | Before → after | Removed |
+| --- | --- | --- |
+| `cypress/integration/todo_analytics_dashboard.js` | 1 → 10 `it` blocks | none; the original "renders two cards and two charts" still runs |
+| `frappe/tests/test_auth.py` | 32 → 35 methods (+ class `TestLoginMintsCSRFToken`) | `test_request_without_browser_origin_allowed_when_session_has_no_token`, renamed with a flipped expectation to `test_request_without_browser_origin_rejected_when_session_has_no_token` (O-5); the `"*"` subtest of `test_allow_cors_conf_allows_cross_site_request_without_token` moved to the rejection case (RI-3) and `test_supplied_token_is_removed_from_the_form_dict` now expects rejection without same-site evidence |
+| `frappe/tests/test_api.py` | 44 → 48 methods | `test_request_without_browser_origin_is_accepted`, renamed with a flipped expectation to `test_request_without_browser_origin_is_rejected` (O-5) |
+| `frappe/tests/test_frappe_client.py` | 13 → 14 methods | none |
+| `frappe/tests/test_api_v2.py`, `frappe/tests/test_oauth20.py` | 44 → 44, 8 → 8 | none; only the two credential changes of RK-1 and RK-2 |
+| `frappe/desk/doctype/number_card/test_number_card.py`, `…/test_dashboard_chart_source.py` | 5 → 5, 7 → 7 | none; unchanged by this refinement |
+
+**Python regression (D2).** `fbench-20 --site test_site run-tests --module <module>`, every module `OK`:
+
+| Module | Result |
+| --- | --- |
+| `frappe.desk.dashboard_chart_source.todo_created_vs_completed.test_todo_created_vs_completed` | Ran 17 tests in 1.128s — OK |
+| `frappe.desk.dashboard_chart_source.todo_top_owners.test_todo_top_owners` | Ran 14 tests in 0.139s — OK |
+| `frappe.tests.test_todo_analytics_dashboard` | Ran 9 tests in 0.098s — OK (17 + 14 + 9 = the 40 D2 protects) |
+| `frappe.tests.test_auth` | Ran 3 tests — OK, then Ran 32 tests in 6.604s — OK |
+| `frappe.tests.test_api` | Ran 47 tests in 2.275s — OK |
+| `frappe.tests.test_cors` | Ran 4 tests in 0.003s — OK |
+| `frappe.tests.test_frappe_client` | Ran 14 tests in 1.434s — OK |
+| `frappe.tests.test_security_headers` | Ran 19 tests in 0.487s — OK |
+| `frappe.tests.test_api_v2` | Ran 44 tests in 9.918s — OK |
+| `frappe.tests.test_oauth20` | Ran 8 tests in 1.054s — OK |
+| `frappe.tests.test_website` | Ran 24 tests in 1.231s — OK |
+| `frappe.website.doctype.web_form.test_web_form` | Ran 36 tests in 1.512s — OK (the `frame-ancestors` precedence path of RJ-4) |
+| `frappe.desk.doctype.number_card.test_number_card` | Ran 5 tests in 0.311s — OK |
+| `frappe.desk.doctype.dashboard_chart_source.test_dashboard_chart_source` | Ran 7 tests in 0.249s — OK |
+| `frappe.desk.doctype.dashboard_chart.test_dashboard_chart` | Ran 11 tests in 0.607s — OK |
+| `frappe.desk.doctype.dashboard.test_dashboard` | Ran 1 test in 0.352s — OK |
+| `frappe.desk.doctype.todo.test_todo` | Ran 6 tests in 0.922s — OK |
+
+301 Python tests in total. `frappe/desk/doctype/dashboard_settings` ships no test module, so there was
+nothing to run for it.
+
+**Cypress (D2).** `fbench-20 --site test_site run-ui-tests frappe --headless --browser chrome --spec <spec>`:
+
+- `cypress/integration/todo_analytics_dashboard.js` — **10 passing, 0 failing**, "All specs passed!":
+  renders two cards and two charts; formats axis ticks consistently and keeps axis labels legible;
+  re-renders the trend chart on every time-window change and keeps focus on the control; recovers from a
+  chart data error with the retry affordance; widget menus are keyboard operable, mark the selected
+  option and restore focus; plot-area tooltips are reachable from the keyboard; dashboard text and
+  controls meet WCAG AA contrast; number card tiles expose a hover and focus affordance; does not write
+  empty dynamic filter values into the widget filter state; serves the dashboard with the security
+  response headers and an intact bundle.
+- `cypress/integration/dashboard.js` — 1 passing. `cypress/integration/dashboard_chart.js` — 1 passing.
+  `cypress/integration/form.js` — 5 passing.
+- `cypress/integration/list_view.js` — 6 of 7 passing. The one failure is the realtime-dependent
+  `enables "Actions" button` case ("Not enough elements found. Found '7', expected '9'"), which fails on
+  this host because no socket.io service runs; it is unrelated to this refinement and is the documented
+  known failure of the environment.
+- `package.json` and `yarn.lock` are byte-identical after every run.
+
+**Static checks.** `python -m compileall -q -f frappe` — clean, exit 0. `pre-commit run --files` over
+every changed file outside `blitzy/` — trailing whitespace, no-commit-to-branch, merge conflict, python
+ast, check json, debug statements, ruff import sorter, ruff linter, ruff formatter, prettier and eslint
+all Passed.
+
+**Two artefacts of running the whole set on one site**, both environmental and both cleared before the
+final sweep was repeated, neither caused by this change set: running `cypress/integration/list_view.js`
+calls `frappe.tests.ui_test_helpers.setup_workflow`, which leaves an active `Test ToDo` Workflow with
+email alerts on the site, after which any module that inserts a ToDo outside a request context fails in
+`send_workflow_action_email` (`AttributeError: 'NoneType' object has no attribute 'environ'` from the
+website router) — deleting that Workflow restored `test_api` to 47 OK; and the repeated runs exhausted
+the site's own hourly rate limit for `frappe.www.login.login_via_key`, so
+`test_auth.test_login_with_email_link` returned 429 instead of 200 — clearing that one per-site counter
+restored `test_auth` to 3 + 32 OK. The final confirmation run after both was `todo_analytics_dashboard.js`
+10/10, `dashboard.js` 1/1 and `dashboard_chart.js` 1/1 in one invocation ("All specs passed!", 12 of 12).
+
+**Runtime verification** on `http://test_site:8300/desk/dashboard-view/ToDo Analytics` as
+Administrator, in the headless Chrome the UI runner drives:
+
+- Two `.number-widget-box` tiles ("ToDo Total Open", "ToDo Total Closed") and two
+  `.dashboard-widget-box` charts, each with `svg.frappe-chart`; the error and loading containers are
+  present but not visible.
+- The dashboard document's own response carries `X-Frame-Options: SAMEORIGIN`,
+  `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` and a
+  `Content-Security-Policy` containing `frame-ancestors 'self'` and `object-src 'none'`.
+- Selecting "Last Month" from the timespan menu re-fetched and redrew the trend chart (8 → more x
+  labels), moved the label to "Last Month", returned focus to the timespan toggle and left exactly one
+  `role="menuitemradio"` with `aria-checked="true"`; restoring "Last Week" returned the axis to 8 labels.
+- Focusing the trend chart's `.chart-plot-area[tabindex="0"][role]` and pressing ArrowRight showed
+  `.graph-svg-tip` at opacity 1 and filled `.chart-tooltip-announcer[aria-live]`; Escape hid it.
+- The first Number Card tile is `tabindex="0"`, `role="link"` and carries an `aria-label`.
+- Zero Content-Security-Policy violations (captured through a `securitypolicyviolation` listener) and no
+  console errors other than the `/socket.io` 404s of a bench without a realtime service.
+- With a forced HTTP 508 on the trend source, the error state became visible with
+  `button.chart-retry` labelled "Retry loading ToDo Created vs Completed"; activating it hid the error
+  and re-rendered the chart.
+- The trend chart's y axis was dumped around a timespan switch to check D3's no-duplicate requirement
+  against a screenshot that appeared to show two `10` ticks: while `frappe-charts` animates the axis the
+  previous maximum tick is still in the DOM, and once the transition settles the axis reads
+  `0, 2.5, 5, 7.5, 10` — distinct and correctly formatted. The apparent duplicate is a transient frame
+  of the library's own transition, not a formatting defect.
+

@@ -149,8 +149,8 @@ frappe.dashboard_utils = {
 			list[((index % list.length) + list.length) % list.length].focus();
 		};
 
-		// Set while a Tab keypress closes the menu, so that the close does not pull focus
-		// back to the toggle and cancel the browser's own focus move.
+		// True only while a Tab keypress closes the menu; the close handler leaves focus
+		// untouched while it is set (PR Description decision RD-5).
 		let leaving_by_tab = false;
 
 		$toggle.on("keydown", (e) => {
