@@ -300,7 +300,23 @@ frappe.ui.Dialog = class Dialog extends frappe.ui.FieldGroup {
 	}
 
 	set_title(t) {
-		this.$wrapper.find(".modal-title").html(t);
+		const $title = this.$wrapper.find(".modal-title");
+		$title.html(t);
+
+		// Names the dialog after its own title node: the title gets an id (existing ids are
+		// kept) and the modal element points `aria-labelledby` at it while the title renders
+		// text. The attribute is absent while there is no title node, and while the title
+		// renders no text.
+		if (!$title.length) {
+			this.$wrapper.removeAttr("aria-labelledby");
+			return;
+		}
+
+		if ($title.text().trim()) {
+			this.$wrapper.attr("aria-labelledby", frappe.dom.set_unique_id($title[0]));
+		} else {
+			this.$wrapper.removeAttr("aria-labelledby");
+		}
 	}
 
 	set_indicator() {

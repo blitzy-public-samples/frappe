@@ -137,6 +137,14 @@ def setup_workflow():
 
 
 @whitelist_for_tests()
+def teardown_workflow():
+	"""Remove the "Test ToDo" Workflow created by `setup_workflow`. Does nothing when it is
+	already absent."""
+	frappe.delete_doc_if_exists("Workflow", "Test ToDo", force=True)
+	frappe.clear_cache()
+
+
+@whitelist_for_tests()
 def create_contact_phone_nos_records():
 	if frappe.get_all("Contact", {"first_name": "Test Contact"}):
 		return

@@ -240,6 +240,9 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 	it("formats axis ticks consistently and keeps axis labels legible", () => {
 		// 0, thousands-separated integers, up to two decimals, or one number system symbol
 		const tick_format = /^-?(\d{1,3}(,\d{3})*|\d+)(\.\d{1,2})?( [A-Za-z]+)?$/;
+		// the magnitude from which a tick carries a number system symbol, and below which it is
+		// written out with the site group separator (RA-6)
+		const abbreviation_threshold = 1.0e6;
 		// the shape frappe-charts prints with its own shortener, such as "1.3K"
 		const library_shortened_number = /^\d+(\.\d+)?[KMB]$/;
 		// the markers frappe-charts leaves at the end of a label it cut short
@@ -248,7 +251,8 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		const is_truncation_of = (text, label) =>
 			truncation_marker.test(text) && label.startsWith(text.replace(truncation_marker, ""));
 		// the Top Owners data this case supplies: long distinct names sharing a prefix, and counts
-		// on both sides of the grouping and abbreviation thresholds
+		// on both sides of the abbreviation threshold, including the 1504 count the axis and the
+		// bar label disagreed over (RA-6)
 		const owner_labels = [
 			"Alexandra Fitzgerald",
 			"Alexandra Fitzwilliam",
@@ -256,8 +260,8 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			"Bartholomew Gainsborough",
 			"Zoe Xu",
 		];
-		const owner_values = [2000, 1250, 640, 120, 12];
-		const owner_value_texts = ["2 K", "1,250", "640", "120", "12"];
+		const owner_values = [1504000, 1504, 640, 120, 12];
+		const owner_value_texts = ["1.5 M", "1,504", "640", "120", "12"];
 		// two labels of equal length that differ only in their final character, which no
 		// truncation narrower than the labels themselves keeps apart
 		const equal_tail_labels = ["Alexandra Fitzgerald A", "Alexandra Fitzgerald B"];
@@ -281,6 +285,9 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				expect(tick).to.match(tick_format);
 				// a trailing zero decimal such as "500.00" is not a tick this axis prints
 				expect(tick, "redundant decimals").to.not.match(/\.\d*0\b/);
+				// a magnitude below the abbreviation threshold is written out in full, so the
+				// thousands symbol is a tick this axis never prints (RA-6)
+				expect(tick, `thousands abbreviation in "${tick}"`).to.not.match(/ K$/);
 			});
 		};
 
@@ -581,8 +588,98 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			expect(win.frappe.utils.format_chart_axis_number(1500000)).to.match(/^1\.5 M$/);
 			expect(win.frappe.utils.format_chart_axis_number("")).to.eq("");
 
-			const format_tick = (value) => win.frappe.utils.format_chart_axis_number(value);
+			const format_tick = (value, country) =>
+				win.frappe.utils.format_chart_axis_number(value, country);
 			const site_number_format = win.frappe.boot.sysdefaults.number_format;
+			// whether a tick carries a number system symbol
+			const is_abbreviated = (text) => / [A-Za-z]+$/.test(text);
+
+			// One convention per magnitude: the threshold alone decides whether a tick is
+			// abbreviated, never whether the abbreviation happens to be exact (RA-6)
+			[
+				[1000, "1,000"],
+				[1001, "1,001"],
+				[1250, "1,250"],
+				[1499, "1,499"],
+				[1500, "1,500"],
+				[1504, "1,504"],
+				[2000, "2,000"],
+				[12500, "12,500"],
+				[123456, "123,456"],
+				[999999, "999,999"],
+				[-1504, "-1,504"],
+				[1000000, "1 M"],
+				[1000001, "1 M"],
+				[1234567, "1.23 M"],
+				[1250000, "1.25 M"],
+				[1500000, "1.5 M"],
+				[1999999, "2 M"],
+				[123456789, "123.46 M"],
+				[999999999, "1 B"],
+				[1e9, "1 B"],
+				[1e12, "1 T"],
+				[1e21, "1,000,000,000 T"],
+				[-1500000, "-1.5 M"],
+			].forEach(([value, text]) => {
+				expect(format_tick(value), `tick of ${value}`).to.eq(text);
+				expect(
+					is_abbreviated(format_tick(value)),
+					`${value} abbreviated only from ${abbreviation_threshold}`
+				).to.eq(Math.abs(value) >= abbreviation_threshold);
+			});
+
+			// neighbouring values of one magnitude never take two conventions
+			[
+				[1000, 1001],
+				[1499, 1500],
+				[1250, 12500],
+				[999998, 999999],
+				[1000000, 1000001],
+				[1234567, 1250000],
+			].forEach(([left, right]) => {
+				expect(
+					is_abbreviated(format_tick(left)),
+					`same convention for ${left} and ${right}`
+				).to.eq(is_abbreviated(format_tick(right)));
+			});
+
+			// the number system of the country decides the symbol, the threshold decides whether
+			// there is one, and rounding the coefficient up carries the tick to the next symbol
+			expect(format_tick(1500000, "India"), "abbreviated tick in the Indian system").to.eq(
+				"15 L"
+			);
+			expect(format_tick(9999999, "India"), "carried tick in the Indian system").to.eq(
+				"1 Cr"
+			);
+			expect(format_tick(100000, "India"), "sub-threshold tick under India").to.eq(
+				"100,000"
+			);
+
+			// Every tick of the documented grammar: at most two decimals from a magnitude of one
+			// upwards, as many as three significant digits need below it, and scientific notation
+			// below 1e-4 (RA-2)
+			const tick_grammar = (value) => {
+				const magnitude = Math.abs(value);
+
+				if (!magnitude) {
+					return /^0$/;
+				}
+
+				if (magnitude < 1.0e-4) {
+					return /^-?\d(\.\d{1,2})?e-\d+$/;
+				}
+
+				return magnitude < 1 ? /^-?0\.\d{1,8}$/ : tick_format;
+			};
+
+			[
+				0, 0.00001, 2.5e-7, 0.000123, 0.0025, 0.005, 0.015, 0.3, 0.5, 2.5, 100, 12345.678,
+				999999, 1000000, 1234567, 1e21, -0.0025, -1504, -1500000,
+			].forEach((value) =>
+				expect(format_tick(value), `tick of ${value} in the documented grammar`).to.match(
+					tick_grammar(value)
+				)
+			);
 			// the separator a tick carries between its whole part and its decimals, with any
 			// number system symbol taken off first
 			const tick_decimal_separator = (text) =>
@@ -633,7 +730,10 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				).to.eq(tick_decimal_separator(format_tick(12345.678)));
 
 				win.frappe.boot.sysdefaults.number_format = "#,##,###.##";
-				expect(format_tick(1234567), "grouped tick under #,##,###.##").to.eq("12,34,567");
+				expect(format_tick(123456), "grouped tick under #,##,###.##").to.eq("1,23,456");
+				expect(format_tick(123456.78), "decimal tick under #,##,###.##").to.eq(
+					"1,23,456.78"
+				);
 
 				win.frappe.boot.sysdefaults.number_format = "#,###";
 				expect(format_tick(0.0025), "sub-cent tick under #,###").to.eq("0.0025");
@@ -949,6 +1049,60 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		trend_widget().find(".widget-title").should("be.visible");
 		trend_widget().find(".widget-head").should("have.css", "flex-direction", "row");
 
+		// a width="Full" chart spans every column the narrow-viewport grid generates, and its
+		// header controls stay inside the card at the narrowest supported width (RG-6, RB-12)
+		[
+			[768, 1024],
+			[375, 812],
+		].forEach(([width, height]) => {
+			cy.viewport(width, height);
+			cy.get(".dashboard-widget-box.full-width").should("have.length", 2);
+			cy.get(".dashboard-widget-box.full-width").each(($widget) => {
+				cy.wrap($widget).should(($rendered) => {
+					const widget = $rendered[0];
+					const win = widget.ownerDocument.defaultView;
+					const grid = widget.closest(".grid-col-2");
+					const widget_box = widget.getBoundingClientRect();
+
+					expect(
+						win.getComputedStyle(widget).gridColumnEnd,
+						`full width span at ${width}`
+					).to.equal("-1");
+					expect(widget_box.width, `full width at ${width}`).to.be.closeTo(
+						grid.getBoundingClientRect().width,
+						1
+					);
+
+					const controls = widget.querySelectorAll(
+						".widget-control .btn-xs, .widget-control .dashboard-date-field"
+					);
+					expect(controls.length, `header controls at ${width}`).to.be.greaterThan(0);
+					controls.forEach((control) => {
+						const control_box = control.getBoundingClientRect();
+						expect(
+							control_box.right,
+							`${control.className} inside the card at ${width}`
+						).to.be.at.most(widget_box.right + 1);
+						expect(
+							control_box.right,
+							`${control.className} inside the viewport at ${width}`
+						).to.be.at.most(width);
+					});
+				});
+			});
+
+			// nothing the header holds overflows the scrolling content area, which offers no
+			// horizontal scrollbar to reach an overflow with
+			cy.get(".main-section").should(($section) => {
+				const section = $section[0];
+
+				expect(section.scrollWidth, `content overflow at ${width}`).to.be.at.most(
+					section.clientWidth
+				);
+			});
+		});
+		cy.viewport(1400, 960);
+
 		// two instances of one timeseries configuration, and one whose record carries a range
 		const fixture_dashboard = "Cypress Time Window";
 		const fixture_charts = ["Cypress Trend One", "Cypress Trend Two", "Cypress Trend Range"];
@@ -1076,6 +1230,12 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 					expect(value, "range from the chart record").to.not.be.empty;
 					expect(value).to.contain(from);
 					expect(value).to.contain(to);
+
+					// the whole two-date value is rendered, not scrolled out of view (RB-13)
+					expect(
+						$input[0].scrollWidth,
+						"date range value inside its input"
+					).to.be.at.most($input[0].clientWidth);
 				});
 		});
 		fixture_widget("Cypress Trend Range").find(".x.axis text").should("have.length", 4);
@@ -1108,6 +1268,49 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			).to.be.at.least(-1);
 		});
 		cy.clear_datepickers();
+
+		// at the narrowest supported width the control row wraps inside the card, so the
+		// interval toggle and the chart menu that carries Reset Chart stay reachable (RB-12)
+		cy.viewport(375, 812);
+
+		// Desk lays its sidebar over the content as a drawer at this width, and the drawer's
+		// own backdrop answers a hit test aimed at anything beneath it
+		cy.window().then((win) => {
+			win.frappe.app.sidebar && win.frappe.app.sidebar.close();
+		});
+
+		fixture_widget("Cypress Trend One").should(($widget) => {
+			const widget = $widget[0];
+			const doc = widget.ownerDocument;
+			const widget_box = widget.getBoundingClientRect();
+
+			[
+				".time-interval-filter .chart-filter-toggle",
+				".timespan-filter .chart-filter-toggle",
+				"button.filter-chart",
+				"button.chart-menu",
+				".dashboard-date-field input",
+			].forEach((selector) => {
+				const control = widget.querySelector(selector);
+				expect(control, `${selector} rendered`).to.not.be.null;
+
+				const control_box = control.getBoundingClientRect();
+				expect(control_box.right, `${selector} inside the card`).to.be.at.most(
+					widget_box.right + 1
+				);
+
+				const hit = doc.elementFromPoint(
+					control_box.left + control_box.width / 2,
+					control_box.top + control_box.height / 2
+				);
+				expect(hit, `${selector} hit testable`).to.not.be.null;
+				expect(
+					control.contains(hit) || control === hit,
+					`${selector} hit testable at its own centre`
+				).to.equal(true);
+			});
+		});
+		cy.viewport(1400, 960);
 
 		fixture_widget("Cypress Trend One").find(".chart-menu").click();
 		fixture_widget("Cypress Trend One")
@@ -1186,10 +1389,17 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		let fail_next_trend_request = true;
 		let empty_next_trend_request = false;
 
+		// every trend data fetch and every Dashboard Chart record read this case makes, in the
+		// order the browser issued them
+		const request_log = [];
+		let requests_before_retry = 0;
+
 		cy.intercept(
 			"POST",
 			"**/frappe.desk.dashboard_chart_source.todo_created_vs_completed.todo_created_vs_completed.get",
 			(req) => {
+				request_log.push({ kind: "chart" });
+
 				if (fail_next_trend_request) {
 					fail_next_trend_request = false;
 					req.reply({
@@ -1207,6 +1417,20 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				}
 			}
 		).as("trend");
+
+		cy.intercept("GET", "**/frappe.client.get*", (req) => {
+			const url = new URL(req.url);
+
+			if (!url.pathname.endsWith("frappe.client.get")) {
+				return;
+			}
+
+			request_log.push({
+				kind: "record",
+				doctype: url.searchParams.get("doctype"),
+				name: url.searchParams.get("name"),
+			});
+		}).as("chart_record");
 
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
 		cy.window().then((win) => {
@@ -1230,10 +1454,30 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		owners_widget().find(".chart-loading-state.text-danger").should("not.be.visible");
 
 		// clicking Retry re-fetches the data and restores the chart
+		cy.then(() => {
+			requests_before_retry = request_log.length;
+		});
 		trend_widget().find("button.chart-retry").click();
 		cy.wait("@trend", { timeout: 30000 });
 		trend_widget().find("svg.frappe-chart").should("have.length", 1);
 		trend_widget().find(".chart-loading-state.text-danger").should("not.be.visible");
+
+		// the retry read this chart's record before it fetched the data, so a configuration the
+		// server has changed since the page loaded is the one the fetch carries
+		cy.wrap(null, { log: false }).should(() => {
+			const made = request_log.slice(requests_before_retry);
+			const read_at = made.findIndex(
+				(entry) =>
+					entry.kind === "record" &&
+					entry.doctype === "Dashboard Chart" &&
+					entry.name === trend_chart
+			);
+			const fetched_at = made.findIndex((entry) => entry.kind === "chart");
+
+			expect(read_at, "the retry read the chart record").to.be.at.least(0);
+			expect(fetched_at, "the retry fetched the chart data").to.be.at.least(0);
+			expect(read_at, "the record read came before the data fetch").to.be.below(fetched_at);
+		});
 
 		// a second failure renders the error state again without duplicating the control
 		cy.then(() => {
@@ -1314,6 +1558,115 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 		// the chart recovered in place: the page was never reloaded
 		cy.window().its("__unitC_no_reload").should("eq", true);
+
+		// the filter-set contract the widget resolves its filters through: a set carrying no
+		// filter is a set, and only an unset value is no set at all
+		cy.window().then((win) => {
+			const parse_array = win.frappe.utils.parse_array;
+			const filters = [["ToDo", "status", "=", "Open"]];
+
+			expect(parse_array([]), "a filter set carrying no filter").to.deep.equal([]);
+			expect(parse_array(null), "no filter set (null)").to.equal(undefined);
+			expect(parse_array(undefined), "no filter set (undefined)").to.equal(undefined);
+			expect(parse_array(filters), "a filter set carrying a filter").to.equal(filters);
+		});
+
+		// a filter group built with this widget's own options rejects a filter naming a field
+		// that does not exist without the framework's global message; the default group still
+		// raises that message
+		const invalid_filter = [["ToDo", "no_such_field", "=", "x"]];
+		const filter_probe = {};
+
+		cy.window().then((win) => {
+			filter_probe.build = (extra_opts) => {
+				const $button = win
+					.$('<button type="button" class="cypress-filter-probe"></button>')
+					.appendTo(win.document.body);
+
+				return {
+					$button: $button,
+					group: new win.frappe.ui.FilterGroup(
+						Object.assign(
+							{
+								doctype: "ToDo",
+								filter_button: $button,
+								on_change: () => {},
+							},
+							extra_opts
+						)
+					),
+				};
+			};
+
+			return new Cypress.Promise((resolve) => {
+				win.frappe.model.with_doctype("ToDo", () => resolve());
+			});
+		});
+
+		cy.then(() => {
+			filter_probe.quiet = filter_probe.build({ report_invalid_filters: false });
+			filter_probe.quiet.group.add_filters_to_filter_group(invalid_filter);
+		});
+		cy.get(".modal.show").should("not.exist");
+		cy.get(".modal-backdrop").should("not.exist");
+		cy.get("body").should("not.have.class", "modal-open");
+		cy.then(() => {
+			expect(
+				filter_probe.quiet.group.get_filters(),
+				"the group rejected the invalid filter"
+			).to.deep.equal([]);
+
+			filter_probe.loud = filter_probe.build({});
+			filter_probe.loud.group.add_filters_to_filter_group(invalid_filter);
+		});
+		cy.get(".modal.show")
+			.should("be.visible")
+			.and("contain.text", "Invalid filter")
+			.and("contain.text", "no_such_field");
+		cy.then(() => {
+			expect(
+				filter_probe.loud.group.get_filters(),
+				"the default group rejected the invalid filter too"
+			).to.deep.equal([]);
+		});
+		// dismissed once the message has finished being shown: bootstrap ignores a dismissal
+		// issued while the modal is still transitioning in
+		cy.window().its("frappe.msg_dialog.display").should("eq", true);
+		cy.get(".modal.show .btn-modal-close").click();
+		cy.get(".modal.show").should("not.exist");
+		cy.get(".modal-backdrop").should("not.exist");
+		cy.then(() => {
+			filter_probe.quiet.$button.remove();
+			filter_probe.loud.$button.remove();
+		});
+		cy.get(".cypress-filter-probe").should("not.exist");
+
+		// the filter dialog this widget opens is named by its own title
+		trend_widget().find("button.filter-chart").click();
+		cy.get(".modal.show")
+			.should("be.visible")
+			.and("have.attr", "role", "dialog")
+			.and("have.attr", "aria-modal", "true")
+			.then(($dialog) => {
+				const labelled_by = $dialog.attr("aria-labelledby");
+				expect(labelled_by, "aria-labelledby").to.be.a("string").and.not.equal("");
+
+				const title = $dialog[0].ownerDocument.getElementById(labelled_by);
+				expect(title, `the element naming the dialog (#${labelled_by})`).to.not.equal(
+					null
+				);
+				expect($dialog[0].contains(title), "the naming element is inside the dialog").to.be
+					.true;
+				expect(title.classList.contains("modal-title"), "the dialog's own title names it")
+					.to.be.true;
+				expect(title.textContent.trim(), "the dialog's accessible name").to.equal(
+					`Set Filters for ${trend_chart}`
+				);
+			});
+		cy.window().its("cur_dialog.display").should("eq", true);
+		cy.get(".modal.show .btn-modal-close").click();
+		cy.get(".modal.show").should("not.exist");
+		cy.get(".modal-backdrop").should("not.exist");
 	});
 
 	it("widget menus are keyboard operable, mark the selected option and restore focus", () => {
@@ -1496,6 +1849,25 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			.parent()
 			.should("have.class", "time-interval-filter");
 
+		// 2b. the two filter toggles are reached in the order they are painted: the timespan
+		// toggle precedes the interval toggle in the document and is painted to its left
+		trend_widget().then(($widget) => {
+			const timespan = $widget.find('.timespan-filter [data-toggle="dropdown"]')[0];
+			const interval = $widget.find('.time-interval-filter [data-toggle="dropdown"]')[0];
+			const interval_follows = Boolean(
+				timespan.compareDocumentPosition(interval) & Node.DOCUMENT_POSITION_FOLLOWING
+			);
+
+			expect(
+				interval_follows,
+				"the interval toggle follows the timespan toggle in the document"
+			).to.equal(true);
+			expect(
+				timespan.getBoundingClientRect().left,
+				"painted left of the timespan toggle"
+			).to.be.lessThan(interval.getBoundingClientRect().left);
+		});
+
 		// 3. chart actions menu: ArrowDown opens it on the first command, End jumps to the last
 		chart_widget(trend_chart).find(".chart-menu").focus();
 		cy.focused().trigger("keydown", ARROW_DOWN);
@@ -1517,6 +1889,30 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			.find(".card-actions")
 			.should("not.have.class", "show");
 		cy.focused().should("have.attr", "aria-label", "Card Actions");
+
+		// 4b. Refresh activated from the card actions menu rebuilds the card's action area and
+		// leaves the keyboard on the rebuilt toggle, not on the one the command was activated from
+		cy.intercept(
+			"POST",
+			"**/api/method/frappe.desk.doctype.number_card.number_card.get_result"
+		).as("card_result");
+		cy.get(card_toggle)
+			.first()
+			.then(($toggle) => $toggle.attr("data-stale-toggle", "1"))
+			.focus()
+			.trigger("keydown", ARROW_DOWN);
+		cy.get(".number-widget-box").first().find(".card-actions").should("have.class", "show");
+		cy.focused().should("have.attr", "role", "menuitem").and("have.text", "Refresh");
+		cy.focused().trigger("keydown", ENTER);
+		cy.wait("@card_result");
+		cy.get(".number-widget-box")
+			.first()
+			.find(".card-actions")
+			.should("not.have.class", "show");
+		cy.focused()
+			.should("have.attr", "aria-label", "Card Actions")
+			.and("not.have.attr", "data-stale-toggle");
+		cy.get(card_toggle).first().should("have.focus");
 
 		// 5. the filter button announces the dialog it opens, not a menu
 		cy.get(".dashboard-widget-box .filter-chart")
@@ -1690,6 +2086,10 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 					expect($tip[0].style.opacity).to.equal("1");
 					expect($tip[0].innerText.trim()).to.not.be.empty;
 					expect($tip[0].innerText).to.match(expected_tooltip_text[title]);
+
+					// a shown tooltip is readable inside the plot-area group (RE-13)
+					expect($tip[0].getAttribute("aria-hidden"), "aria-hidden while shown").to.be
+						.null;
 				});
 
 			// the live region carries the tooltip title and a value
@@ -1736,6 +2136,13 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 						.find(".graph-svg-tip")
 						.should(($tip) => {
 							expect($tip[0].style.opacity).to.equal("0");
+
+							// the text frappe-charts leaves behind is hidden from assistive
+							// technology while the tooltip is dismissed (RE-13)
+							expect(
+								$tip[0].getAttribute("aria-hidden"),
+								"aria-hidden while hidden"
+							).to.equal("true");
 						});
 					chart_widget(title).find(announcer).should("have.text", "");
 					cy.focused().should(($focused) => {
@@ -1758,6 +2165,45 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			expect(announcement, "announcement").to.contain(trend_dataset_name);
 			expect(announcement, "announcement").to.not.contain("&amp;");
 		});
+
+		// the pointer takes the tooltip over: the live region is emptied rather than left holding
+		// a figure the chart has stopped showing, and the same point reached again from the
+		// keyboard is announced again (RE-14)
+		reveal_first_point(top_owners_chart);
+		press(top_owners_chart, "Home");
+		chart_widget(top_owners_chart)
+			.find(announcer)
+			.invoke("text")
+			.then((keyboard_announcement) => {
+				expect(keyboard_announcement.trim(), "keyboard announcement").to.not.be.empty;
+
+				chart_widget(top_owners_chart).should(($widget) => {
+					const bars = $widget.find("rect.bar");
+					const bar = bars[bars.length - 1];
+					const tip = $widget.find(".graph-svg-tip")[0];
+					const box = bar.getBoundingClientRect();
+					const win = bar.ownerDocument.defaultView;
+
+					bar.dispatchEvent(
+						new win.MouseEvent("mousemove", {
+							bubbles: true,
+							clientX: box.left + box.width / 2,
+							clientY: box.top + box.height / 2,
+						})
+					);
+
+					expect(tip.style.opacity, "tooltip under the pointer").to.equal("1");
+					expect(
+						$widget.find(announcer).text(),
+						"announcement once the pointer has the tooltip"
+					).to.equal("");
+				});
+
+				press(top_owners_chart, "Home");
+				chart_widget(top_owners_chart)
+					.find(announcer)
+					.should("have.text", keyboard_announcement);
+			});
 
 		// arrow keys on the plot area do not take over the widget dropdowns
 		chart_widget(trend_chart)
@@ -1788,6 +2234,52 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			expect(tip.style.opacity).to.equal("1");
 			expect(tip.innerText).to.contain("Open ToDos");
 		});
+
+		// an arrow key pressed while frappe-charts still holds its entry placeholder reads none of
+		// it — and the move it made is re-issued for it, so the real value arrives without a
+		// second key press (RE-12)
+		cy.visit("/desk/dashboard-view/ToDo Analytics");
+		chart_widget(top_owners_chart)
+			.find(plot_area)
+			.then(($plot) => {
+				const win = $plot[0].ownerDocument.defaultView;
+				const widget = $plot.closest(".dashboard-widget-box");
+
+				$plot[0].focus();
+				$plot[0].dispatchEvent(
+					new win.KeyboardEvent("keydown", {
+						key: "ArrowRight",
+						keyCode: key_codes.ArrowRight,
+						which: key_codes.ArrowRight,
+						bubbles: true,
+						cancelable: true,
+					})
+				);
+
+				const read = (text) =>
+					text === "" || expected_tooltip_text[top_owners_chart].test(text);
+				const announced = widget.find(announcer).text();
+				const shown = widget.find(".graph-svg-tip")[0].innerText;
+
+				// either the chart had already settled, or neither the live region nor the
+				// tooltip has been given anything — never a point carrying a placeholder value
+				expect(read(announced), `announcement in the entry window: "${announced}"`).to.be
+					.true;
+				expect(read(shown), `tooltip in the entry window: "${shown}"`).to.be.true;
+			});
+		chart_widget(top_owners_chart)
+			.find(announcer)
+			.should(($announcer) => {
+				const tip = $announcer.closest(".dashboard-widget-box").find(".graph-svg-tip")[0];
+
+				expect($announcer.text(), "announcement once the chart has settled").to.match(
+					expected_tooltip_text[top_owners_chart]
+				);
+				expect(tip.style.opacity, "tooltip once the chart has settled").to.equal("1");
+				expect(tip.innerText, "tooltip once the chart has settled").to.match(
+					expected_tooltip_text[top_owners_chart]
+				);
+			});
 	});
 
 	it("dashboard text and controls meet WCAG AA contrast", () => {
@@ -1886,6 +2378,32 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				).to.equal(theme);
 			});
 
+		// Every selector loaded in the page whose rule text matches `pattern`. Cypress
+		// dispatches synthetic events, which never put the browser in keyboard modality,
+		// so a rule that only paints under `:focus-visible` is proven by its presence in
+		// the cascade (RG-4) and by the token it consumes, not by a painted ring (RF-8).
+		const loaded_selectors = (win, pattern) => {
+			const selectors = [];
+
+			[...win.document.styleSheets].forEach((sheet) => {
+				let rules;
+
+				try {
+					rules = sheet.cssRules;
+				} catch (error) {
+					return;
+				}
+
+				[...(rules || [])].forEach((rule) => {
+					if (rule.selectorText && pattern.test(rule.selectorText)) {
+						selectors.push(rule.selectorText);
+					}
+				});
+			});
+
+			return selectors;
+		};
+
 		// Every surface D7 names, measured in the theme that is active when this runs.
 		// `ring_width` is the focus-ring geometry that theme's scoped block declares.
 		const assert_dashboard_contrast = (theme, ring_width) => {
@@ -1924,6 +2442,44 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				});
 			});
 
+			// focus-ring token of the page chrome outside every widget: the breadcrumb
+			// links and the page-head controls, which the route scope covers (RF-12).
+			// Retried, because `.es-button` transitions its background over 120ms and a
+			// same-tick read after the theme switch returns the previous theme's colour.
+			cy.window().should((win) => {
+				const chrome = [
+					...win.document.querySelectorAll(
+						".navbar-breadcrumbs a, .page-head .menu-more-button"
+					),
+				];
+				expect(chrome.length, `${theme}: page-chrome controls`).to.be.greaterThan(0);
+				chrome.forEach((control) => {
+					const style = win.getComputedStyle(control);
+					const declared = style.getPropertyValue("--focus-default").trim();
+					const behind = effective_background(win, control);
+					const named = `${control.tagName}.${control.className || "(no class)"}`;
+					expect(declared, `${theme}: ${named} --focus-default geometry`).to.contain(
+						`0px 0px 0px ${ring_width}`
+					);
+					expect(
+						contrast(declared, behind),
+						`${theme}: ${named} focus ring "${declared}" over "${behind}"`
+					).to.be.at.least(3);
+				});
+			});
+
+			// the crumb's ring is drawn inset, because its ancestors clip an outset
+			// shadow away (RF-20)
+			cy.window().then((win) => {
+				expect(
+					loaded_selectors(
+						win,
+						/dashboard-view[^,{]*navbar-breadcrumbs a:focus-visible/
+					),
+					`${theme}: route-scoped breadcrumb focus rule`
+				).to.not.be.empty;
+			});
+
 			// placeholder of the date-range input the trend widget reveals
 			chart_widget(trend_chart)
 				.find('.timespan-filter button[data-toggle="dropdown"]')
@@ -1944,6 +2500,27 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 					win.getComputedStyle(input).backgroundColor
 				);
 				expect(ratio, `${theme}: date-range placeholder contrast`).to.be.at.least(4.5);
+
+				// focus ring of the same control: the rules that paint it on a form
+				// control inside a widget, including while it carries `has-error` (RF-13)
+				const style = win.getComputedStyle(input);
+				const declared = style.getPropertyValue("--focus-default").trim();
+				expect(
+					contrast(declared, style.backgroundColor),
+					`${theme}: date-range focus ring contrast against the control`
+				).to.be.at.least(3);
+				expect(
+					contrast(declared, effective_background(win, input.closest(".widget"))),
+					`${theme}: date-range focus ring contrast against the widget`
+				).to.be.at.least(3);
+				expect(
+					loaded_selectors(win, /\.widget (input|\.form-control):focus-visible/),
+					`${theme}: widget form-control focus rule`
+				).to.not.be.empty;
+				expect(
+					loaded_selectors(win, /\.widget .*has-error input:focus-visible/),
+					`${theme}: widget error-state focus rule`
+				).to.not.be.empty;
 			});
 
 			// a preset window applied again, which removes the date-range control
@@ -1957,6 +2534,28 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			chart_widget(trend_chart)
 				.find(".timespan-filter .filter-label")
 				.should("have.text", "Last Week");
+
+			// the applied option of that dropdown, which is the one item a viewer must
+			// read to know the window in effect (RF-14)
+			chart_widget(trend_chart)
+				.find('.timespan-filter button[data-toggle="dropdown"]')
+				.click();
+			chart_widget(trend_chart)
+				.find(".timespan-filter .dropdown-item.active")
+				.should("be.visible");
+			cy.window().then((win) => {
+				const applied = win.document.querySelector(
+					".dashboard-widget-box .timespan-filter .dropdown-item.active"
+				);
+				const style = win.getComputedStyle(applied);
+				expect(
+					contrast(style.color, style.backgroundColor),
+					`${theme}: applied "${applied.innerText.trim()}" option contrast`
+				).to.be.at.least(4.5);
+			});
+			chart_widget(trend_chart)
+				.find('.timespan-filter button[data-toggle="dropdown"]')
+				.click();
 
 			// error text, measured while the normally hidden container is shown
 			cy.window().then((win) => {
@@ -2014,6 +2613,27 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 					contrast(ring, style.backgroundColor),
 					`${theme}: focus ring contrast against the control background`
 				).to.be.at.least(3);
+			});
+
+			// the values frappe-charts prints over the bars, which paint from the SVG
+			// `fill` rather than from the inherited CSS colour (RF-15)
+			cy.window().then((win) => {
+				const labels = [
+					...win.document.querySelectorAll(
+						".dashboard-widget-box .frappe-chart text.data-point-value"
+					),
+				];
+				expect(labels.length, `${theme}: chart value labels`).to.be.greaterThan(0);
+				labels.forEach((label) => {
+					const ratio = contrast(
+						win.getComputedStyle(label).fill,
+						effective_background(win, label)
+					);
+					expect(
+						ratio,
+						`${theme}: value label "${label.textContent}" contrast`
+					).to.be.at.least(4.5);
+				});
 			});
 
 			// tile text of the number cards
@@ -2193,6 +2813,44 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 			const events = win.$._data(tile[0], "events");
 			expect(events && events.keydown, "customize mode tile key handler").to.be.undefined;
+		});
+
+		// the tile that customize mode made inert does not advertise activation, and the rules
+		// carrying that affordance all name the customize-mode class (RG-5)
+		cy.window().then((win) => {
+			const tile = win.frappe.dashboard.number_card_group.widgets_list[0].widget;
+			const customize_class = "edit-mode";
+
+			tile.addClass(customize_class);
+			expect(
+				win.getComputedStyle(tile[0]).cursor,
+				"customize mode tile cursor"
+			).to.not.equal("pointer");
+
+			tile.removeClass(customize_class);
+			expect(win.getComputedStyle(tile[0]).cursor, "operable tile cursor").to.equal(
+				"pointer"
+			);
+
+			const selectors = [];
+			for (const sheet of win.document.styleSheets) {
+				let rules;
+				try {
+					rules = sheet.cssRules;
+				} catch (e) {
+					continue;
+				}
+				for (const rule of rules || []) {
+					rule.selectorText && selectors.push(rule.selectorText);
+				}
+			}
+
+			const unscoped = selectors.filter(
+				(selector) =>
+					/number-widget-box[^,{]*:(hover|focus-within)/.test(selector) &&
+					!selector.includes("edit-mode")
+			);
+			expect(unscoped, "tile hover rule without the customize-mode guard").to.be.empty;
 		});
 
 		// rebuilding the tile outside customize mode puts them back

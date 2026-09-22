@@ -481,6 +481,31 @@ def get_doc_workflow_state(doc):
 	return doc.get(workflow_state_field)
 
 
+def get_workflow_action_email_attachments(doc, print_format=None, lang=None):
+	"""Return the printed copy of `doc` as a single-item attachment list for the workflow action
+	email. Return an empty list and record an Error Log when the print format cannot be rendered."""
+	doctype = doc.get("doctype")
+	docname = doc.get("name")
+
+	try:
+		return [
+			frappe.attach_print(
+				doctype,
+				docname,
+				file_name=docname,
+				doc=doc,
+				lang=lang,
+				print_format=print_format,
+			)
+		]
+	except Exception:
+		frappe.log_error(
+			title="Workflow action email attachment could not be rendered",
+			message=frappe.get_traceback(),
+		)
+		return []
+
+
 def get_common_email_args(doc):
 	doctype = doc.get("doctype")
 	docname = doc.get("name")
@@ -503,16 +528,7 @@ def get_common_email_args(doc):
 	return {
 		"template": "workflow_action",
 		"header": "Workflow Action",
-		"attachments": [
-			frappe.attach_print(
-				doctype,
-				docname,
-				file_name=docname,
-				doc=doc,
-				lang=lang,
-				print_format=print_format,
-			)
-		],
+		"attachments": get_workflow_action_email_attachments(doc, print_format=print_format, lang=lang),
 		"subject": subject,
 		"message": response,
 	}

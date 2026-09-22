@@ -1,5 +1,34 @@
 frappe.dashboard_utils = {
+	/**
+	 * Renders one dropdown per entry of `filters` into a group element appended - or, with
+	 * `append` set, prepended - to `container`. The group lays its dropdowns out left to right
+	 * in the order they are painted, so the keyboard reaches them in that order inside a
+	 * widget control row that paints its own children right to left, and wraps them onto
+	 * further rows where the row is too narrow to hold them side by side.
+	 *
+	 * See PR Description decisions RD-13 and RD-15.
+	 *
+	 * @param {Array} filters One object per dropdown: `label`, `options`, `action` and the
+	 *   optional `icon`, `class` and `fieldnames`.
+	 * @param {string} button_class Class every dropdown carries, e.g. `"chart-actions"`.
+	 * @param {Object} container jQuery object wrapping the element the group is inserted into.
+	 * @param {boolean|number} append Truthy to prepend the group to `container`.
+	 */
 	render_chart_filters: function (filters, button_class, container, append) {
+		if (!filters || !filters.length) return;
+
+		const $filter_group = $(`<div class="chart-filter-group"></div>`).css({
+			display: "flex",
+			"flex-wrap": "wrap",
+			"align-items": "center",
+			gap: "5px",
+			"min-width": "0",
+		});
+
+		if (append) {
+			$filter_group.prependTo(container);
+		} else $filter_group.appendTo(container);
+
 		filters.forEach((filter) => {
 			let icon_html = "",
 				filter_class = "";
@@ -62,9 +91,9 @@ frappe.dashboard_utils = {
 				`<ul class="dropdown-menu" role="menu">${options_html}</ul></div>`;
 			let $chart_filter = $(dropdown_html);
 
-			if (append) {
-				$chart_filter.prependTo(container);
-			} else $chart_filter.appendTo(container);
+			// Each dropdown is inserted at the start of the group, which reverses the order
+			// the caller passes them in (PR Description decision RD-13).
+			$chart_filter.prependTo($filter_group);
 
 			$chart_filter.find(".dropdown-menu").on("click", "li a", (e) => {
 				let $el = $(e.currentTarget);

@@ -70,6 +70,11 @@ export default class ChartWidget extends Widget {
 	destroy_dashboard_chart() {
 		const chart = this.dashboard_chart || this.rendered_chart;
 
+		if (chart) {
+			clearTimeout(chart.deferred_redraw_timer);
+			chart.deferred_redraw_timer = null;
+		}
+
 		if (chart && typeof chart.destroy === "function") {
 			chart.destroy();
 		}
@@ -84,6 +89,47 @@ export default class ChartWidget extends Widget {
 		this.destroy_dashboard_chart();
 		this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
 		this.rendered_chart = this.dashboard_chart;
+		this.guard_chart_redraw(this.dashboard_chart);
+	}
+
+	// Holds a redraw of `chart` — the one frappe-charts itself issues on a resize — until the
+	// chart's <svg> is back in its container. An animated update replaces the <svg> with an
+	// animating clone for its duration, and a redraw made meanwhile removes the <svg> from a
+	// container that no longer holds it and stops, leaving the chart at its previous width.
+	// The redraw is retried every 50 ms for at most a second and then dropped, once per chart
+	// (RG-9).
+	guard_chart_redraw(chart) {
+		if (!chart || chart.redraw_guarded || typeof chart.draw !== "function") {
+			return;
+		}
+
+		chart.redraw_guarded = true;
+
+		const draw = chart.draw.bind(chart);
+		const retry_interval = 50;
+		const max_retries = 20;
+
+		chart.draw = (...args) => {
+			const svg_swapped_out =
+				chart.svg && chart.container && chart.svg.parentNode !== chart.container;
+
+			if (!svg_swapped_out) {
+				chart.deferred_redraw_count = 0;
+				return draw(...args);
+			}
+
+			if ((chart.deferred_redraw_count || 0) >= max_retries) {
+				chart.deferred_redraw_count = 0;
+				return;
+			}
+
+			chart.deferred_redraw_count = (chart.deferred_redraw_count || 0) + 1;
+			clearTimeout(chart.deferred_redraw_timer);
+			chart.deferred_redraw_timer = setTimeout(() => {
+				chart.deferred_redraw_timer = null;
+				chart.draw(...args);
+			}, retry_interval);
+		};
 	}
 
 	set_chart_title() {
@@ -402,9 +448,11 @@ export default class ChartWidget extends Widget {
 		this.selected_from_date = time_window.from_date;
 		this.selected_to_date = time_window.to_date;
 
+		// The control takes the first place of the filter group, the place the group paints at
+		// its left end and the keyboard reaches first (PR Description decision RD-13).
 		this.date_field_wrapper = $(
 			`<div class="dashboard-date-field pull-right"></div>`
-		).insertAfter(this.action_area.find(".timespan-filter"));
+		).prependTo(this.action_area.find(".chart-filter-group"));
 
 		this.wrap_header_for_date_field();
 
@@ -460,9 +508,13 @@ export default class ChartWidget extends Widget {
 
 	// Wraps the header of a narrow widget onto a second row, making room for the date range
 	// control while the title and subtitle keep the first row, and records that this widget's
-	// header is wrapped for it (RB-11).
+	// header is wrapped for it (RB-11). The width the widget is rendered at decides it,
+	// whatever width it is configured with, and a widget whose width cannot be measured is
+	// left on one row (RB-12).
 	wrap_header_for_date_field() {
-		if (this.width === "Full" || this.widget.width() >= 700) {
+		const rendered_width = this.widget.width();
+
+		if (!rendered_width || rendered_width >= 700) {
 			return;
 		}
 
@@ -758,6 +810,8 @@ export default class ChartWidget extends Widget {
 			doctype: this.chart_doc.document_type,
 			parent_doctype: this.chart_doc.parent_document_type,
 			filter_button: this.filter_button,
+			// a filter this group rejects raises no message of the group's own
+			report_invalid_filters: false,
 			on_change: () => {
 				this.filters = this.filter_group.get_filters();
 				this.save_chart_config_for_user({
@@ -767,7 +821,9 @@ export default class ChartWidget extends Widget {
 			},
 		});
 
+		// a filter set carrying no filter loads no meta and adds nothing to the group
 		this.filters &&
+			this.filters.length &&
 			frappe.model.with_doctype(this.chart_doc.document_type, () => {
 				this.filter_group.add_filters_to_filter_group(this.filters);
 			});
@@ -1005,14 +1061,61 @@ export default class ChartWidget extends Widget {
 		}
 	}
 
-	// Re-fetches the chart data from the error state. fetch_and_update_chart() requests with
-	// refresh: 1 and renders, and render() hides the error state once data arrives.
+	// Re-fetches the chart data from the error state, against the chart record as the server holds
+	// it when the retry is made. reload_chart_object() re-reads that record and never rejects,
+	// fetch_and_update_chart() requests with refresh: 1 and renders, and render() hides the error
+	// state once data arrives.
 	retry_fetch() {
 		this.retry_focus_pending = this.widget_holds_focus();
 
 		this.error_state.hide();
 		this.loading.show();
-		this.fetch_and_update_chart();
+
+		return this.reload_chart_object().then(() => this.fetch_and_update_chart());
+	}
+
+	/**
+	 * Re-reads this chart's record from the server and re-derives this widget's chart object,
+	 * its window and its filter set from the record that read returned.
+	 *
+	 * The record is read silently: a failure is reported neither by a message nor by a rejected
+	 * promise. This widget is left as it is when there is no saved record to read, when the read
+	 * fails or returns nothing, when the widget has left the document while the read was in
+	 * flight, and when the widget moved to another chart meanwhile. The record read is written to
+	 * the client document cache, so a later rebuild of this widget reads it rather than the
+	 * record the cache held before.
+	 *
+	 * @returns {Promise} Resolves once the record has been applied, or once it has been skipped.
+	 */
+	reload_chart_object() {
+		const chart_name = this.chart_doc && this.chart_doc.name;
+
+		if (!chart_name) {
+			return Promise.resolve();
+		}
+
+		return frappe
+			.xcall("frappe.client.get", { doctype: "Dashboard Chart", name: chart_name }, "GET", {
+				silent: true,
+			})
+			.then((doc) => {
+				const moved_on =
+					this.widget_disconnected() ||
+					!this.chart_doc ||
+					this.chart_doc.name !== chart_name;
+
+				if (!doc || !doc.name || moved_on) {
+					return null;
+				}
+
+				frappe.model.sync(doc);
+
+				this.chart_doc = this.clone_value(doc);
+				this.filters = null;
+
+				return this.prepare_chart_object();
+			})
+			.catch(() => null);
 	}
 
 	// Moves the keyboard to a rendered, visible element of this widget after a retry that started
@@ -1548,6 +1651,25 @@ export default class ChartWidget extends Widget {
 		);
 	}
 
+	// True when the rendered chart holds the data it was given rather than the entry placeholder
+	// frappe-charts draws for its first `initTimeout` milliseconds. The placeholder carries one
+	// value fewer than the axis has labels and no series names, so a chart whose every dataset
+	// holds one value per label of the data this widget fetched has completed the swap (RE-12).
+	chart_data_is_settled(chart) {
+		const labels = chart?.state?.xAxis?.labels;
+		const datasets = chart?.state?.datasets;
+
+		if (!labels || !labels.length || !datasets || !datasets.length) {
+			return false;
+		}
+
+		if (this.data?.labels?.length && this.data.labels.length !== labels.length) {
+			return false;
+		}
+
+		return datasets.every((dataset) => (dataset.values || []).length === labels.length);
+	}
+
 	// Turns the plot area into a labelled focus stop whose arrow keys walk the tooltip.
 	make_chart_keyboard_accessible() {
 		const chart = this.dashboard_chart;
@@ -1569,6 +1691,11 @@ export default class ChartWidget extends Widget {
 		// re-bounds the stored index to the label count of the chart as it now stands
 		this.clamp_tooltip_index();
 
+		// no tooltip path reads the entry placeholder (RE-12), and the hidden tooltip stays out of
+		// the accessibility tree of the group above (RE-13)
+		this.gate_tooltip_on_settled_data(chart);
+		this.bind_tooltip_aria_state(chart);
+
 		if (plot_area.plot_area_keyboard_bound) {
 			return;
 		}
@@ -1577,6 +1704,77 @@ export default class ChartWidget extends Widget {
 
 		this.chart_wrapper.on("keydown", (event) => this.handle_plot_area_keydown(event));
 		this.chart_wrapper.on("blur", () => this.hide_plot_area_tooltip());
+		this.chart_wrapper.on("mouseenter mousemove", () => this.release_tooltip_to_pointer());
+	}
+
+	// Holds `mapTooltipXPosition` — the one call every tooltip path goes through, this widget's
+	// keyboard and pointer handlers and frappe-charts' own pointer handler alike — closed while
+	// the chart still holds its entry placeholder, once per chart (RE-12).
+	gate_tooltip_on_settled_data(chart) {
+		if (!chart || chart.tooltip_entry_gated) {
+			return;
+		}
+
+		chart.tooltip_entry_gated = true;
+
+		const map_tooltip_x_position = chart.mapTooltipXPosition.bind(chart);
+
+		chart.mapTooltipXPosition = (...args) => {
+			if (!this.chart_data_is_settled(chart)) {
+				return;
+			}
+
+			return map_tooltip_x_position(...args);
+		};
+	}
+
+	// Mirrors the visibility frappe-charts gives `.graph-svg-tip` — which it hides by opacity
+	// alone, leaving its last text in the DOM — into `aria-hidden`, once per tooltip instance and
+	// for the pointer path as well as the keyboard path (RE-13).
+	bind_tooltip_aria_state(chart) {
+		const tip = chart && chart.tip;
+
+		if (!tip || !tip.container || tip.aria_state_bound) {
+			return;
+		}
+
+		tip.aria_state_bound = true;
+
+		const set_hidden = (hidden) => {
+			if (hidden) {
+				tip.container.setAttribute("aria-hidden", "true");
+			} else {
+				tip.container.removeAttribute("aria-hidden");
+			}
+		};
+		const show_tip = tip.showTip.bind(tip);
+		const hide_tip = tip.hideTip.bind(tip);
+
+		tip.showTip = () => {
+			show_tip();
+			set_hidden(false);
+		};
+
+		tip.hideTip = () => {
+			hide_tip();
+			set_hidden(true);
+		};
+
+		set_hidden(tip.container.style.opacity !== "1");
+	}
+
+	// Hands the tooltip over to the pointer: the live region is emptied, so it can never hold a
+	// figure the chart has stopped showing, and a keyboard move still waiting on the chart's data
+	// is dropped (RE-14).
+	release_tooltip_to_pointer() {
+		const announced = this.chart_announcer && this.chart_announcer.text();
+
+		if (!announced && !this.tooltip_settle_timer) {
+			return;
+		}
+
+		this.next_tooltip_request();
+		announced && this.chart_announcer.text("");
 	}
 
 	handle_plot_area_keydown(event) {
@@ -1623,7 +1821,9 @@ export default class ChartWidget extends Widget {
 		this.move_tooltip_to(next_index);
 	}
 
-	// Shows the same tooltip the pointer shows, for the data point at `index`.
+	// Shows the same tooltip the pointer shows, for the data point at `index`. A chart still
+	// holding its entry placeholder shows and announces nothing yet: the move is re-issued once
+	// the real data is in place (RE-12).
 	move_tooltip_to(index) {
 		const chart = this.dashboard_chart;
 
@@ -1632,7 +1832,30 @@ export default class ChartWidget extends Widget {
 		}
 
 		const positions = chart.state.xAxis.positions;
-		const bounded_index = Math.min(Math.max(index, 0), positions.length - 1);
+
+		this.tooltip_index = Math.min(Math.max(index, 0), positions.length - 1);
+
+		const request = this.next_tooltip_request();
+
+		if (this.chart_data_is_settled(chart)) {
+			this.show_tooltip_at(this.tooltip_index);
+			return;
+		}
+
+		this.chart_announcer && this.chart_announcer.text("");
+		this.await_settled_chart_data(chart, request);
+	}
+
+	// Shows the tooltip of the data point at `index` and mirrors it into the live region.
+	show_tooltip_at(index) {
+		const chart = this.dashboard_chart;
+
+		if (!this.chart_supports_tooltip_navigation(chart)) {
+			return;
+		}
+
+		const positions = chart.state.xAxis.positions;
+		const bounded_index = Math.min(Math.max(index ?? 0, 0), positions.length - 1);
 		const value_label_offset = chart.config && chart.config.valuesOverPoints ? -20 : 0;
 
 		this.tooltip_index = bounded_index;
@@ -1640,8 +1863,58 @@ export default class ChartWidget extends Widget {
 		this.announce_tooltip(bounded_index);
 	}
 
+	// Re-issues the pending tooltip move as soon as `chart` holds its real data, and drops it
+	// without showing anything when this widget has moved on: a newer move or an Escape, a chart
+	// this widget has redrawn or discarded, an element that has left the document, or a chart that
+	// has not settled within the deadline (RE-12).
+	await_settled_chart_data(chart, request) {
+		// frappe-charts swaps the placeholder for the real data 700 ms after it builds the chart,
+		// so the move is re-tried every 50 ms and given up on after 2 s
+		const retry_interval = 50;
+		const deadline = Date.now() + 2000;
+		const poll = () => {
+			this.tooltip_settle_timer = null;
+
+			if (
+				request !== this.tooltip_request ||
+				chart !== this.dashboard_chart ||
+				this.widget_disconnected()
+			) {
+				return;
+			}
+
+			if (this.chart_data_is_settled(chart)) {
+				this.show_tooltip_at(this.tooltip_index);
+				return;
+			}
+
+			if (Date.now() >= deadline) {
+				return;
+			}
+
+			this.tooltip_settle_timer = setTimeout(poll, retry_interval);
+		};
+
+		this.tooltip_settle_timer = setTimeout(poll, retry_interval);
+	}
+
+	// Tags the tooltip move being made now and invalidates every move still waiting on the
+	// chart's data, so only the latest request can reach the tooltip and the live region.
+	next_tooltip_request() {
+		if (this.tooltip_settle_timer) {
+			clearTimeout(this.tooltip_settle_timer);
+			this.tooltip_settle_timer = null;
+		}
+
+		this.tooltip_request = (this.tooltip_request || 0) + 1;
+
+		return this.tooltip_request;
+	}
+
 	hide_plot_area_tooltip() {
 		const chart = this.dashboard_chart;
+
+		this.next_tooltip_request();
 
 		if (chart && chart.tip && typeof chart.tip.hideTip === "function") {
 			chart.tip.hideTip();
@@ -1874,7 +2147,8 @@ export default class ChartWidget extends Widget {
 	}
 
 	set_chart_filters() {
-		let user_saved_filters = this.chart_settings.filters || null;
+		// the setting is read as it is: a saved filter set carrying no filter is a saved filter set
+		let user_saved_filters = this.chart_settings.filters;
 		let chart_saved_filters = frappe.dashboard_utils.get_all_filters(this.chart_doc);
 
 		if (this.chart_doc.chart_type == "Report") {
@@ -1885,18 +2159,51 @@ export default class ChartWidget extends Widget {
 						filters,
 						chart_saved_filters
 					);
-					this.filters =
-						frappe.utils.parse_array(user_saved_filters) ||
-						frappe.utils.parse_array(this.filters) ||
-						frappe.utils.parse_array(chart_saved_filters);
+					this.filters = this.resolve_chart_filters(
+						user_saved_filters,
+						this.filters,
+						chart_saved_filters
+					);
 				});
 		} else {
-			this.filters =
-				frappe.utils.parse_array(user_saved_filters) ||
-				frappe.utils.parse_array(this.filters) ||
-				frappe.utils.parse_array(chart_saved_filters);
+			this.filters = this.resolve_chart_filters(
+				user_saved_filters,
+				this.filters,
+				chart_saved_filters
+			);
 			return Promise.resolve();
 		}
+	}
+
+	/**
+	 * Returns the first of the given candidates that is a filter set, and undefined when none
+	 * of them is one.
+	 *
+	 * A candidate that is not set is skipped; a filter set that carries no filter is a filter
+	 * set and is returned. For chart_type "Report" an array carrying no filter is skipped
+	 * instead, so such a candidate leaves the next one to answer.
+	 *
+	 * @param {...(Array|Object|null|undefined)} candidates Filter sets in order of precedence.
+	 * @returns {Array|Object|undefined} The filter set that answers, or undefined.
+	 */
+	resolve_chart_filters(...candidates) {
+		const arrays_must_carry_a_filter = this.chart_doc.chart_type == "Report";
+
+		for (const candidate of candidates) {
+			const filters = frappe.utils.parse_array(candidate);
+
+			if (filters === undefined) {
+				continue;
+			}
+
+			if (arrays_must_carry_a_filter && Array.isArray(filters) && !filters.length) {
+				continue;
+			}
+
+			return filters;
+		}
+
+		return undefined;
 	}
 
 	update_default_date_filters(report_filters, chart_filters) {

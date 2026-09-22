@@ -83,6 +83,11 @@ class TestAuth(IntegrationTestCase):
 		frappe.clear_cache()
 		frappe.db.commit()
 
+	def clear_email_link_login_rate_limit(self):
+		"""Delete every rate limiter counter of `frappe.www.login.login_via_key` for this site,
+		across all client IPs and window sizes."""
+		frappe.cache.delete_keys("rl:frappe.www.login.login_via_key:")
+
 	def test_allow_login_using_mobile(self):
 		self.set_system_settings("allow_login_using_mobile_number", 1)
 		self.set_system_settings("allow_login_using_user_name", 0)
@@ -160,6 +165,10 @@ class TestAuth(IntegrationTestCase):
 
 	def test_login_with_email_link(self):
 		user = self.test_user_email
+
+		# Clear the login_via_key limiter before the attempts below, and again after the test
+		self.clear_email_link_login_rate_limit()
+		self.addCleanup(self.clear_email_link_login_rate_limit)
 
 		# Logs in
 		res = requests.get(_generate_temporary_login_link(user, 10))

@@ -377,9 +377,10 @@ bench --site test_site run-tests --doctype "Number Card"
 bench --site test_site run-tests --app frappe --coverage        # long; see troubleshooting
 ```
 
-Cypress, which needs a running web process and the setup wizard completed:
+Cypress, which needs the setup wizard completed and a web process started with `CI=true`:
 
 ```bash
+CI=true bench --site test_site serve --port 8300     # or CI=true bench start; leave it running
 bench --site test_site execute frappe.utils.install.complete_setup_wizard
 CI=true bench --site test_site execute frappe.tests.ui_test_helpers.create_test_user
 bench --site test_site run-ui-tests frappe --headless --browser chrome \
@@ -387,6 +388,8 @@ bench --site test_site run-ui-tests frappe --headless --browser chrome \
 ```
 
 Observed: `✓ renders two cards and two charts (3255ms)` / `1 passing` / `All specs passed!`, with `package.json` and `yarn.lock` unchanged afterwards.
+
+`CI=true` belongs on the web process, not only on the `execute` command that creates the test user. Every endpoint in `frappe/tests/ui_test_helpers.py` is decorated with `@whitelist_for_tests`, whose gate admits a call only when `frappe.in_test` is set, or `frappe._dev_server` and the site's `allow_tests` are both set, or `CI` is present in the environment (`frappe/tests/utils/__init__.py:27-29`). `frappe._dev_server` comes from the `DEV_SERVER` environment variable and from nothing else (`frappe/__init__.py:223`), and `bench --site <site> serve` does not set it, so on a bare `serve` — `allow_tests` at 1 notwithstanding — those endpoints answer HTTP 417 with "Test endpoints are only available when running in test mode or running a development server…" (`frappe/tests/utils/__init__.py:30-32`; `ValidationError` carries 417, `frappe/exceptions.py:24-25`). CI never meets this because it runs the app under `bench start` in a workflow environment that always exports `CI=true` (`.github/actions/setup/action.yml:243`). The dashboard spec calls no test helper, but 25 of the other specs do, and so do `cy.create_records` and `cy.add_role`/`cy.remove_role` (`cypress/support/commands.js:173`, `:452`), which means a `serve` without `CI=true` fails most of the suite in its `before` hook.
 
 **Static checks**
 
@@ -399,11 +402,58 @@ semgrep ci --config <frappe semgrep rules> --config r/python.lang.correctness
 
 Repository conventions the hooks enforce: `.py` and `.js` use tabs with a 110-column limit; every parameter of a new `@frappe.whitelist()` method must be type-annotated, because `require_type_annotated_api_methods` is on (`frappe/hooks.py:159`) and an unannotated parameter raises `FrappeTypeError` at request and test time.
 
+**Running more than one bench against one Redis cache**
+
+This dashboard was verified on a host carrying one bench per checkout, and that arrangement has a trap worth writing down, because it looks exactly like a broken build: the Desk asset map is cached under a Redis key that names neither the site nor the bench, so two benches sharing one Redis cache database overwrite each other's copy of it.
+
+The symptom is a Desk that never boots. `/desk`, any Desk route, or a Cypress spec's `before` hook returns HTTP 200 with a completely blank page, the console reports `TypeError: frappe.call is not a function`, and four script requests 404 — `assets/frappe/dist/js/{desk,list,form,report}.bundle.<HASH>.js` — carrying hashes that appear nowhere in that bench's own `sites/assets/assets.json`.
+
+The cause is the key those URLs come from. `get_assets_json()` merges `sites/assets/assets.json` with `assets-rtl.json` and, whenever `developer_mode` is falsy, returns it through `frappe.client_cache.get_value("assets_json", shared=True, generator=_get_assets)` (`frappe/utils/__init__.py:960-978`, the cached branch at `:970-975`; with `developer_mode` on it re-reads both files per call, `:977-978`). `shared=True` makes `RedisWrapper.make_key` hand the key back verbatim instead of prefixing it with the site's database name (`frappe/utils/redis_wrapper.py:52-62`), so `assets_json` is one global entry with no expiry — on the verification bench it is the only key in the whole cache database without a `test_frappe_11|` prefix. Every Desk page resolves its `<script>` URLs through that map (`frappe/utils/jinja_globals.py:147-157`, plus `frappe/sessions.py:166` for the boot payload), so the bench that regenerated the key last dictates the filenames every other bench on that database serves. esbuild names each bundle after its contents, so no two checkouts agree: `desk.bundle.js` is `H2G66NEE` on this branch's bench and `3ULAWL2G` on the neighbouring one. Exactly four scripts 404 rather than all eight, because the vendor bundles (`libs`, `billing`, `controls`, `telemetry`) are byte-identical between checkouts and resolve under either map. And the page is blank rather than half-built because `frappe/www/desk.html:52` creates `window.frappe` as a bare object before any bundle loads — the global exists, every method on it is missing.
+
+Two console messages follow, and both send readers down the wrong path. "Refused to execute script from '…' because its MIME type ('text/html') is not executable, and strict MIME type checking is enabled" is `X-Content-Type-Options: nosniff` applied to a 404 page, not a Content-Security-Policy refusal: a missing bundle URL is answered `404 NOT FOUND` with `Content-Type: text/html; charset=utf-8`, where the bundle that exists is served as `text/javascript; charset=utf-8`, and `nosniff` forbids executing the former as a script. Two checks separate the explanations. A `securitypolicyviolation` listener registered before the page loads records nothing in this failure mode; and injecting the bundle URLs read from the bench's own `assets.json` boots the Desk completely with the byte-identical CSP header still in force.
+
+Resolve it in the bench configuration, in this order.
+
+**Step 1 — give each bench its own Redis cache database.** Several benches on the verification host already do, and it is what this branch's bench uses. Number the database after the bench, set it once per bench, then restart that bench's processes so they connect to the new database:
+
+```bash
+bench set-config -g redis_cache redis://127.0.0.1:13000/11     # -g writes <bench>/sites/common_site_config.json
+```
+
+**Step 2 — where the configuration cannot change, delete the shared entry and restart that bench's web process.**
+
+```bash
+redis-cli -p 13000 -n 0 del assets_json     # -n <db>: 0 when redis_cache carries no index
+```
+
+The restart is not optional: the value also sits in each web worker's in-process `ClientCache` dictionary, which holds it for a hardcoded ten-minute local TTL and evicts it earlier only if a Redis invalidation message reaches that worker (`frappe/utils/redis_wrapper.py:448-483`, `:518-557`, `:630-636`), so emptying Redis does not reliably change what a running process serves. Note too that `bench --site <site> clear-cache` removes this key for *every* bench on the database rather than only yours — `assets_json` is the sole member of `bench_cache_keys` and is deleted with `shared=True` (`frappe/cache_manager.py:21`, `:109`, `:301`). Either way this is a truce, not a fix: the next Desk render on any other bench on that database repopulates the key from its own manifest.
+
+**Step 3 — confirm the served map is the bench's own.** The hash in the page must equal the hash on disk:
+
+```bash
+curl -s -c cookies.txt -X POST http://test_site:8300/api/method/login \
+  -H 'Content-Type: application/json' -d '{"usr":"Administrator","pwd":"admin"}'
+curl -s -b cookies.txt http://test_site:8300/desk | grep -oE 'desk\.bundle\.[A-Z0-9]+\.js'
+grep -o '"desk.bundle.js": "[^"]*"' sites/assets/assets.json
+```
+
+On this branch's bench the page reported `desk.bundle.H2G66NEE.js` and the manifest `/assets/frappe/dist/js/desk.bundle.H2G66NEE.js`, with `list`, `form` and `report` agreeing likewise. A mismatch means the map in Redis is not this bench's.
+
+**Harness decisions** — Rule 1 rows for the choices above. They govern the verification environment rather than the delivered feature, so they carry no `D` number from the plan's log:
+
+| Decision | Alternatives considered | Why this choice | Risks carried |
+| --- | --- | --- | --- |
+| Document the shared `assets_json` key as harness guidance and leave the framework code untouched | Namespace the cache key in `frappe/utils/__init__.py` — drop `shared=True` so the site's database name prefixes it, or fold the bench root into the key | The behaviour is framework-wide, predates this work and is correct for the deployment it was written for, where one bench owns its Redis cache; the failure needs two benches on one cache database, which is a property of this host. Re-keying a cache every request reads, to fix a condition production does not meet, is the larger change and the larger risk | The next multi-bench setup meets the same trap, and this section is the only guard; a framework-side prefix would remove the trap for everyone and would need its own review |
+| One Redis cache database per bench, set in that bench's `common_site_config.json` | Delete the shared key whenever the Desk breaks; run one bench at a time; set `developer_mode` 1 so the map is read from disk on every request | The configuration line is permanent and costs nothing at runtime; deleting is racy, because the next Desk render on any bench repopulates the key; serialising benches wastes the host; `developer_mode` 1 makes standard-record saves rewrite repository JSON and changes the code path under test | Each bench needs a distinct index, and a duplicate silently restores the fault; Redis serves 16 databases by default, so a host with more benches than that needs an index scheme or a second Redis instance |
+| Require `CI=true` on the web process and document it | Treat `allow_tests` alone as sufficient in `whitelist_for_tests`; export `DEV_SERVER=1` on the `serve` process instead | `allow_tests` is set on every test site, so accepting it alone would expose the whole of `ui_test_helpers.py` — record and DocType creation, role grants, cache resets — on any server carrying it. `DEV_SERVER=1` changes framework behaviour the specs are there to observe: no-cache response headers (`frappe/app.py:339-340`), an uncached Jinja environment (`frappe/utils/jinja.py:24`), uncached website route rules (`frappe/website/path_resolver.py:221`) and a `connect-src` addition to the served CSP by `add_dev_socketio_source` (`frappe/app.py:547-589`). `CI=true` is a property of the process, is what CI itself sets, and changes nothing else | A reader who starts `serve` without it meets HTTP 417 and can read it as a product defect; the command block above and the Troubleshooting row below are the mitigation |
+
 **Troubleshooting**
 
 | Symptom | Cause and resolution |
 | --- | --- |
 | `AttributeError: 'NoneType' object has no attribute 'get'` in `jinja_globals.py` | Assets not built. Run `bench build --app frappe`. |
+| Blank Desk page and `TypeError: frappe.call is not a function`, with 404s for `desk`, `list`, `form` and `report` bundle URLs whose hashes are not in `sites/assets/assets.json` | Another bench sharing this Redis cache database owns the `assets_json` key. Give the bench its own cache database, or delete the key and restart the bench's web process, then re-check the hash; see "Running more than one bench against one Redis cache" above. The accompanying "strict MIME type checking" messages are `nosniff` on the 404 page, not a CSP block. |
+| HTTP 417 "Test endpoints are only available when running in test mode or running a development server…" from a Cypress spec or a `frappe.tests.ui_test_helpers` call | The web process was started without `CI=true`; `allow_tests` alone does not satisfy the gate under a bare `serve`, because `DEV_SERVER` is unset. Restart it as `CI=true bench --site <site> serve --port <port>`. |
 | `ConnectionRefusedError` from `test_api`, `test_auth` or `test_frappe_client` | Those modules drive real HTTP. Start `bench --site <site> serve --port <port>` first, and make sure the site's `host_name` matches the port you serve on. |
 | `/socket.io/...` 404s and "xhr poll error" in the console | No realtime process under a bare `serve`. Expected; use `bench start` if you need realtime. |
 | Bar chart shows "No Data" | No ToDo is both Open and allocated. Seed one with `allocated_to` set. |
@@ -445,7 +495,7 @@ Repository conventions the hooks enforce: `.py` and `.js` use tabs with a 110-co
 | 9000 | Socket.IO (realtime) | Absent under a bare `serve`; `/socket.io` 404s are expected then |
 | 3306 | MariaDB | Site database |
 | 11000 | Redis queue | Background jobs |
-| 13000 | Redis cache | Document and chart caches |
+| 13000 | Redis cache | Document and chart caches. Give each bench its own database on this port — `"redis_cache": "redis://127.0.0.1:13000/<bench index>"` — because the Desk asset map is cached under the unprefixed key `assets_json` and benches sharing a database overwrite each other's copy (Section 9) |
 | 2525 | SMTP capture (CI only) | Not run locally; sites use `mute_emails 1` |
 
 ## C. Key File Locations
@@ -497,7 +547,8 @@ Existing framework files this branch changes:
 
 | Name | Scope | Purpose |
 | --- | --- | --- |
-| `CI` | shell | Set to `true` for non-interactive Node tooling and to let the UI test-user helper run |
+| `CI` | shell | Set to `true` for non-interactive Node tooling, and required on any process that calls a `frappe.tests.ui_test_helpers` endpoint — a `bench execute` of one, and the web process behind a Cypress run — or the call is refused (HTTP 417 over the API, `ValidationError` from `execute`) |
+| `DEV_SERVER` | web process | The only source of `frappe._dev_server` (`frappe/__init__.py:223`); `bench --site <site> serve` does not set it, which is why `CI=true` and not `allow_tests` is what opens the test endpoints on a bare `serve` |
 | `CYPRESS_baseUrl` | Cypress | Base URL of the running site, e.g. `http://test_site:8000` |
 | `CYPRESS_adminPassword` | Cypress | Administrator password used by `cy.login` |
 | `CYPRESS_coverage` | Cypress | Enables instrumented UI coverage; `false` for a plain run |

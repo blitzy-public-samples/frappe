@@ -78,9 +78,11 @@ body {
 		.grid-col-2 {
 			grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
 
+			// spans every column `auto-fill` generates, however many that is
+			// (decision row RG-6 in blitzy/documentation/PR Description.md section 6)
 			.full-width {
 				grid-column-start: 1;
-				grid-column-end: 2;
+				grid-column-end: -1;
 			}
 		}
 
@@ -155,8 +157,12 @@ body {
 				}
 			}
 
+			// holds a complete two-date range at the 14px control font, and never exceeds
+			// the header row it sits in
+			// (decision row RB-13 in blitzy/documentation/PR Description.md section 6)
 			.dashboard-date-field {
-				width: 130px;
+				width: 220px;
+				max-width: 100%;
 				height: 27px;
 
 				.clearfix,
@@ -249,11 +255,18 @@ body {
 			padding-top: 7px;
 		}
 
+		// the control row takes a header row of its own where it does not fit beside the
+		// title, and wraps within that row rather than overflowing the widget, so every
+		// control stays inside the card at any widget width
+		// (decision row RB-12 in blitzy/documentation/PR Description.md section 6)
 		.widget-control {
 			display: flex;
 			align-items: center;
-			flex: 1;
+			flex: 1 1 auto;
 			font-size: 10px;
+			min-width: 0;
+			flex-wrap: wrap;
+			row-gap: 6px;
 		}
 
 		.chart-loading-state {
@@ -265,9 +278,15 @@ body {
 			border-radius: 7px;
 			background-color: var(--subtle-accent);
 
-			// restores the focus ring that `.dashboard-widget-box .btn-xs` removes
-			.chart-retry:focus-visible {
-				box-shadow: var(--focus-default);
+			// gives the Retry control a resting boundary against its own fill and the
+			// panel behind it (decision row RF-19), and restores the focus ring that
+			// `.dashboard-widget-box .btn-xs` removes (decision row RC-7)
+			.chart-retry {
+				border: 1px solid var(--ink-gray-6);
+
+				&:focus-visible {
+					box-shadow: var(--focus-default);
+				}
 			}
 		}
 
@@ -582,10 +601,13 @@ body {
 			font-size: var(--text-lg);
 		}
 
+		// consumes the ring token the widget scope declares, which this rule's
+		// `outline: 0` would otherwise leave unpainted (decision row RF-18)
 		&:focus-visible {
 			text-decoration: underline;
 			background-color: var(--highlight-color);
 			outline: 0;
+			box-shadow: var(--focus-default);
 		}
 	}
 
@@ -661,22 +683,33 @@ body {
 	}
 
 	&.number-widget-box {
-		cursor: pointer;
 		min-height: 84px;
 		padding: 12px;
 		border: 1px solid var(--border-color);
 		transition: border-color 0.2s ease-in-out, box-shadow 0.2s ease-in-out;
 
-		&:hover,
-		&:focus-visible,
-		&:focus-within {
-			border-color: var(--invert-neutral, currentColor);
-			box-shadow: var(--shadow-base);
+		// the activation affordance belongs to an operable tile: a tile in workspace
+		// customize mode carries no role, no tab stop and no key handler, and takes none
+		// of it. `:where()` leaves the specificity of each selector as it was
+		// (decision row RG-5 in blitzy/documentation/PR Description.md section 6)
+		&:where(:not(.edit-mode)) {
+			cursor: pointer;
+
+			&:hover,
+			&:focus-visible,
+			&:focus-within {
+				border-color: var(--invert-neutral, currentColor);
+				box-shadow: var(--shadow-base);
+			}
+
+			&:focus-visible {
+				box-shadow: var(--focus-default), var(--shadow-base);
+				outline: 0;
+			}
 		}
 
-		&:focus-visible {
-			box-shadow: var(--focus-default), var(--shadow-base);
-			outline: 0;
+		&.edit-mode {
+			cursor: default;
 		}
 
 		.widget-head {
@@ -879,6 +912,22 @@ body {
 // Decision row RD-10 in blitzy/documentation/PR Description.md section 6.
 .btn-group > .btn.chart-filter-toggle:not(:last-child):not(.dropdown-toggle) {
 	border-radius: var(--radius);
+}
+
+// Keeps the browser's own scroll-into-view — the one sequential focus navigation performs
+// inside the scrolling `.main-section` — clear of the sticky `.page-head` above it, for a
+// widget and for every control a widget can hand focus to.
+// Decision row RG-7 in blitzy/documentation/PR Description.md section 6.
+.widget {
+	scroll-margin-top: calc(var(--page-head-height) + var(--margin-sm));
+
+	.btn,
+	.btn-reset,
+	a,
+	input,
+	[tabindex] {
+		scroll-margin-top: calc(var(--page-head-height) + var(--margin-sm));
+	}
 }
 
 .onboarding-success {
@@ -1477,6 +1526,20 @@ body {
 	--focus-outline-default: 3px solid var(--ink-gray-6);
 }
 
+// Re-declares the same ring tokens for the whole Desk dashboard route, so the page
+// chrome outside every widget — the breadcrumb links and the page-head controls —
+// paints the ring the widgets paint. Ring geometry is unchanged (2px light, 3px dark).
+// Decision row RF-12 in blitzy/documentation/PR Description.md section 6.
+body[data-route^="dashboard-view"] {
+	--focus-default: 0px 0px 0px 2px var(--ink-gray-6);
+	--focus-outline-default: 2px solid var(--ink-gray-6);
+}
+
+[data-theme="dark"] body[data-route^="dashboard-view"] {
+	--focus-default: 0px 0px 0px 3px var(--ink-gray-6);
+	--focus-outline-default: 3px solid var(--ink-gray-6);
+}
+
 .widget {
 	// Overrides bootstrap's compiled `.form-control::placeholder { color: var(--gray-500) }`.
 	// Decision row RF-3 in blitzy/documentation/PR Description.md section 6.
@@ -1492,20 +1555,54 @@ body {
 	}
 
 	// Restores the focus ring on widget controls that `.dashboard-widget-box
-	// .btn-xs { box-shadow: none }` above leaves without one.
+	// .btn-xs { box-shadow: none }` above leaves without one, and paints it on the
+	// form controls a widget renders, which no other rule gives a ring of this
+	// contrast. Decision row RF-13 in blitzy/documentation/PR Description.md section 6.
 	.btn:focus-visible,
 	.btn-reset:focus-visible,
 	a:focus-visible,
-	[tabindex]:focus-visible {
+	[tabindex]:focus-visible,
+	input:focus-visible,
+	select:focus-visible,
+	textarea:focus-visible,
+	.form-control:focus-visible {
 		box-shadow: var(--focus-default);
 		outline: none;
 	}
+
+	// Overrides bootstrap's `.dropdown-item.active { background-color: #7c7c7c }`,
+	// compiled from `$component-active-bg` in frappe/public/scss/desk/variables.scss,
+	// which paints the same mid grey in both themes.
+	// Decision row RF-14 in blitzy/documentation/PR Description.md section 6.
+	.dropdown-item.active,
+	.dropdown-item.active:hover {
+		background-color: var(--ink-gray-8);
+		color: var(--fg-color);
+	}
+}
+
+// Overrides the error-state ring of `frappe/public/scss/common/controls.scss`
+// (`.frappe-control…has-error input:focus`) while a widget's control holds keyboard
+// focus; that rule's `:not()` qualifiers are mirrored here to out-specify it.
+// Decision row RF-13 in blitzy/documentation/PR Description.md section 6.
+.widget
+	.frappe-control:not([data-fieldtype="MultiSelectPills"]):not([data-fieldtype="Table MultiSelect"]).has-error
+	input:focus-visible {
+	box-shadow: var(--focus-default);
 }
 
 // Overrides bootstrap's `.text-danger { color: #e03636 !important }` utility,
 // emitted by its text-emphasis-variant mixin.
 .dashboard-widget-box .chart-loading-state.text-danger {
 	color: var(--ink-red-8) !important;
+}
+
+// Paints the value labels frappe-charts prints over bars and points. The library
+// creates those `<text>` nodes without a `fill`, so they otherwise take the SVG
+// initial black regardless of theme.
+// Decision row RF-15 in blitzy/documentation/PR Description.md section 6.
+.dashboard-widget-box .frappe-chart text.data-point-value {
+	fill: var(--text-color);
 }
 
 // Overrides `.navbar-breadcrumbs a { color: var(--ink-gray-5) }` and its `/` separator
@@ -1516,5 +1613,38 @@ body[data-route^="dashboard-view"] .navbar-breadcrumbs a {
 
 	&:before {
 		color: var(--ink-gray-6);
+	}
+
+	// Restores the hover colour of `.navbar-breadcrumbs a:hover` in
+	// frappe/public/scss/desk/breadcrumb.scss, which the rule above out-specifies.
+	// Decision row RF-17 in blitzy/documentation/PR Description.md section 6.
+	&:hover {
+		color: var(--ink-gray-8);
+	}
+
+	// Draws the focus ring inside the crumb's own box, replacing the outset
+	// `box-shadow` that `a:focus-visible` in frappe/public/scss/common/buttons.scss
+	// applies: the crumb's `li.ellipsis`, `ul.navbar-breadcrumbs.ellipsis` and
+	// `div.title-area.ellipsis` ancestors are `overflow: hidden` and clip it away.
+	// Decision row RF-20 in blitzy/documentation/PR Description.md section 6.
+	&:focus-visible {
+		box-shadow: none;
+		outline: var(--focus-outline-default);
+		outline-offset: -2px;
+	}
+}
+
+// Keeps the inset ring flush with the crumb's box at the dark theme's 3px width.
+// Decision row RF-20 in blitzy/documentation/PR Description.md section 6.
+[data-theme="dark"] body[data-route^="dashboard-view"] .navbar-breadcrumbs a:focus-visible {
+	outline-offset: -3px;
+}
+
+// Drops the `/` separator at the widths where frappe/public/scss/desk/mobile.scss
+// renders the last crumb alone, on the same 991px threshold that rule uses.
+// Decision row RF-16 in blitzy/documentation/PR Description.md section 6.
+@media (max-width: 991px) {
+	body[data-route^="dashboard-view"] .navbar-breadcrumbs a:before {
+		display: none;
 	}
 }

@@ -20,10 +20,9 @@ const CHART_PLOT_EXTRA_WIDTH = 80;
 const CHART_AXIS_LABEL_CHAR_DIVISOR = 7;
 // characters per label below which a label space ratio is not reduced further
 const CHART_AXIS_MIN_LABEL_CHARACTERS = 0.01;
-// absolute value from which an axis tick may carry a number system symbol such as K, M, L or Cr
-const CHART_AXIS_ABBREVIATION_THRESHOLD = 1000;
-// absolute value from which an abbreviated axis tick may carry two decimals instead of one
-const CHART_AXIS_TWO_DECIMAL_ABBREVIATION_THRESHOLD = 1.0e6;
+// absolute value from which every axis tick carries a number system symbol such as M, L or Cr,
+// and below which every axis tick is written out with the site group separator
+const CHART_AXIS_ABBREVIATION_THRESHOLD = 1.0e6;
 // decimals every axis tick may carry, whatever its magnitude
 const CHART_AXIS_MAX_DECIMALS = 2;
 // significant digits an axis tick keeps when it needs more decimals than CHART_AXIS_MAX_DECIMALS
@@ -110,9 +109,41 @@ function group_chart_axis_number(value) {
 	return write_chart_axis_number(value, chart_axis_decimals(value));
 }
 
-// An axis tick abbreviated in the number system of `country`, its coefficient written with the
-// group and decimal separators of the site number format, or null when the abbreviation would not
-// carry the tick exactly.
+// The coefficient an axis tick of `value` carries when it is abbreviated with `divisor`, rounded
+// to the decimals an axis tick may carry.
+function chart_axis_coefficient(value, divisor) {
+	const factor = Math.pow(10, CHART_AXIS_MAX_DECIMALS);
+
+	return Math.round((value / divisor) * factor) / factor;
+}
+
+// The `number_system` entry an axis tick of `magnitude` is abbreviated with: the entry with the
+// largest divisor the magnitude reaches, or the entry above it when rounding the coefficient
+// carries the tick up to that entry's divisor. Null when the magnitude reaches no entry.
+function chart_axis_number_system_entry(number_system, magnitude) {
+	// the entries run from the largest divisor down, so the entry above one precedes it
+	let index = number_system.findIndex((entry) => magnitude >= entry.divisor);
+
+	if (index === -1) {
+		return null;
+	}
+
+	while (
+		index > 0 &&
+		chart_axis_coefficient(magnitude, number_system[index].divisor) *
+			number_system[index].divisor >=
+			number_system[index - 1].divisor
+	) {
+		index -= 1;
+	}
+
+	return number_system[index];
+}
+
+// An axis tick abbreviated in the number system of `country`, its coefficient rounded to at most
+// CHART_AXIS_MAX_DECIMALS decimals and written with the group and decimal separators of the site
+// number format, or null when the tick's magnitude is below CHART_AXIS_ABBREVIATION_THRESHOLD or
+// reaches no entry of that number system.
 function abbreviate_chart_axis_number(value, country) {
 	const magnitude = Math.abs(value);
 
@@ -120,29 +151,22 @@ function abbreviate_chart_axis_number(value, country) {
 		return null;
 	}
 
-	const number_system = frappe.utils.get_number_system(country);
-	const rounded_magnitude = Math.abs(Math.round(value));
-	const map = number_system.find((entry) => rounded_magnitude >= entry.divisor);
-
-	if (!map) {
-		return null;
-	}
-
-	const decimals = magnitude >= CHART_AXIS_TWO_DECIMAL_ABBREVIATION_THRESHOLD ? 2 : 1;
-	const scaled = (value / map.divisor) * Math.pow(10, decimals);
-
-	if (Math.abs(scaled - Math.round(scaled)) > 1e-9) {
-		return null;
-	}
-
-	// the coefficient carries its own decimals, capped at the abbreviation's allowance
-	const coefficient = Math.round(scaled) / Math.pow(10, decimals);
-	const coefficient_decimals = Math.min(
-		frappe.utils.get_number_of_decimals(coefficient),
-		decimals
+	const entry = chart_axis_number_system_entry(
+		frappe.utils.get_number_system(country),
+		magnitude
 	);
 
-	return `${write_chart_axis_number(coefficient, coefficient_decimals)} ${map.symbol}`;
+	if (!entry) {
+		return null;
+	}
+
+	const coefficient = chart_axis_coefficient(value, entry.divisor);
+	const coefficient_decimals = Math.min(
+		frappe.utils.get_number_of_decimals(coefficient),
+		CHART_AXIS_MAX_DECIMALS
+	);
+
+	return `${write_chart_axis_number(coefficient, coefficient_decimals)} ${entry.symbol}`;
 }
 
 // The label space ratio that gives frappe-charts `characters` characters per label for `count`
@@ -2093,11 +2117,26 @@ Object.assign(frappe.utils, {
 		return new Promise((resolve) => setTimeout(resolve, time));
 	},
 
+	/**
+	 * Returns the filter set passed in, and undefined for a value that is not set.
+	 *
+	 * A filter set that carries no filter — an empty array, an empty object — is a filter set
+	 * and is returned as it is. null, undefined and every other falsy value return undefined.
+	 *
+	 * @param {Array|Object|null|undefined} array A filter set, or a value that is not set.
+	 * @returns {Array|Object|undefined} The filter set, or undefined when none is set.
+	 *
+	 * @example
+	 * frappe.utils.parse_array([["ToDo", "status", "=", "Open"]]); // the array passed in
+	 * frappe.utils.parse_array([]); // []
+	 * frappe.utils.parse_array(null); // undefined
+	 */
 	parse_array(array) {
-		if (array && array.length !== 0) {
-			return array;
+		if (!array) {
+			return undefined;
 		}
-		return undefined;
+
+		return array;
 	},
 
 	// simple implementation of python's range

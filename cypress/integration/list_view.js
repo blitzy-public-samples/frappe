@@ -10,6 +10,11 @@ context("List View", () => {
 			});
 	});
 
+	after(() => {
+		// Removes the "Test ToDo" Workflow this spec's before hook created
+		cy.call("frappe.tests.ui_test_helpers.teardown_workflow");
+	});
+
 	it("Keep checkbox checked after Refresh", { scrollBehavior: false }, () => {
 		cy.go_to_list("ToDo");
 		cy.clear_filters();

@@ -15,6 +15,7 @@ from frappe.app import (
 	DEFAULT_X_CONTENT_TYPE_OPTIONS,
 	DEFAULT_X_FRAME_OPTIONS,
 	SCRIPT_SOURCE_ORIGINS,
+	SECURITY_HEADER_CONFIG_KEYS,
 	STYLE_SOURCE_ORIGINS,
 	origin_of,
 	process_response,
@@ -63,6 +64,17 @@ SHIPPED_ORIGIN_LOADERS = {
 		"//www.google-analytics.com/analytics.js",
 	),
 	"https://www.youtube.com": ("public/js/frappe/utils/help.js", 'data-plyr-provider="youtube"'),
+}
+
+
+# Configured values the WSGI layer cannot send, keyed by the shape that makes each one unsendable.
+UNSENDABLE_VALUE_SHAPES = {
+	"line feed": "{}\nX-Injected: pwned",
+	"carriage return": "{}\rX-Injected: pwned",
+	"carriage return line feed": "{}\r\nX-Injected: pwned",
+	"non-ascii character": "{}\u2713",
+	"null byte": "{}\x00",
+	"delete character": "{}\x7f",
 }
 
 
@@ -418,6 +430,159 @@ class TestSecurityHeaders(IntegrationTestCase):
 			self.assertNotIn(header, response.headers)
 
 		self.assertIn("Cache-Control", response.headers)
+
+	def assert_headers_are_sendable(self, response):
+		"""Assert every emitted header survives the encoding the WSGI layer applies to it."""
+		for header, value in response.headers.to_wsgi_list():
+			self.assertNotIn("\n", value, msg=f"{header} spans more than one line")
+			self.assertNotIn("\r", value, msg=f"{header} spans more than one line")
+			value.encode("latin-1")
+
+	def test_every_emitted_default_header_value_is_sendable(self):
+		self.assert_headers_are_sendable(self.process())
+
+	def test_site_config_policy_allowing_another_origin_omits_x_frame_options(self):
+		"""The X-Frame-Options decision reads a site-config policy as well (decision RJ-13)."""
+		configured_policy = "default-src 'self'; frame-ancestors https://partner.example"
+		self.set_conf(content_security_policy=configured_policy)
+
+		response = self.process()
+
+		self.assertEqual(response.headers["Content-Security-Policy"], configured_policy)
+		self.assertNotIn("X-Frame-Options", response.headers)
+		self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+		self.assertEqual(response.headers["Referrer-Policy"], DEFAULT_REFERRER_POLICY)
+
+	def test_site_config_policy_confined_to_this_origin_keeps_x_frame_options(self):
+		confined_policies = (
+			"default-src 'self'; frame-ancestors 'self'",
+			"default-src 'self'; frame-ancestors 'none'",
+			"default-src 'self'; frame-ancestors http://test.localhost:8000",
+			"default-src 'self'",
+		)
+
+		for configured_policy in confined_policies:
+			with self.subTest(policy=configured_policy):
+				self.set_conf(content_security_policy=configured_policy)
+
+				response = self.process(headers={"Host": "test.localhost:8000"})
+
+				self.assertEqual(response.headers["Content-Security-Policy"], configured_policy)
+				self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+
+	def test_configured_x_frame_options_is_omitted_beside_an_embedding_site_config_policy(self):
+		self.set_conf(
+			x_frame_options="DENY",
+			content_security_policy="default-src 'self'; frame-ancestors https://partner.example",
+		)
+
+		self.assertNotIn("X-Frame-Options", self.process().headers)
+
+	def test_request_policy_decides_x_frame_options_over_a_site_config_policy(self):
+		self.set_conf(content_security_policy="frame-ancestors https://partner.example")
+		frappe.local.response_headers["Content-Security-Policy"] = "frame-ancestors 'self'"
+
+		response = self.process()
+
+		self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+
+	def test_renderer_policy_decides_x_frame_options_over_a_site_config_policy(self):
+		self.set_conf(content_security_policy="frame-ancestors 'self'")
+		response = Response()
+		response.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://embed.example"
+
+		self.process(response=response)
+
+		self.assertEqual(
+			response.headers["Content-Security-Policy"], "frame-ancestors 'self' https://embed.example"
+		)
+		self.assertNotIn("X-Frame-Options", response.headers)
+
+	def test_crlf_site_config_value_falls_back_to_the_default(self):
+		"""The reported CRLF override no longer breaks the response (decision RJ-14)."""
+		self.set_conf(x_frame_options="DENY\nX-Injected: pwned")
+
+		response = self.process()
+
+		self.assertEqual(response.headers["X-Frame-Options"], DEFAULT_X_FRAME_OPTIONS)
+		self.assertNotIn("X-Injected", response.headers)
+		self.assertEqual(response.headers["Content-Security-Policy"], DEFAULT_CONTENT_SECURITY_POLICY)
+		self.assert_headers_are_sendable(response)
+
+	def test_non_ascii_site_config_value_falls_back_to_the_default(self):
+		self.set_conf(x_frame_options="SAMEORIGIN\u2713")
+
+		response = self.process()
+
+		self.assertEqual(response.headers["X-Frame-Options"], DEFAULT_X_FRAME_OPTIONS)
+		self.assert_headers_are_sendable(response)
+
+	def test_unsendable_value_falls_back_to_the_default_for_every_header(self):
+		for config_key, (header, default) in SECURITY_HEADER_CONFIG_KEYS.items():
+			for shape, template in UNSENDABLE_VALUE_SHAPES.items():
+				with self.subTest(config_key=config_key, shape=shape):
+					self.set_conf(**{config_key: template.format(default)})
+
+					response = self.process()
+
+					self.assertEqual(response.headers[header], default)
+					self.assertNotIn("X-Injected", response.headers)
+					self.assert_headers_are_sendable(response)
+
+	def test_unsendable_site_config_value_is_logged_against_its_key(self):
+		self.set_conf(referrer_policy="no-referrer\u2713")
+
+		with patch("frappe.logger") as logger:
+			self.process()
+
+		logged = logger.return_value.error.call_args.args[0]
+		self.assertIn("referrer_policy", logged)
+
+	def test_a_log_that_cannot_be_written_does_not_fail_the_response(self):
+		self.set_conf(x_frame_options="DENY\nX-Injected: pwned")
+
+		with patch("frappe.logger", side_effect=OSError("log file unavailable")):
+			response = self.process()
+
+		self.assertEqual(response.headers["X-Frame-Options"], DEFAULT_X_FRAME_OPTIONS)
+		self.assertNotIn("X-Injected", response.headers)
+
+	def test_whitespace_only_site_config_value_omits_its_header(self):
+		self.set_conf(referrer_policy="   ")
+
+		response = self.process()
+
+		self.assertNotIn("Referrer-Policy", response.headers)
+		self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+		self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+
+	def test_surrounding_whitespace_is_dropped_from_a_site_config_value(self):
+		self.set_conf(x_frame_options="  DENY\t")
+
+		self.assertEqual(self.process().headers["X-Frame-Options"], "DENY")
+
+	def test_unsendable_policy_falls_back_to_the_default_policy_with_the_cloud_settings_origin(self):
+		self.set_conf(
+			pilot_endpoint="https://pilot.example.com",
+			content_security_policy="default-src 'self'\nX-Injected: pwned",
+		)
+
+		policy = self.process().headers["Content-Security-Policy"]
+
+		self.assertIn("https://pilot.example.com", get_directive(policy, "script-src"))
+		self.assertEqual(get_directive(policy, "frame-ancestors"), "'self'")
+		self.assertEqual(get_directive(policy, "object-src"), "'none'")
+
+	def test_long_site_config_policy_is_sent_in_full(self):
+		hosts = " ".join(f"https://cdn{index}.example" for index in range(400))
+		configured_policy = f"default-src 'self'; frame-ancestors 'self'; img-src 'self' {hosts}"
+		self.set_conf(content_security_policy=configured_policy)
+
+		response = self.process()
+
+		self.assertGreater(len(configured_policy), 8000)
+		self.assertEqual(response.headers["Content-Security-Policy"], configured_policy)
+		self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
 
 	def test_headers_present_on_cors_response_with_wildcard_origin(self):
 		"""A site that allows every CORS origin is not exempt from the header baseline."""

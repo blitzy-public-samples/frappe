@@ -285,7 +285,11 @@ export default class NumberCardWidget extends Widget {
 	}
 
 	async render_card() {
+		// The control the keyboard sits on is remembered by selector before the action area is
+		// rebuilt and re-matched in the rebuilt one (PR Description decision RD-12).
+		this.pending_focus_control = this.pending_focus_control || this.get_focused_control();
 		this.prepare_actions();
+		this.restore_rebuilt_control_focus();
 		this.set_title();
 		this.card_doc?.background_color &&
 			this.widget.css("background-color", this.card_doc.background_color);
@@ -477,6 +481,9 @@ export default class NumberCardWidget extends Widget {
 				label: __("Refresh"),
 				action: "action-refresh",
 				handler: () => {
+					// The rebuild this command triggers returns the keyboard to the rebuilt
+					// card actions toggle (PR Description decision RD-12).
+					this.pending_focus_control = ".card-menu";
 					this.render_card();
 				},
 			},
@@ -522,5 +529,85 @@ export default class NumberCardWidget extends Widget {
 		frappe.dashboard_utils.make_dropdown_keyboard_operable(this.card_actions);
 
 		this.action_area.html(this.card_actions);
+	}
+
+	/**
+	 * True while the keyboard sits on one of this widget's action-area controls.
+	 *
+	 * See PR Description decision RD-12.
+	 */
+	action_area_holds_focus() {
+		const focused = document.activeElement;
+		const area = this.action_area && this.action_area[0];
+
+		return Boolean(focused && area && area.contains(focused));
+	}
+
+	/**
+	 * The selector of the control in this widget's action area that holds the keyboard - the
+	 * card actions toggle, the one control that area renders - or null while the keyboard sits
+	 * anywhere else. `restore_rebuilt_control_focus()` matches the selector again in the
+	 * rebuilt action area.
+	 *
+	 * See PR Description decision RD-12.
+	 */
+	get_focused_control() {
+		return this.action_area_holds_focus() ? ".card-menu" : null;
+	}
+
+	/**
+	 * Focuses the control `selector` matches in this widget's action area. An empty selector,
+	 * and a selector the area holds no match for - the card actions toggle of a card in
+	 * customize mode, which renders no menu - leave focus untouched.
+	 *
+	 * @param {string} [selector] CSS selector of the control, e.g. `".card-menu"`.
+	 */
+	focus_control(selector) {
+		const area = this.action_area;
+
+		if (!selector || !area) {
+			return;
+		}
+
+		const $control = area.find(selector).first();
+		$control.length && $control.trigger("focus");
+	}
+
+	/**
+	 * Returns the keyboard to the control recorded in `pending_focus_control` once this
+	 * widget's action area has been rebuilt, and clears the record, so a later render restores
+	 * nothing of its own accord.
+	 *
+	 * Focus that the rebuild's command placed on a connected element outside this widget - a
+	 * dialog, another widget, a new route - is left where it was put. Focus on `body`, on the
+	 * document element, on an element the rebuild detached, or nowhere at all counts as
+	 * unplaced and is returned to the recorded control.
+	 *
+	 * See PR Description decisions RD-11 and RD-12.
+	 */
+	restore_rebuilt_control_focus() {
+		const selector = this.pending_focus_control;
+		this.pending_focus_control = null;
+
+		if (!selector) {
+			return;
+		}
+
+		const focused = document.activeElement;
+		const widget = this.widget && this.widget[0];
+		const placed_outside_widget = Boolean(
+			focused &&
+				focused !== document.body &&
+				focused !== document.documentElement &&
+				focused.isConnected &&
+				widget &&
+				!widget.contains(focused)
+		);
+
+		if (placed_outside_widget) {
+			return;
+		}
+
+		this.focus_control(selector);
 	}
 }

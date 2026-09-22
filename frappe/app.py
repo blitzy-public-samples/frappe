@@ -4,6 +4,7 @@
 import functools
 import logging
 import os
+import re
 import sys
 from urllib.parse import urlsplit
 
@@ -303,6 +304,9 @@ SECURITY_HEADER_CONFIG_KEYS = {
 	"referrer_policy": ("Referrer-Policy", DEFAULT_REFERRER_POLICY),
 }
 
+# A header value the WSGI layer can send: one line of printable ASCII, horizontal tab included.
+HEADER_VALUE_PATTERN = re.compile(r"[\t\x20-\x7e]*")
+
 
 def process_response(response: Response):
 	if not response:
@@ -383,8 +387,11 @@ def set_security_headers(response: Response):
 	Each header is added with `setdefault`, so a header already set on the response - e.g. the
 	`frame-ancestors` Content-Security-Policy a Web Form with allowed embedding domains sets - is
 	kept as it is. Every header can be overridden per site through the site config keys in
-	`SECURITY_HEADER_CONFIG_KEYS`; an empty or null configured value omits that header, and
-	`disable_security_headers` omits all of them.
+	`SECURITY_HEADER_CONFIG_KEYS`; an empty or null configured value omits that header, a configured
+	value that cannot be sent as a header is replaced by the default (decision RJ-14), and
+	`disable_security_headers` omits all of them. `X-Frame-Options` is omitted while the policy the
+	client receives allows framing by another origin, whichever layer sets that policy - the
+	per-request headers, the response, or this baseline (decision RJ-13).
 
 	    # site_config.json
 	    {"referrer_policy": "same-origin", "x_frame_options": "DENY"}
@@ -394,30 +401,91 @@ def set_security_headers(response: Response):
 	if cint(conf.get("disable_security_headers")):
 		return
 
-	explicit_csp = effective_content_security_policy(response)
+	explicit_csp = explicit_content_security_policy(response)
+	baseline_csp = baseline_content_security_policy(conf)
+	effective_csp = baseline_csp if explicit_csp is None else explicit_csp
 
 	for config_key, (header, default) in SECURITY_HEADER_CONFIG_KEYS.items():
-		value = conf[config_key] if config_key in conf else default
-		if not value:
-			continue
-
-		value = str(value)
-
 		if header == "Content-Security-Policy":
 			if explicit_csp:
 				continue
-			if config_key not in conf:
-				value = add_cloud_settings_source(value)
-			value = add_dev_socketio_source(value)
-		elif header == "X-Frame-Options" and explicit_csp and frame_ancestors_allow_other_hosts(explicit_csp):
-			# omitted while the effective policy allows framing by other hosts
+
+			value = baseline_csp
+		else:
+			value = configured_header_value(conf, config_key, default)
+
+			if header == "X-Frame-Options" and frame_ancestors_allow_other_hosts(effective_csp):
+				continue
+
+		if not value:
 			continue
 
 		response.headers.setdefault(header, value)
 
 
-def effective_content_security_policy(response: Response) -> str | None:
-	"""Return the Content-Security-Policy `response` carries once the per-request headers are merged.
+def configured_header_value(conf: dict, config_key: str, default: str) -> str:
+	"""Return the value the site config contributes to one baseline header.
+
+	A key the site does not set takes `default`. A key set to a null or empty value - empty once
+	surrounding whitespace is dropped included - resolves to an empty string, which omits the
+	header. A value that is not a single-line printable-ASCII header value is logged against
+	`config_key` and replaced by `default` (decision RJ-14).
+	"""
+	if config_key not in conf:
+		return default
+
+	configured = conf[config_key]
+
+	if not configured:
+		return ""
+
+	value = str(configured).strip()
+
+	if not HEADER_VALUE_PATTERN.fullmatch(value):
+		log_unsendable_header_value(config_key)
+		return default
+
+	return value
+
+
+def log_unsendable_header_value(config_key: str):
+	"""Report that the site config value of `config_key` cannot be sent as a header value.
+
+	The report is written to the site's `frappe.web` log, and to the process logger when that log
+	cannot be opened, so that reporting it never fails the response (decision RJ-14).
+	"""
+	message = (
+		f"Ignoring site config '{config_key}': a response header value must be a single line of "
+		"printable ASCII. Sending the framework default for this header instead."
+	)
+
+	try:
+		frappe.logger("frappe.web").error(message)
+	except Exception:
+		logging.getLogger("frappe.web").error(message)
+
+
+def baseline_content_security_policy(conf: dict) -> str:
+	"""Return the Content-Security-Policy this baseline emits, or an empty string when it emits none.
+
+	The value is the site's configured `content_security_policy`, and the framework default when the
+	site configures none or configures one that cannot be sent as a header. The site's Cloud Settings
+	embed origin is added to the framework default only (decision RJ-12); the development server's
+	socket.io origin is added to either (decision RJ-7).
+	"""
+	policy = configured_header_value(conf, "content_security_policy", DEFAULT_CONTENT_SECURITY_POLICY)
+
+	if not policy:
+		return ""
+
+	if policy == DEFAULT_CONTENT_SECURITY_POLICY:
+		policy = add_cloud_settings_source(policy)
+
+	return add_dev_socketio_source(policy)
+
+
+def explicit_content_security_policy(response: Response) -> str | None:
+	"""Return the Content-Security-Policy set for this response outside the baseline, else None.
 
 	A value in `frappe.local.response_headers` takes precedence over one already on the response,
 	which is the order `process_response` merges them in; a key present there with an empty value

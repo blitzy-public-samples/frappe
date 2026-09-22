@@ -26,45 +26,71 @@ export default class ShortcutWidget extends Widget {
 	}
 
 	setup_events() {
-		this.widget.click((e) => {
+		this.widget.click((e) => this.activate(e));
+
+		// Enter or Space on the tile itself runs the same activation as a click
+		// (PR Description decision RD-14). The namespaced binding is replaced, not added to,
+		// on every render, and keys pressed on a control nested inside the tile are ignored.
+		this.widget.off("keydown.shortcut").on("keydown.shortcut", (e) => {
+			if (e.target !== this.widget[0]) return;
 			if (this.in_customize_mode) return;
+			if (!["Enter", " ", "Spacebar"].includes(e.key)) return;
 
-			if (this.type == "DocType" && this.doc_view == "New") {
-				frappe.ui.form.make_quick_entry(
-					this.link_to,
-					// Callback to ensure no redirection after insert
-					() => {}
-				);
-				return;
-			}
-
-			let route = frappe.utils.generate_route({
-				route: this.route,
-				name: this.link_to,
-				type: this.type,
-				is_query_report: this.is_query_report,
-				doctype: this.ref_doctype,
-				doc_view: this.doc_view,
-				kanban_board: this.kanban_board,
-				report_ref_doctype: this.report_ref_doctype,
-			});
-
-			let filters = frappe.utils.get_filter_from_json(this.stats_filter);
-			if (this.type == "DocType" && filters) {
-				frappe.route_options = filters;
-			}
-
-			if (e.ctrlKey || e.metaKey) {
-				frappe.open_in_new_tab = true;
-			}
-
-			if (this.type == "URL") {
-				window.open(this.url, "_blank");
-				return;
-			}
-
-			frappe.set_route(route);
+			e.preventDefault();
+			this.activate(e);
 		});
+	}
+
+	/**
+	 * Opens the shortcut's destination, and is the single activation path shared by a click on
+	 * the tile and Enter or Space pressed on it: the quick entry dialog for a Document Type
+	 * shortcut whose view is "New", the shortcut's URL in a new tab for a URL shortcut, or the
+	 * route generated from the shortcut's target - with the shortcut's own filters applied as
+	 * route options for a Document Type shortcut, and the route opened in a new tab when the
+	 * activating event carries Ctrl or Cmd.
+	 *
+	 * Does nothing while the workspace is in customize mode.
+	 *
+	 * @param {Object} e - the click or keydown event that activated the tile
+	 */
+	activate(e) {
+		if (this.in_customize_mode) return;
+
+		if (this.type == "DocType" && this.doc_view == "New") {
+			frappe.ui.form.make_quick_entry(
+				this.link_to,
+				// Callback to ensure no redirection after insert
+				() => {}
+			);
+			return;
+		}
+
+		let route = frappe.utils.generate_route({
+			route: this.route,
+			name: this.link_to,
+			type: this.type,
+			is_query_report: this.is_query_report,
+			doctype: this.ref_doctype,
+			doc_view: this.doc_view,
+			kanban_board: this.kanban_board,
+			report_ref_doctype: this.report_ref_doctype,
+		});
+
+		let filters = frappe.utils.get_filter_from_json(this.stats_filter);
+		if (this.type == "DocType" && filters) {
+			frappe.route_options = filters;
+		}
+
+		if (e.ctrlKey || e.metaKey) {
+			frappe.open_in_new_tab = true;
+		}
+
+		if (this.type == "URL") {
+			window.open(this.url, "_blank");
+			return;
+		}
+
+		frappe.set_route(route);
 	}
 
 	set_actions() {
