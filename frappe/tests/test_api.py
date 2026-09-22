@@ -11,10 +11,10 @@ from urllib.parse import urlencode, urljoin
 
 import requests
 from filetype import guess_mime
-from werkzeug.test import TestResponse
+from werkzeug.test import Client, TestResponse
 
 import frappe
-from frappe.installer import update_site_config
+from frappe.installer import get_site_config_path, update_site_config
 from frappe.tests import IntegrationTestCase
 from frappe.tests.utils import whitelist_for_tests
 from frappe.utils import cint, get_test_client, get_url
@@ -107,6 +107,10 @@ class FrappeAPITestCase(IntegrationTestCase):
 
 	@cached_property
 	def sid(self) -> str:
+		return self.create_session()
+
+	def create_session(self) -> str:
+		"""Log in as Administrator in this process and return the new session's `sid`."""
 		from frappe.auth import CookieManager, LoginManager
 		from frappe.utils import set_request
 
@@ -121,18 +125,22 @@ class FrappeAPITestCase(IntegrationTestCase):
 		finally:
 			frappe.local.request = original_request
 
-	def login_through_test_client(self) -> str:
-		"""Log in over `POST /api/method/login` so `TEST_CLIENT`'s cookie jar holds that session.
+	def login_with_cookie_jar(self) -> tuple[Client, str]:
+		"""Log in over `POST /api/method/login` with a client of its own cookie jar.
 
-		Returns the CSRF token the login response carries, which unsafe requests made through the
-		jar's `sid` cookie must send as `X-Frappe-CSRF-Token`.
+		Returns that client, whose jar holds the session's `sid`, and the CSRF token the login
+		response carries, which unsafe requests on that session must send as `X-Frappe-CSRF-Token`.
+		The shared `TEST_CLIENT` is left unauthenticated.
 		"""
+		client = get_test_client(use_cookies=True)
 		response = make_request(
-			target=self.TEST_CLIENT.post,
+			target=client.post,
 			args=(self.method("login"),),
 			kwargs={"json": {"usr": "Administrator", "pwd": frappe.conf.admin_password or "admin"}},
 		)
-		return response.json["csrf_token"]
+		self.assertEqual(response.status_code, 200)
+
+		return client, response.json.get("csrf_token")
 
 	def get(self, path: str, params: dict | None = None, **kwargs) -> TestResponse:
 		return make_request(target=self.TEST_CLIENT.get, args=(path,), kwargs={"json": params, **kwargs})
@@ -421,9 +429,13 @@ class TestMethodAPI(FrappeAPITestCase):
 		method = "frappe.tests.test_api.test_array"
 
 		test_data = list(range(5))
-		# a JSON array body carries no `sid`, so this request is authenticated by the jar's cookie
-		csrf_token = self.login_through_test_client()
-		response = self.post(self.method(method), test_data, headers={"X-Frappe-CSRF-Token": csrf_token})
+		# credential: a cookie session of this test's own, plus that session's CSRF token (RI-7)
+		client, csrf_token = self.login_with_cookie_jar()
+		response = make_request(
+			target=client.post,
+			args=(self.method(method),),
+			kwargs={"json": test_data, "headers": {"X-Frappe-CSRF-Token": csrf_token}},
+		)
 
 		self.assertEqual(response.json["message"], test_data)
 
@@ -609,8 +621,8 @@ def after_request(*args, **kwargs):
 
 
 class TestCSRFProtection(FrappeAPITestCase):
-	"""Exercise CSRF enforcement for a cookie session that has never rendered an HTML page, which is
-	the session `POST /api/method/login` creates and which therefore holds no CSRF token."""
+	"""Exercise CSRF enforcement on cookie sessions: the token-carrying session
+	`POST /api/method/login` creates, and a session that holds no CSRF token at all (RI-6)."""
 
 	FOREIGN_ORIGIN = "http://evil.example.com"
 	PROBE_DESCRIPTION = "csrf protection probe"
@@ -626,6 +638,39 @@ class TestCSRFProtection(FrappeAPITestCase):
 		frappe.delete_doc_if_exists("ToDo", name, force=True)
 		frappe.db.commit()
 
+	@staticmethod
+	def delete_session(sid: str) -> None:
+		"""Remove a session's `Sessions` row and its entry in the session cache."""
+		frappe.db.rollback()
+		frappe.db.delete("Sessions", {"sid": sid})
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit
+		frappe.cache.hdel("session", sid)
+
+	def set_site_config(self, key: str, value) -> None:
+		"""Write `key` to the site configuration, restoring its prior state in cleanup."""
+		with open(get_site_config_path()) as site_config_file:
+			stored = json.load(site_config_file)
+
+		snapshot = {
+			"stored": (key in stored, stored.get(key)),
+			"conf": (key in frappe.conf, frappe.conf.get(key)),
+		}
+		self.addCleanup(self.restore_site_config, key, snapshot)
+		update_site_config(key, value)
+
+	@staticmethod
+	def restore_site_config(key: str, snapshot: dict) -> None:
+		"""Restore a site configuration key to the stored and in-process state `snapshot` holds."""
+		was_stored, stored_value = snapshot["stored"]
+		# `update_site_config` deletes the key when the value is the string "None"
+		update_site_config(key, stored_value if was_stored else "None")
+
+		in_conf, conf_value = snapshot["conf"]
+		if in_conf:
+			frappe.local.conf[key] = conf_value
+		else:
+			frappe.local.conf.pop(key, None)
+
 	@cached_property
 	def cookie_client(self):
 		"""A client that keeps no cookie jar, so every request carries only the cookies it is given."""
@@ -633,13 +678,14 @@ class TestCSRFProtection(FrappeAPITestCase):
 
 	@cached_property
 	def token_less_sid(self) -> str:
-		"""Return this test's `sid`, with the CSRF token removed from its session.
+		"""Return the `sid` of a session of this test's own that holds no CSRF token (RI-6).
 
-		`login_as` mints a token for every session it creates, so a session that holds none - one
-		created before this site was upgraded - is synthesised by clearing the stored token in both
-		the `Sessions` table and the session cache.
+		The session is created for this fixture, its stored token is cleared in both the `Sessions`
+		table and the session cache, and the session is deleted in cleanup.
 		"""
-		sid = self.sid
+		sid = self.create_session()
+		self.addCleanup(self.delete_session, sid)
+
 		Sessions = frappe.qb.DocType("Sessions")
 		stored = (frappe.qb.from_(Sessions).select(Sessions.sessiondata).where(Sessions.sid == sid)).run()[0][
 			0
@@ -666,21 +712,6 @@ class TestCSRFProtection(FrappeAPITestCase):
 			args=(path,),
 			kwargs={"json": data, "headers": {"Cookie": f"sid={self.token_less_sid}", **(headers or {})}},
 		)
-
-	def login_with_cookie_jar(self):
-		"""Log in over `POST /api/method/login` with a client that keeps the session cookie.
-
-		Returns the client and the CSRF token the login response carries.
-		"""
-		client = get_test_client(use_cookies=True)
-		response = make_request(
-			target=client.post,
-			args=(self.method("login"),),
-			kwargs={"json": {"usr": "Administrator", "pwd": frappe.conf.admin_password or "admin"}},
-		)
-		self.assertEqual(response.status_code, 200)
-
-		return client, response.json.get("csrf_token")
 
 	def stored_description(self) -> str:
 		frappe.db.rollback()
@@ -735,8 +766,7 @@ class TestCSRFProtection(FrappeAPITestCase):
 		self.assertEqual(self.stored_description(), self.PROBE_DESCRIPTION)
 
 	def test_allow_cors_wildcard_does_not_exempt_token_less_session(self):
-		self.addCleanup(update_site_config, "allow_cors", "None")
-		update_site_config("allow_cors", "*")
+		self.set_site_config("allow_cors", "*")
 
 		response = self.cookie_request(
 			"put",

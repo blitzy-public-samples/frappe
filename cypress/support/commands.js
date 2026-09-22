@@ -27,6 +27,29 @@ import "cypress-real-events/support";
 // -- This is will overwrite an existing command --
 // Cypress.Commands.overwrite("visit", (originalFn, url, options) => { ... });
 
+// CSRF tokens returned by `POST /api/method/login`, keyed by `cy.session` id, and the key of the
+// session `cy.login` last authenticated as. Recorded in `cy.login`, cleared on logout; see the
+// `cypress/support/commands.js` row of PR Description section 3 (D14).
+const session_csrf_tokens = new Map();
+let active_session_key = null;
+
+// Yields the CSRF token of the session Cypress is authenticated as: the token recorded for that
+// session, otherwise the token the loaded page carries.
+const resolve_csrf_token = () => {
+	const session_csrf_token = session_csrf_tokens.get(active_session_key);
+
+	if (!session_csrf_token) {
+		return cy.window().its("frappe.csrf_token");
+	}
+
+	return cy.window().then((win) => {
+		if (win.frappe && win.frappe.csrf_token !== session_csrf_token) {
+			win.frappe.csrf_token = session_csrf_token;
+		}
+		return session_csrf_token;
+	});
+};
+
 Cypress.Commands.add("login", (email, password) => {
 	if (!email) {
 		email = Cypress.config("testUser") || "Administrator";
@@ -36,18 +59,27 @@ Cypress.Commands.add("login", (email, password) => {
 	}
 	// cy.session clears all localStorage on new login, so we need to retain the last route
 	const session_last_route = window.localStorage.getItem("session_last_route");
+	const session_id = [email, password];
+	const session_key = JSON.stringify(session_id);
 	return cy
-		.session([email, password] || "", () => {
-			return cy.request({
-				url: "/api/method/login",
-				method: "POST",
-				body: {
-					usr: email,
-					pwd: password,
-				},
-			});
+		.session(session_id, () => {
+			return cy
+				.request({
+					url: "/api/method/login",
+					method: "POST",
+					body: {
+						usr: email,
+						pwd: password,
+					},
+				})
+				.then((res) => {
+					if (res.body.csrf_token) {
+						session_csrf_tokens.set(session_key, res.body.csrf_token);
+					}
+				});
 		})
 		.then(() => {
+			active_session_key = session_key;
 			if (session_last_route) {
 				window.localStorage.setItem("session_last_route", session_last_route);
 			}
@@ -55,95 +87,85 @@ Cypress.Commands.add("login", (email, password) => {
 });
 
 Cypress.Commands.add("call", (method, args) => {
-	return cy
-		.window()
-		.its("frappe.csrf_token")
-		.then((csrf_token) => {
-			return cy
-				.request({
-					url: `/api/method/${method}`,
-					method: "POST",
-					body: args,
-					headers: {
-						Accept: "application/json",
-						"Content-Type": "application/json",
-						"X-Frappe-CSRF-Token": csrf_token,
-					},
-				})
-				.then((res) => {
-					expect(res.status).eq(200);
-					if (method === "logout") {
-						Cypress.session.clearAllSavedSessions();
-					}
-					return res.body;
-				});
-		});
+	return resolve_csrf_token().then((csrf_token) => {
+		return cy
+			.request({
+				url: `/api/method/${method}`,
+				method: "POST",
+				body: args,
+				headers: {
+					Accept: "application/json",
+					"Content-Type": "application/json",
+					"X-Frappe-CSRF-Token": csrf_token,
+				},
+			})
+			.then((res) => {
+				expect(res.status).eq(200);
+				if (method === "logout") {
+					Cypress.session.clearAllSavedSessions();
+					session_csrf_tokens.clear();
+					active_session_key = null;
+				}
+				return res.body;
+			});
+	});
 });
 
 Cypress.Commands.add("get_list", (doctype, fields = [], filters = []) => {
 	filters = JSON.stringify(filters);
 	fields = JSON.stringify(fields);
 	let url = `/api/resource/${doctype}?fields=${fields}&filters=${filters}`;
-	return cy
-		.window()
-		.its("frappe.csrf_token")
-		.then((csrf_token) => {
-			return cy
-				.request({
-					method: "GET",
-					url,
-					headers: {
-						Accept: "application/json",
-						"X-Frappe-CSRF-Token": csrf_token,
-					},
-				})
-				.then((res) => {
-					expect(res.status).eq(200);
-					return res.body;
-				});
-		});
+	return resolve_csrf_token().then((csrf_token) => {
+		return cy
+			.request({
+				method: "GET",
+				url,
+				headers: {
+					Accept: "application/json",
+					"X-Frappe-CSRF-Token": csrf_token,
+				},
+			})
+			.then((res) => {
+				expect(res.status).eq(200);
+				return res.body;
+			});
+	});
 });
 
 Cypress.Commands.add("get_doc", (doctype, name) => {
-	return cy
-		.window()
-		.its("frappe.csrf_token")
-		.then((csrf_token) => {
-			return cy
-				.request({
-					method: "GET",
-					url: `/api/resource/${doctype}/${name}`,
-					headers: {
-						Accept: "application/json",
-						"X-Frappe-CSRF-Token": csrf_token,
-					},
-				})
-				.then((res) => {
-					expect(res.status).eq(200);
-					return res.body;
-				});
-		});
+	return resolve_csrf_token().then((csrf_token) => {
+		return cy
+			.request({
+				method: "GET",
+				url: `/api/resource/${doctype}/${name}`,
+				headers: {
+					Accept: "application/json",
+					"X-Frappe-CSRF-Token": csrf_token,
+				},
+			})
+			.then((res) => {
+				expect(res.status).eq(200);
+				return res.body;
+			});
+	});
 });
 
 Cypress.Commands.add("remove_doc", (doctype, name, ignore_missing) => {
-	return cy
-		.window()
-		.its("frappe.csrf_token")
-		.then((csrf_token) => {
-			return cy
-				.request({
-					method: "DELETE",
-					url: `/api/resource/${doctype}/${name}`,
-					headers: {
-						Accept: "application/json",
-						"X-Frappe-CSRF-Token": csrf_token,
-					},
-					failOnStatusCode: !ignore_missing,
-				})
-				.then((res) => {
-					return res.body;
-				});
-		});
+	return resolve_csrf_token().then((csrf_token) => {
+		return cy
+			.request({
+				method: "DELETE",
+				url: `/api/resource/${doctype}/${name}`,
+				headers: {
+					Accept: "application/json",
+					"X-Frappe-CSRF-Token": csrf_token,
+				},
+				failOnStatusCode: !ignore_missing,
+			})
+			.then((res) => {
+				return res.body;
+			});
+	});
 });
 
 Cypress.Commands.add("create_records", (doc) => {
@@ -344,63 +366,57 @@ Cypress.Commands.add("insert_doc", (doctype, args, ignore_duplicate) => {
 	if (!args.doctype) {
 		args.doctype = doctype;
 	}
-	return cy
-		.window()
-		.its("frappe.csrf_token")
-		.then((csrf_token) => {
-			return cy
-				.request({
-					method: "POST",
-					url: `/api/resource/${doctype}`,
-					body: args,
-					headers: {
-						Accept: "application/json",
-						"Content-Type": "application/json",
-						"X-Frappe-CSRF-Token": csrf_token,
-					},
-					failOnStatusCode: !ignore_duplicate,
-				})
-				.then((res) => {
-					let status_codes = [200];
-					if (ignore_duplicate) {
-						status_codes.push(409);
-					}
+	return resolve_csrf_token().then((csrf_token) => {
+		return cy
+			.request({
+				method: "POST",
+				url: `/api/resource/${doctype}`,
+				body: args,
+				headers: {
+					Accept: "application/json",
+					"Content-Type": "application/json",
+					"X-Frappe-CSRF-Token": csrf_token,
+				},
+				failOnStatusCode: !ignore_duplicate,
+			})
+			.then((res) => {
+				let status_codes = [200];
+				if (ignore_duplicate) {
+					status_codes.push(409);
+				}
 
-					let message = null;
-					if (ignore_duplicate && !status_codes.includes(res.status)) {
-						message = `Document insert failed, response: ${JSON.stringify(
-							res,
-							null,
-							"\t"
-						)}`;
-					}
-					expect(res.status).to.be.oneOf(status_codes, message);
-					return res.body.data;
-				});
-		});
+				let message = null;
+				if (ignore_duplicate && !status_codes.includes(res.status)) {
+					message = `Document insert failed, response: ${JSON.stringify(
+						res,
+						null,
+						"\t"
+					)}`;
+				}
+				expect(res.status).to.be.oneOf(status_codes, message);
+				return res.body.data;
+			});
+	});
 });
 
 Cypress.Commands.add("update_doc", (doctype, docname, args) => {
-	return cy
-		.window()
-		.its("frappe.csrf_token")
-		.then((csrf_token) => {
-			return cy
-				.request({
-					method: "PUT",
-					url: `/api/resource/${doctype}/${docname}`,
-					body: args,
-					headers: {
-						Accept: "application/json",
-						"Content-Type": "application/json",
-						"X-Frappe-CSRF-Token": csrf_token,
-					},
-				})
-				.then((res) => {
-					expect(res.status).to.eq(200);
-					return res.body.data;
-				});
-		});
+	return resolve_csrf_token().then((csrf_token) => {
+		return cy
+			.request({
+				method: "PUT",
+				url: `/api/resource/${doctype}/${docname}`,
+				body: args,
+				headers: {
+					Accept: "application/json",
+					"Content-Type": "application/json",
+					"X-Frappe-CSRF-Token": csrf_token,
+				},
+			})
+			.then((res) => {
+				expect(res.status).to.eq(200);
+				return res.body.data;
+			});
+	});
 });
 
 Cypress.Commands.add("switch_to_user", (user) => {

@@ -205,7 +205,7 @@ class TestFrappeClient(IntegrationTestCase):
 		self.assertIsInstance(csrf_token, str)
 		self.assertTrue(csrf_token)
 
-		# an insert is an unsafe request, which this cookie session accepts only with the token
+		# exercise a cookie-session write (RI-5)
 		response = server.insert({"doctype": "Note", "title": "test_client_sends_csrf_token"})
 		self.assertEqual(response.get("title"), "test_client_sends_csrf_token")
 

@@ -1,29 +1,157 @@
 describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
+	const dashboard_user = "Administrator";
+	const trend_chart = "ToDo Created vs Completed";
+	const top_owners_chart = "ToDo Top Owners";
+	const driven_charts = [trend_chart, top_owners_chart];
+	const create_dashboard_settings =
+		"frappe.desk.doctype.dashboard_settings.dashboard_settings.create_dashboard_settings";
+	const save_chart_config =
+		"frappe.desk.doctype.dashboard_settings.dashboard_settings.save_chart_config";
+
+	// The chart widget whose title is `title`.
+	const chart_widget = (title) => cy.contains(".dashboard-widget-box", title);
+
+	// Documents inserted by the running case, in insertion order, and the result of deleting each.
+	let seeded_docs = [];
+	let deletions = [];
+
+	// Inserts a document and registers it for the afterEach cleanup.
+	const seed_doc = (doctype, args) =>
+		cy.insert_doc(doctype, args, true).then((doc) => {
+			if (doc && doc.name) {
+				seeded_docs.push({ doctype: doctype, name: doc.name });
+			}
+
+			return doc;
+		});
+
+	// Deletes every registered document, newest first, and keeps each response for the assertions
+	// that run after the whole cleanup.
+	const remove_seeded_docs = () =>
+		cy.then(() => {
+			seeded_docs
+				.slice()
+				.reverse()
+				.forEach((doc) =>
+					cy.remove_doc(doc.doctype, doc.name, true).then((response) => {
+						deletions.push({
+							doctype: doc.doctype,
+							name: doc.name,
+							result: response && response.data,
+						});
+					})
+				);
+		});
+
+	// Leaves a Desk window loaded, holding the CSRF token the cy.request commands read.
+	const desk_window = () =>
+		cy.window({ log: false }).then((win) => {
+			if (!win.frappe || !win.frappe.csrf_token) {
+				cy.visit("/desk");
+			}
+		});
+
+	// This user's Dashboard Settings as the spec found it: whether the row was there at all, and
+	// the raw chart_config value it held.
+	let settings_snapshot = { exists: false, chart_config: null };
+
+	const read_dashboard_settings = () =>
+		cy
+			.get_list(
+				"Dashboard Settings",
+				["name", "chart_config"],
+				[["name", "=", dashboard_user]]
+			)
+			.then((response) => (response.data.length ? response.data[0] : null));
+
+	// Drops this user's persisted window for every chart this spec drives, leaving the window of
+	// the chart record itself in effect (RB-7).
+	const reset_chart_config = () => {
+		cy.call(create_dashboard_settings, { user: dashboard_user });
+		driven_charts.forEach((chart_name) =>
+			cy.call(save_chart_config, { reset: 1, config: {}, chart_name: chart_name })
+		);
+	};
+
+	// Puts Dashboard Settings back as the spec found it: the raw chart_config of the row it read,
+	// or no row at all.
+	const restore_dashboard_settings = () => {
+		if (settings_snapshot.exists) {
+			cy.update_doc("Dashboard Settings", dashboard_user, {
+				chart_config: settings_snapshot.chart_config,
+			});
+		} else {
+			cy.remove_doc("Dashboard Settings", dashboard_user, true);
+		}
+	};
+
 	before(() => {
 		cy.login("Administrator");
 		cy.visit("/desk");
+
+		read_dashboard_settings().then((settings) => {
+			settings_snapshot = {
+				exists: Boolean(settings),
+				chart_config: settings ? settings.chart_config : null,
+			};
+		});
+	});
+
+	beforeEach(() => {
+		seeded_docs = [];
+		deletions = [];
+		desk_window();
+		reset_chart_config();
+
+		// Fixture of the case: one open ToDo allocated to each of two owners.
+		seed_doc("ToDo", {
+			description: "Cypress ToDo Analytics fixture for Administrator",
+			allocated_to: dashboard_user,
+			assigned_by: dashboard_user,
+		});
+		seed_doc("ToDo", {
+			description: "Cypress ToDo Analytics fixture for the test user",
+			allocated_to: Cypress.config("testUser"),
+			assigned_by: dashboard_user,
+		});
+	});
+
+	afterEach(() => {
+		desk_window();
+		remove_seeded_docs();
+		restore_dashboard_settings();
+
+		// Asserted only once every cleanup command above has run.
+		cy.then(() => {
+			deletions.forEach((deletion) =>
+				expect(deletion.result, `deleted ${deletion.doctype} ${deletion.name}`).to.equal(
+					"ok"
+				)
+			);
+		});
+		read_dashboard_settings().then((settings) => {
+			expect(Boolean(settings), "Dashboard Settings row as found").to.equal(
+				settings_snapshot.exists
+			);
+			expect(
+				settings ? settings.chart_config : null,
+				"Dashboard Settings chart_config as found"
+			).to.equal(settings_snapshot.chart_config);
+		});
 	});
 
 	it("renders two cards and two charts", () => {
-		cy.insert_doc(
-			"ToDo",
-			{
-				description: "Cypress ToDo Analytics seed one",
-				allocated_to: "Administrator",
-				assigned_by: "Administrator",
-			},
-			true
-		);
+		seed_doc("ToDo", {
+			description: "Cypress ToDo Analytics seed one",
+			allocated_to: "Administrator",
+			assigned_by: "Administrator",
+		});
 
-		cy.insert_doc(
-			"ToDo",
-			{
-				description: "Cypress ToDo Analytics seed two",
-				allocated_to: "Administrator",
-				assigned_by: "Administrator",
-			},
-			true
-		);
+		seed_doc("ToDo", {
+			description: "Cypress ToDo Analytics seed two",
+			allocated_to: "Administrator",
+			assigned_by: "Administrator",
+		});
 
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
 
@@ -50,25 +178,23 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		});
 
 		// hovering the body of a Top Owners bar reveals its tooltip
-		cy.get(".dashboard-widget-box")
-			.eq(1)
-			.should(($widget) => {
-				const bar = $widget.find("rect.bar")[0];
-				const tip = $widget.find(".graph-svg-tip")[0];
-				const box = bar.getBoundingClientRect();
-				const win = bar.ownerDocument.defaultView;
+		chart_widget(top_owners_chart).should(($widget) => {
+			const bar = $widget.find("rect.bar")[0];
+			const tip = $widget.find(".graph-svg-tip")[0];
+			const box = bar.getBoundingClientRect();
+			const win = bar.ownerDocument.defaultView;
 
-				bar.dispatchEvent(
-					new win.MouseEvent("mousemove", {
-						bubbles: true,
-						clientX: box.left + box.width / 2,
-						clientY: box.top + box.height / 2,
-					})
-				);
+			bar.dispatchEvent(
+				new win.MouseEvent("mousemove", {
+					bubbles: true,
+					clientX: box.left + box.width / 2,
+					clientY: box.top + box.height / 2,
+				})
+			);
 
-				expect(tip.style.opacity).to.equal("1");
-				expect(tip.innerText).to.contain("Open ToDos");
-			});
+			expect(tip.style.opacity).to.equal("1");
+			expect(tip.innerText).to.contain("Open ToDos");
+		});
 
 		// chart and card controls carry an accessible name and menu semantics
 		cy.get(".dashboard-widget-box .filter-chart")
@@ -96,30 +222,38 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			.and("have.attr", "tabindex", "-1");
 
 		// the chart menu is operable from the keyboard alone
-		cy.get(".dashboard-widget-box")
-			.eq(0)
+		chart_widget(trend_chart)
 			.find(".chart-menu")
 			.focus()
 			.trigger("keydown", { key: "ArrowDown", keyCode: 40, which: 40 })
 			.parent()
 			.should("have.class", "show");
-		cy.get(".dashboard-widget-box")
-			.eq(0)
+		chart_widget(trend_chart)
 			.find(".chart-menu")
 			.trigger("keydown", { key: "ArrowDown", keyCode: 40, which: 40 });
 		cy.focused().should("have.class", "dropdown-item").and("have.attr", "role", "menuitem");
 		cy.focused().trigger("keydown", { key: "Enter", keyCode: 13, which: 13 });
-		cy.get(".dashboard-widget-box")
-			.eq(0)
-			.find(".chart-menu")
-			.parent()
-			.should("not.have.class", "show");
+		chart_widget(trend_chart).find(".chart-menu").parent().should("not.have.class", "show");
 		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
 	});
 
 	it("formats axis ticks consistently and keeps axis labels legible", () => {
 		// 0, thousands-separated integers, up to two decimals, or one number system symbol
 		const tick_format = /^-?(\d{1,3}(,\d{3})*|\d+)(\.\d{1,2})?( [A-Za-z]+)?$/;
+		// the shape frappe-charts prints with its own shortener, such as "1.3K"
+		const library_shortened_number = /^\d+(\.\d+)?[KMB]$/;
+		// the Top Owners data this case supplies: long distinct names sharing a prefix, and counts
+		// on both sides of the grouping and abbreviation thresholds
+		const owner_labels = [
+			"Alexandra Fitzgerald",
+			"Alexandra Fitzwilliam",
+			"Alexandra Fitzsimmons",
+			"Bartholomew Gainsborough",
+			"Zoe Xu",
+		];
+		const owner_values = [2000, 1250, 640, 120, 12];
+		const owner_value_texts = ["2 K", "1,250", "640", "120", "12"];
+		let probe_chart;
 
 		const label_texts = ($widget, axis) =>
 			Array.from($widget.find(`.${axis}.axis text`))
@@ -162,24 +296,186 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			});
 		};
 
+		const top_owners_widget = () => cy.contains(".dashboard-widget-box", "ToDo Top Owners");
+
+		const rendered_labels = ($widget) =>
+			Array.from($widget.find(".x.axis text"))
+				.filter((node) => node.textContent.trim() !== "")
+				.map((node) => ({ text: node.textContent, rect: node.getBoundingClientRect() }));
+
+		// every rendered label is one whole supplied label, the rendered labels are distinct and
+		// clear of each other, and the last supplied label is on the axis
+		const assert_thinned_labels = (labels, supplied, where) => {
+			const texts = labels.map((label) => label.text);
+
+			texts.forEach((text) => {
+				expect(supplied, `complete label "${text}" ${where}`).to.include(text);
+				expect(text, `truncated label "${text}" ${where}`).to.not.contain("...");
+			});
+			expect(new Set(texts).size, `distinct labels in ${texts} ${where}`).to.eq(
+				texts.length
+			);
+			expect(texts, `last supplied label ${where}`).to.include(
+				supplied[supplied.length - 1]
+			);
+
+			labels.forEach((label, index) => {
+				labels.slice(index + 1).forEach((other) => {
+					const overlapping =
+						label.rect.left < other.rect.right && other.rect.left < label.rect.right;
+					expect(overlapping, `"${label.text}" overlaps "${other.text}" ${where}`).to.be
+						.false;
+				});
+			});
+		};
+
+		const assert_owner_value_labels = (where) =>
+			top_owners_widget()
+				.find("text.data-point-value")
+				.should(($values) => {
+					const texts = Array.from($values).map((node) => node.textContent);
+
+					expect(texts, `values printed over the bars ${where}`).to.deep.eq(
+						owner_value_texts
+					);
+					texts.forEach((text) => {
+						expect(text, `library-shortened value "${text}" ${where}`).to.not.match(
+							library_shortened_number
+						);
+					});
+				});
+
+		const assert_owner_labels = (least, where) => {
+			top_owners_widget()
+				.find("svg.frappe-chart")
+				.find("animate, animateTransform")
+				.should("have.length", 0);
+			top_owners_widget().should(($widget) => {
+				const labels = rendered_labels($widget);
+
+				expect(labels.length, `rendered owner labels ${where}`).to.be.at.least(least);
+				assert_thinned_labels(labels, owner_labels, where);
+			});
+		};
+
+		// `count` consecutive days in the MM-DD-YYYY label shape of the dashboard's trend chart
+		const probe_labels = (count) =>
+			Array.from({ length: count }, (_, index) => {
+				const day = new Date(Date.UTC(2024, 0, 1));
+
+				day.setUTCDate(day.getUTCDate() + index);
+
+				return [
+					String(day.getUTCMonth() + 1).padStart(2, "0"),
+					String(day.getUTCDate()).padStart(2, "0"),
+					day.getUTCFullYear(),
+				].join("-");
+			});
+
+		// Renders `count` labels through the shipped density code into a container
+		// `container_width` pixels wide, asserts the axis frappe-charts draws from it, and takes
+		// the probe back out of the document.
+		const assert_probe_axis = (count, container_width) => {
+			const labels = probe_labels(count);
+			const where = `for ${count} labels in ${container_width}px`;
+
+			cy.window().then((win) => {
+				const element = win.document.createElement("div");
+
+				element.className = "blitzy-axis-probe";
+				element.style.width = `${container_width}px`;
+				element.style.position = "relative";
+				win.document.body.appendChild(element);
+
+				probe_chart = win.frappe.utils.make_chart(element, {
+					type: "line",
+					data: {
+						labels,
+						datasets: [{ name: "Probe", values: labels.map((_, index) => index + 1) }],
+					},
+				});
+			});
+
+			// one text node per label, which the placeholder draw carries one fewer of
+			cy.get(".blitzy-axis-probe svg.frappe-chart g.x.axis text").should(
+				"have.length",
+				count
+			);
+			cy.get(".blitzy-axis-probe svg.frappe-chart")
+				.find("animate, animateTransform")
+				.should("have.length", 0);
+			cy.get(".blitzy-axis-probe svg.frappe-chart g.x.axis text").should(($texts) => {
+				const rendered = Array.from($texts)
+					.filter((node) => node.textContent.trim() !== "")
+					.map((node) => ({
+						text: node.textContent,
+						rect: node.getBoundingClientRect(),
+					}));
+
+				expect(rendered.length, `rendered labels ${where}`).to.be.at.least(1);
+				assert_thinned_labels(rendered, labels, where);
+			});
+
+			cy.window().then((win) => {
+				probe_chart.destroy();
+				probe_chart = null;
+				win.document
+					.querySelectorAll(".blitzy-axis-probe")
+					.forEach((element) => element.remove());
+			});
+		};
+
 		cy.viewport(1400, 960);
+		cy.intercept(
+			"POST",
+			"**/frappe.desk.dashboard_chart_source.todo_top_owners.todo_top_owners.get",
+			(req) =>
+				req.reply({
+					body: {
+						message: {
+							labels: owner_labels,
+							datasets: [{ name: "Open ToDos", values: owner_values }],
+						},
+					},
+				})
+		).as("top_owners");
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
+		cy.wait("@top_owners");
 		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
+
+		assert_owner_value_labels("at 1400px");
+		assert_owner_labels(owner_labels.length, "at 1400px");
 
 		cy.get(".dashboard-widget-box").each(($widget) => {
 			cy.wrap($widget).should(assert_y_axis).and(assert_x_axis);
+		});
+
+		// the label set this chart renders while it is wide
+		let wide_x_labels;
+		chart_widget(trend_chart).then(($widget) => {
+			wide_x_labels = label_texts($widget, "x");
 		});
 
 		// the x labels are re-thinned for the narrower chart
 		cy.viewport(375, 800);
-		cy.get(".dashboard-widget-box svg.frappe-chart")
-			.first()
+		chart_widget(trend_chart)
+			.find("svg.frappe-chart")
 			.should(($svg) => expect($svg[0].getBoundingClientRect().width).to.be.lessThan(375));
-		cy.wait(1000); // the widget re-applies the label density on a debounced resize
+
+		// the debounced resize has re-applied the label density (RA-4)
+		chart_widget(trend_chart).should(($widget) => {
+			expect(
+				label_texts($widget, "x"),
+				`x labels re-thinned from ${wide_x_labels}`
+			).to.not.deep.equal(wide_x_labels);
+		});
 
 		cy.get(".dashboard-widget-box").each(($widget) => {
 			cy.wrap($widget).should(assert_y_axis).and(assert_x_axis);
 		});
+
+		assert_owner_value_labels("at 375px");
+		assert_owner_labels(1, "at 375px");
 
 		cy.window().then((win) => {
 			expect(win.frappe.utils.format_chart_axis_number(0)).to.eq("0");
@@ -188,9 +484,76 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			expect(win.frappe.utils.format_chart_axis_number(100)).to.eq("100");
 			expect(win.frappe.utils.format_chart_axis_number(1500000)).to.match(/^1\.5 M$/);
 			expect(win.frappe.utils.format_chart_axis_number("")).to.eq("");
+
+			const format_tick = (value) => win.frappe.utils.format_chart_axis_number(value);
+			const site_number_format = win.frappe.boot.sysdefaults.number_format;
+			// the sub-cent intervals frappe-charts generates
+			const quarter_cent_ticks = [0, 0.0025, 0.005, 0.0075, 0.01].map(format_tick);
+			const half_cent_ticks = [0, 0.005, 0.01, 0.015, 0.02].map(format_tick);
+
+			expect(quarter_cent_ticks, "quarter-cent interval ticks").to.deep.eq([
+				"0",
+				"0.0025",
+				"0.005",
+				"0.0075",
+				"0.01",
+			]);
+			expect(
+				new Set(quarter_cent_ticks).size,
+				`distinct ticks in ${quarter_cent_ticks}`
+			).to.eq(quarter_cent_ticks.length);
+			expect(new Set(half_cent_ticks).size, `distinct ticks in ${half_cent_ticks}`).to.eq(
+				half_cent_ticks.length
+			);
+			expect(format_tick(0.0000005), "half-microcent tick").to.eq("5e-7");
+			expect(format_tick(2.5e-7), "tick with a coefficient decimal").to.eq("2.5e-7");
+			expect(format_tick(-0.0025), "negative sub-cent tick").to.eq("-0.0025");
+			expect(format_tick(0.00012345), "tick kept to three significant digits").to.eq(
+				"0.000123"
+			);
+
+			try {
+				win.frappe.boot.sysdefaults.number_format = "#.###,##";
+				expect(format_tick(1250), "grouped tick under #.###,##").to.eq("1.250");
+				expect(format_tick(12345.678), "decimal tick under #.###,##").to.eq("12.345,68");
+				expect(format_tick(0.0025), "sub-cent tick under #.###,##").to.eq("0,0025");
+				expect(format_tick(2.5e-7), "scientific tick under #.###,##").to.eq("2,5e-7");
+
+				win.frappe.boot.sysdefaults.number_format = "#,##,###.##";
+				expect(format_tick(1234567), "grouped tick under #,##,###.##").to.eq("12,34,567");
+
+				win.frappe.boot.sysdefaults.number_format = "#,###";
+				expect(format_tick(0.0025), "sub-cent tick under #,###").to.eq("0.0025");
+			} finally {
+				win.frappe.boot.sysdefaults.number_format = site_number_format;
+			}
+
+			expect(win.frappe.boot.sysdefaults.number_format, "restored site number format").to.eq(
+				site_number_format
+			);
 		});
 
 		cy.viewport(1400, 960);
+
+		[8, 31].forEach((count) => {
+			[375, 768].forEach((container_width) => assert_probe_axis(count, container_width));
+		});
+
+		cy.get(".blitzy-axis-probe").should("have.length", 0);
+
+		cy.window().then((win) => {
+			const options = win.frappe.utils.get_axis_label_options(
+				probe_labels(31),
+				win.frappe.utils.get_chart_plot_width(768)
+			);
+
+			expect(options.xIsSeries, "x labels thinned as a series").to.eq(1);
+			expect(options.seriesLabelSpaceRatio, "label space ratio").to.be.greaterThan(0);
+			expect(
+				win.frappe.utils.get_axis_label_options([], 768),
+				"options without measurable labels"
+			).to.deep.eq({});
+		});
 	});
 
 	it("re-renders the trend chart on every time-window change and keeps focus on the control", () => {
@@ -212,9 +575,8 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
 
-		const trend_widget = () =>
-			cy.contains(".dashboard-widget-box", "ToDo Created vs Completed");
-		const top_owners_widget = () => cy.contains(".dashboard-widget-box", "ToDo Top Owners");
+		const trend_widget = () => chart_widget(trend_chart);
+		const top_owners_widget = () => chart_widget(top_owners_chart);
 		const request_args = (interception) => {
 			const body = interception.request.body;
 			return typeof body === "string" ? JSON.parse(body) : body;
@@ -236,16 +598,35 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			});
 
 		top_owners_widget().find("rect.bar").should("have.length.at.least", 1);
-		// wait for the entry animation to finish before snapshotting the markup
+		// no entry-animation nodes left in the sibling chart (RB-7)
 		top_owners_widget()
 			.find("svg.frappe-chart")
 			.find("animate, animateTransform")
 			.should("have.length", 0);
+
+		// the markup snapshotted is the one this widget has stopped changing on its own: it is
+		// read until it has been the same string for two seconds
+		let settling_top_owners_svg = null;
+		let top_owners_changed_at = null;
 		top_owners_widget()
 			.find("svg.frappe-chart")
-			.then(($svg) => {
-				top_owners_svg = $svg[0].outerHTML;
+			.should(($svg) => {
+				const markup = $svg[0].outerHTML;
+				const read_at = Date.now();
+
+				if (markup !== settling_top_owners_svg) {
+					settling_top_owners_svg = markup;
+					top_owners_changed_at = read_at;
+				}
+
+				expect(
+					read_at - top_owners_changed_at,
+					"ms the Top Owners markup has been unchanged"
+				).to.be.at.least(2000);
 			});
+		cy.then(() => {
+			top_owners_svg = settling_top_owners_svg;
+		});
 
 		// a timespan selection fetches the chosen window and redraws the axis
 		trend_widget().find('.timespan-filter [data-toggle="dropdown"]').click();
@@ -291,12 +672,146 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				expect($svg[0].outerHTML).to.equal(top_owners_svg);
 			});
 
+		// the arguments of the most recent trend request, retried until they match
+		const last_trend_args = (assert_args) =>
+			cy.get("@trend.all").should((interceptions) => {
+				expect(interceptions.length, "trend requests").to.be.greaterThan(0);
+				assert_args(request_args(interceptions[interceptions.length - 1]));
+			});
+
+		// the settings of the most recent answered write, retried until they match
+		const last_saved_window = (assert_config) =>
+			cy.get("@save_config.all").should((interceptions) => {
+				expect(interceptions.length, "settings writes").to.be.greaterThan(0);
+
+				const last = interceptions[interceptions.length - 1];
+				expect(last.response && last.response.statusCode, "write answered").to.equal(200);
+				assert_config(request_args(last).config);
+			});
+
+		// the entry the server holds for this chart in this user's Dashboard Settings
+		const persisted_window = (chart_name) =>
+			cy.get_doc("Dashboard Settings", "Administrator").then((settings) => {
+				const chart_config = JSON.parse(settings.data.chart_config || "{}");
+				return chart_config[chart_name] || {};
+			});
+
+		cy.intercept(
+			"POST",
+			"**/api/method/frappe.desk.doctype.dashboard_settings.dashboard_settings.save_chart_config"
+		).as("save_config");
+
+		// the daily grain the date-range cases below are counted in
+		trend_widget().find('.time-interval-filter [data-toggle="dropdown"]').click();
+		trend_widget().find(".time-interval-filter .dropdown-item").contains("Daily").click();
+
+		last_trend_args((args) => {
+			expect(args.time_interval).to.equal("Daily");
+			expect(args.timespan).to.equal("Last Month");
+		});
+
+		trend_widget()
+			.find(".x.axis text")
+			.should(($labels) => {
+				expect($labels.length).to.equal(month_label_count);
+			});
+
+		// an unsaved Select Date Range choice survives a rebuild of the action area
+		trend_widget().find('.timespan-filter [data-toggle="dropdown"]').click();
+		trend_widget()
+			.find(".timespan-filter .dropdown-item")
+			.contains("Select Date Range")
+			.click();
+		trend_widget().find(".dashboard-date-field input").should("exist");
+		cy.clear_datepickers();
+
+		trend_widget().find(".chart-menu").click();
+		trend_widget().find('.chart-actions [data-action="action-refresh"]').click();
+		last_trend_args((args) => expect(args.timespan).to.equal("Select Date Range"));
+
+		trend_widget()
+			.find(".timespan-filter .filter-label")
+			.should("have.text", "Select Date Range");
+		trend_widget()
+			.find('.timespan-filter .dropdown-item[data-option="Select%20Date%20Range"]')
+			.should("have.attr", "aria-checked", "true");
+		trend_widget().find(".dashboard-date-field").should("exist");
+
+		// the range typed into the control is fetched, drawn and persisted as one window
+		const type_date_range = (range) => {
+			cy.window().then((win) => {
+				const from = win.frappe.datetime.str_to_user(range.from, false, true);
+				const to = win.frappe.datetime.str_to_user(range.to, false, true);
+
+				// the control reads a range typed as two comma-separated dates
+				trend_widget()
+					.find(".dashboard-date-field input")
+					.type(`{selectall}{del}${from},${to}`, { force: true })
+					.should("have.value", `${from},${to}`)
+					.trigger("change");
+			});
+			cy.clear_datepickers();
+		};
+
+		const assert_window = (range) => (args) => {
+			expect(args.timespan).to.equal("Select Date Range");
+			expect(args.from_date).to.equal(range.from);
+			expect(args.to_date).to.equal(range.to);
+		};
+
+		const first_range = {};
+		const second_range = {};
+
+		cy.window().then((win) => {
+			const today = win.frappe.datetime.now_date();
+			Object.assign(first_range, {
+				from: win.moment(today).add(-2, "days").format("YYYY-MM-DD"),
+				to: today,
+			});
+			Object.assign(second_range, {
+				from: win.moment(today).add(-4, "days").format("YYYY-MM-DD"),
+				to: today,
+			});
+		});
+
+		type_date_range(first_range);
+
+		last_trend_args((args) => assert_window(first_range)(args));
+		trend_widget().find(".x.axis text").should("have.length", 3);
+		last_saved_window((config) => assert_window(first_range)(config));
+		persisted_window("ToDo Created vs Completed").then((entry) => {
+			assert_window(first_range)(entry);
+		});
+
+		// the saved range is on the control again after a reload, and editing it then keeps the
+		// timespan it was saved with
+		cy.reload();
+
+		trend_widget()
+			.find(".timespan-filter .filter-label")
+			.should("have.text", "Select Date Range");
+		trend_widget()
+			.find(".dashboard-date-field input")
+			.should(($input) => {
+				expect($input.val(), "range restored from Dashboard Settings").to.not.be.empty;
+			});
+		trend_widget().find(".x.axis text").should("have.length", 3);
+		last_trend_args((args) => assert_window(first_range)(args));
+
+		type_date_range(second_range);
+
+		last_trend_args((args) => assert_window(second_range)(args));
+		trend_widget().find(".x.axis text").should("have.length", 5);
+		last_saved_window((config) => assert_window(second_range)(config));
+		persisted_window("ToDo Created vs Completed").then((entry) => {
+			assert_window(second_range)(entry);
+		});
+
 		// Reset Chart returns the widget to the chart record's own window
 		trend_widget().find(".chart-menu").click();
 		trend_widget().find('.chart-actions [data-action="action-reset"]').click();
 
-		cy.wait("@trend").then((interception) => {
-			const args = request_args(interception);
+		last_trend_args((args) => {
 			expect(args.timespan).to.equal("Last Week");
 			expect(args.time_interval).to.equal("Daily");
 		});
@@ -308,10 +823,242 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			});
 		trend_widget().find(".timespan-filter .filter-label").should("have.text", "Last Week");
 		trend_widget().find(".time-interval-filter .filter-label").should("have.text", "Daily");
+
+		// the date-range control is gone and the header it made room for is back
+		trend_widget().find(".dashboard-date-field").should("not.exist");
+		trend_widget().find(".widget-title").should("be.visible");
+		trend_widget().find(".widget-head").should("have.css", "flex-direction", "row");
+
+		// two instances of one timeseries configuration, and one whose record carries a range
+		const fixture_dashboard = "Cypress Time Window";
+		const fixture_charts = ["Cypress Trend One", "Cypress Trend Two", "Cypress Trend Range"];
+		const fixture_requests = [];
+		const record_range = {};
+
+		// scoped by title, and still found while a collapsed header keeps that title hidden
+		const fixture_widget = (chart_name) =>
+			cy.get(`.dashboard-widget-box:has(.widget-title:contains("${chart_name}"))`).first();
+
+		// the arguments of the most recent request for one fixture chart
+		const last_fixture_args = (chart_name, assert_args) =>
+			cy.wrap(fixture_requests).should((requests) => {
+				const for_chart = requests.filter((args) => args.chart_name === chart_name);
+				expect(for_chart.length, `requests for ${chart_name}`).to.be.greaterThan(0);
+				assert_args(for_chart[for_chart.length - 1]);
+			});
+
+		const reset_fixture_config = () =>
+			cy
+				.window()
+				.its("frappe")
+				.then((frappe) =>
+					Promise.all(
+						fixture_charts.map((chart_name) =>
+							frappe.xcall(
+								"frappe.desk.doctype.dashboard_settings.dashboard_settings.save_chart_config",
+								{ reset: 1, config: {}, chart_name: chart_name }
+							)
+						)
+					)
+				);
+
+		// fixture records a run that stopped before its cleanup may have left behind
+		cy.remove_doc("Dashboard", fixture_dashboard, true);
+		fixture_charts.forEach((chart_name) => {
+			cy.remove_doc("Dashboard Chart", chart_name, true);
+		});
+
+		cy.window().then((win) => {
+			const today = win.frappe.datetime.now_date();
+			Object.assign(record_range, {
+				from: win.moment(today).add(-3, "days").format("YYYY-MM-DD"),
+				to: today,
+			});
+		});
+
+		// the fixture records are registered for the afterEach cleanup
+		cy.then(() => {
+			const fixture_chart_record = (chart_name, window_fields = {}) =>
+				Object.assign(
+					{
+						chart_name: chart_name,
+						chart_type: "Custom",
+						source: "ToDo Created vs Completed",
+						document_type: "ToDo",
+						type: "Line",
+						timeseries: 1,
+						time_interval: "Daily",
+						timespan: "Last Week",
+						filters_json: "[]",
+						is_standard: 0,
+					},
+					window_fields
+				);
+
+			seed_doc("Dashboard Chart", fixture_chart_record("Cypress Trend One"));
+			seed_doc("Dashboard Chart", fixture_chart_record("Cypress Trend Two"));
+			seed_doc(
+				"Dashboard Chart",
+				fixture_chart_record("Cypress Trend Range", {
+					timespan: "Select Date Range",
+					from_date: record_range.from,
+					to_date: record_range.to,
+				})
+			);
+			seed_doc("Dashboard", {
+				dashboard_name: fixture_dashboard,
+				is_standard: 0,
+				charts: fixture_charts.map((chart_name) => ({
+					chart: chart_name,
+					width: "Half",
+				})),
+			});
+		});
+
+		reset_fixture_config();
+
+		cy.intercept(
+			"POST",
+			"**/api/method/frappe.desk.dashboard_chart_source.todo_created_vs_completed.todo_created_vs_completed.get",
+			(req) => {
+				fixture_requests.push(
+					typeof req.body === "string" ? JSON.parse(req.body) : req.body
+				);
+			}
+		).as("fixture_trend");
+
+		cy.visit(`/desk/dashboard-view/${fixture_dashboard}`);
+		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 3);
+
+		// both instances of the same configuration render the record's own window
+		["Cypress Trend One", "Cypress Trend Two"].forEach((chart_name) => {
+			fixture_widget(chart_name).find(".x.axis text").should("have.length", 8);
+			fixture_widget(chart_name)
+				.find(".timespan-filter .filter-label")
+				.should("have.text", "Last Week");
+			fixture_widget(chart_name)
+				.find(".time-interval-filter .filter-label")
+				.should("have.text", "Daily");
+		});
+
+		// the record's own date range reaches the control, the drawn chart and the request
+		fixture_widget("Cypress Trend Range")
+			.find(".timespan-filter .filter-label")
+			.should("have.text", "Select Date Range");
+		cy.window().then((win) => {
+			const from = win.frappe.datetime.str_to_user(record_range.from, false, true);
+			const to = win.frappe.datetime.str_to_user(record_range.to, false, true);
+
+			fixture_widget("Cypress Trend Range")
+				.find(".dashboard-date-field input")
+				.should(($input) => {
+					const value = $input.val();
+					expect(value, "range from the chart record").to.not.be.empty;
+					expect(value).to.contain(from);
+					expect(value).to.contain(to);
+				});
+		});
+		fixture_widget("Cypress Trend Range").find(".x.axis text").should("have.length", 4);
+		last_fixture_args("Cypress Trend Range", (args) => {
+			expect(args.timespan).to.equal("Select Date Range");
+			expect(args.from_date).to.equal(record_range.from);
+			expect(args.to_date).to.equal(record_range.to);
+		});
+
+		// the date field collapses this narrow widget's header, and Reset Chart restores it
+		fixture_widget("Cypress Trend One").find(".widget-title").should("be.visible");
+		fixture_widget("Cypress Trend One")
+			.find('.timespan-filter [data-toggle="dropdown"]')
+			.click();
+		fixture_widget("Cypress Trend One")
+			.find(".timespan-filter .dropdown-item")
+			.contains("Select Date Range")
+			.click();
+		fixture_widget("Cypress Trend One").find(".dashboard-date-field input").should("exist");
+		fixture_widget("Cypress Trend One").find(".widget-title").should("not.be.visible");
+		fixture_widget("Cypress Trend One")
+			.find(".widget-head")
+			.should("have.css", "flex-direction", "row-reverse");
+		cy.clear_datepickers();
+
+		fixture_widget("Cypress Trend One").find(".chart-menu").click();
+		fixture_widget("Cypress Trend One")
+			.find('.chart-actions [data-action="action-reset"]')
+			.click();
+
+		fixture_widget("Cypress Trend One").find(".dashboard-date-field").should("not.exist");
+		fixture_widget("Cypress Trend One").find(".widget-title").should("be.visible");
+		fixture_widget("Cypress Trend One")
+			.find(".widget-head")
+			.should("have.css", "flex-direction", "row");
+		fixture_widget("Cypress Trend One").find(".x.axis text").should("have.length", 8);
+
+		// a window changed on one instance is neither read nor written by the other
+		fixture_widget("Cypress Trend One")
+			.find('.timespan-filter [data-toggle="dropdown"]')
+			.click();
+		fixture_widget("Cypress Trend One")
+			.find(".timespan-filter .dropdown-item")
+			.contains("Last Month")
+			.click();
+
+		last_fixture_args("Cypress Trend One", (args) => {
+			expect(args.timespan).to.equal("Last Month");
+		});
+		fixture_widget("Cypress Trend One")
+			.find(".x.axis text")
+			.should("have.length.of.at.least", 28);
+		fixture_widget("Cypress Trend One")
+			.find(".timespan-filter .filter-label")
+			.should("have.text", "Last Month");
+		fixture_widget("Cypress Trend One")
+			.find('.timespan-filter .dropdown-item[data-option="Last%20Month"]')
+			.should("have.attr", "aria-checked", "true");
+
+		fixture_widget("Cypress Trend Two").find(".x.axis text").should("have.length", 8);
+		fixture_widget("Cypress Trend Two")
+			.find(".timespan-filter .filter-label")
+			.should("have.text", "Last Week");
+		fixture_widget("Cypress Trend Two")
+			.find('.timespan-filter .dropdown-item[data-option="Last%20Week"]')
+			.should("have.attr", "aria-checked", "true");
+		fixture_widget("Cypress Trend Two")
+			.find('.timespan-filter .dropdown-item[data-option="Last%20Month"]')
+			.should("have.attr", "aria-checked", "false");
+
+		// the sibling re-renders from its own window, not from the window just changed
+		fixture_widget("Cypress Trend Two").find(".chart-menu").click();
+		fixture_widget("Cypress Trend Two")
+			.find('.chart-actions [data-action="action-refresh"]')
+			.click();
+
+		cy.wrap(fixture_requests).should((requests) => {
+			const for_sibling = requests.filter((args) => args.chart_name === "Cypress Trend Two");
+			expect(for_sibling.length, "requests for the sibling instance").to.be.at.least(2);
+			for_sibling.forEach((args) => {
+				expect(
+					args.timespan === null || args.timespan === "Last Week",
+					`sibling timespan ${args.timespan}`
+				).to.be.true;
+			});
+		});
+
+		fixture_widget("Cypress Trend Two").find(".x.axis text").should("have.length", 8);
+		fixture_widget("Cypress Trend Two")
+			.find(".timespan-filter .filter-label")
+			.should("have.text", "Last Week");
+		fixture_widget("Cypress Trend Two")
+			.find('.timespan-filter .dropdown-item[data-option="Last%20Week"]')
+			.should("have.attr", "aria-checked", "true");
+
+		persisted_window("Cypress Trend Two").then((entry) => {
+			expect(entry.timespan, "sibling persisted timespan").to.not.equal("Last Month");
+		});
 	});
 
 	it("recovers from a chart data error with the retry affordance", () => {
 		let fail_next_trend_request = true;
+		let empty_next_trend_request = false;
 
 		cy.intercept(
 			"POST",
@@ -328,6 +1075,9 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 							]),
 						},
 					});
+				} else if (empty_next_trend_request) {
+					empty_next_trend_request = false;
+					req.reply({ statusCode: 200, body: { message: {} } });
 				}
 			}
 		).as("trend");
@@ -337,8 +1087,8 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			win.__unitC_no_reload = true;
 		});
 
-		const trend_widget = () => cy.get(".dashboard-widget-box").eq(0);
-		const owners_widget = () => cy.get(".dashboard-widget-box").eq(1);
+		const trend_widget = () => chart_widget(trend_chart);
+		const owners_widget = () => chart_widget(top_owners_chart);
 
 		cy.wait("@trend", { timeout: 30000 });
 		trend_widget().should("contain.text", "ToDo Created vs Completed");
@@ -386,6 +1136,56 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		// focus lands on the chart's action menu instead of the document body
 		cy.focused().should("have.class", "chart-menu");
 
+		// with no action menu — as in customize mode — focus still lands on a visible node of the
+		// widget and not on the hidden Retry control or the document body
+		cy.then(() => {
+			fail_next_trend_request = true;
+		});
+		trend_widget().find(".chart-menu").click();
+		trend_widget().find('[data-action="action-refresh"]').click();
+		cy.wait("@trend", { timeout: 30000 });
+		trend_widget().find("button.chart-retry").should("be.visible");
+		trend_widget()
+			.find("button.chart-menu")
+			.should("have.length", 1)
+			.then(($menu) => {
+				$menu.closest(".chart-actions").remove();
+			});
+		trend_widget().find(".chart-menu").should("not.exist");
+
+		trend_widget().find("button.chart-retry").focus();
+		cy.focused().trigger("keydown", { key: "Enter", keyCode: 13, which: 13 });
+		cy.wait("@trend", { timeout: 30000 });
+		trend_widget().find("svg.frappe-chart").should("have.length", 1);
+		trend_widget().find(".chart-loading-state.text-danger").should("not.be.visible");
+		cy.focused().should(($focused) => {
+			expect(
+				$focused.closest(".dashboard-widget-box").text(),
+				"focus stayed inside the widget"
+			).to.contain(trend_chart);
+			expect($focused.is(":visible"), "focused element is visible").to.be.true;
+			expect($focused.hasClass("chart-retry"), "focus left the hidden Retry").to.be.false;
+			expect($focused.attr("tabindex"), "focused element is focusable").to.not.be.undefined;
+		});
+
+		// a retry that recovers into the "No Data" state focuses that container
+		cy.then(() => {
+			empty_next_trend_request = true;
+		});
+		trend_widget()
+			.find("button.chart-retry")
+			.then(($retry) => {
+				$retry.trigger("click");
+			});
+		cy.wait("@trend", { timeout: 30000 });
+		trend_widget().find("svg.frappe-chart").should("not.be.visible");
+		cy.focused().should(($focused) => {
+			expect($focused.hasClass("chart-loading-state"), "focus is the empty state").to.be
+				.true;
+			expect($focused.attr("tabindex"), "empty state is focusable").to.equal("-1");
+			expect($focused.text(), "empty state text").to.contain("No Data");
+		});
+
 		// the chart recovered in place: the page was never reloaded
 		cy.window().its("__unitC_no_reload").should("eq", true);
 	});
@@ -401,6 +1201,9 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		const interval_toggle =
 			'.dashboard-widget-box .time-interval-filter [data-toggle="dropdown"]';
 		const card_toggle = '.number-widget-box .card-actions [data-toggle="dropdown"]';
+
+		const trend_widget = () =>
+			cy.contains(".dashboard-widget-box", "ToDo Created vs Completed");
 
 		const select_timespan = (option) => {
 			cy.get(timespan_toggle).focus().trigger("keydown", ARROW_DOWN);
@@ -423,6 +1226,34 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				1
 			);
 		};
+
+		// marks the toggle the menu is opened from, then activates the named command with Enter
+		const activate_chart_command = (label) => {
+			trend_widget()
+				.find(".chart-menu")
+				.then(($toggle) => $toggle.attr("data-stale-toggle", "1"))
+				.focus()
+				.trigger("keydown", ARROW_DOWN);
+			trend_widget().find(".chart-actions").should("have.class", "show");
+			trend_widget().find(".chart-actions").contains('[role="menuitem"]', label).focus();
+			return cy.focused().should("have.text", label).trigger("keydown", ENTER);
+		};
+
+		// asserts the refetch finished, the menu closed and the keyboard sits on the rebuilt toggle
+		const assert_focus_on_rebuilt_menu = () => {
+			cy.wait("@menu_trend");
+			trend_widget().find("svg.frappe-chart").should("have.length", 1);
+			trend_widget().find(".chart-actions").should("not.have.class", "show");
+			cy.focused()
+				.should("have.class", "chart-menu")
+				.and("not.have.attr", "data-stale-toggle");
+			trend_widget().find(".chart-menu").should("have.focus");
+		};
+
+		cy.intercept(
+			"POST",
+			"**/api/method/frappe.desk.dashboard_chart_source.todo_created_vs_completed.todo_created_vs_completed.get"
+		).as("menu_trend");
 
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
 		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
@@ -454,7 +1285,7 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			.parent()
 			.should("have.class", "timespan-filter");
 
-		// restore the timespan the dashboard was found with
+		// re-applying "Last Week" marks it and leaves it applied
 		select_timespan("Last%20Week");
 		cy.get(".dashboard-widget-box .timespan-filter .filter-label").should(
 			"have.text",
@@ -475,17 +1306,14 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			.should("have.class", "time-interval-filter");
 
 		// 3. chart actions menu: ArrowDown opens it on the first command, End jumps to the last
-		cy.get(".dashboard-widget-box").eq(0).find(".chart-menu").focus();
+		chart_widget(trend_chart).find(".chart-menu").focus();
 		cy.focused().trigger("keydown", ARROW_DOWN);
-		cy.get(".dashboard-widget-box").eq(0).find(".chart-actions").should("have.class", "show");
+		chart_widget(trend_chart).find(".chart-actions").should("have.class", "show");
 		cy.focused().should("have.attr", "role", "menuitem").and("have.text", "Refresh");
 		cy.focused().trigger("keydown", END);
 		cy.focused().should("have.attr", "role", "menuitem").and("have.text", "ToDo List");
 		cy.focused().trigger("keydown", ESCAPE);
-		cy.get(".dashboard-widget-box")
-			.eq(0)
-			.find(".chart-actions")
-			.should("not.have.class", "show");
+		chart_widget(trend_chart).find(".chart-actions").should("not.have.class", "show");
 		cy.focused().should("have.class", "chart-menu");
 
 		// 4. card actions menu: Enter opens it, Escape closes it and focus returns to the toggle
@@ -517,29 +1345,78 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				).to.not.equal(null);
 			}
 		);
+
+		// 7. with the trend fetches of the earlier steps consumed, Refresh activated from the
+		// keyboard refetches the chart and puts the keyboard on the rebuilt actions toggle
+		cy.get("@menu_trend.all").then((calls) => {
+			calls.forEach(() => cy.wait("@menu_trend"));
+		});
+		activate_chart_command("Refresh");
+		assert_focus_on_rebuilt_menu();
+
+		// 8. Reset Chart activated from the keyboard returns the widget to the chart record's own
+		// window and puts the keyboard on the rebuilt actions toggle
+		activate_chart_command("Reset Chart");
+		assert_focus_on_rebuilt_menu();
+		trend_widget().find(".timespan-filter .filter-label").should("have.text", "Last Week");
+		trend_widget().find(".time-interval-filter .filter-label").should("have.text", "Daily");
+
+		// 9. Escape on the actions toggle of a closed menu reaches the document's own handler,
+		// which blurs the toggle and leaves the menu closed
+		trend_widget().find(".chart-menu").focus();
+		cy.focused().should("have.class", "chart-menu").trigger("keydown", ESCAPE);
+		trend_widget().find(".chart-actions").should("not.have.class", "show");
+		trend_widget().find(".chart-menu").should("not.have.focus");
+		cy.focused().should("not.exist");
+
+		// 10. the Edit command routes to the chart's own form, and the close it triggers leaves
+		// focus on the activated command instead of pulling it back to the actions toggle
+		activate_chart_command("Edit").then(($item) => {
+			const focused = $item[0].ownerDocument.activeElement;
+			expect(
+				Boolean(focused && focused.classList.contains("chart-menu")),
+				"focus pulled back to the chart actions toggle"
+			).to.equal(false);
+			expect(focused, "focus right after the routing command").to.equal($item[0]);
+		});
+		cy.window()
+			.its("frappe")
+			.invoke("get_route_str")
+			.should("eq", "Form/Dashboard Chart/ToDo Created vs Completed");
+		cy.visit("/desk/dashboard-view/ToDo Analytics");
+		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
 	});
 
 	it("plot-area tooltips are reachable from the keyboard", () => {
-		// two owners, so moving along the Top Owners axis lands on a different data point
-		cy.insert_doc(
-			"ToDo",
-			{
-				description: "Cypress keyboard tooltip seed admin",
-				allocated_to: "Administrator",
-				assigned_by: "Administrator",
-			},
-			true
-		);
+		// the trend chart is served a dataset name carrying an ampersand (RE-11)
+		const trend_dataset_name = "Created & Reopened";
 
-		cy.insert_doc(
-			"ToDo",
-			{
-				description: "Cypress keyboard tooltip seed test user",
-				allocated_to: Cypress.config("testUser"),
-				assigned_by: "Administrator",
-			},
-			true
-		);
+		cy.intercept(
+			"POST",
+			"**/frappe.desk.dashboard_chart_source.todo_created_vs_completed.todo_created_vs_completed.get",
+			(req) => {
+				req.continue((res) => {
+					const datasets = res.body && res.body.message && res.body.message.datasets;
+
+					if (datasets && datasets.length) {
+						datasets[0].name = trend_dataset_name;
+					}
+				});
+			}
+		).as("trend_tooltip");
+
+		// a second Top Owners owner (RE-9)
+		seed_doc("ToDo", {
+			description: "Cypress keyboard tooltip seed admin",
+			allocated_to: "Administrator",
+			assigned_by: "Administrator",
+		});
+
+		seed_doc("ToDo", {
+			description: "Cypress keyboard tooltip seed test user",
+			allocated_to: Cypress.config("testUser"),
+			assigned_by: "Administrator",
+		});
 
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
 		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
@@ -547,159 +1424,179 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		const plot_area = '.chart-plot-area[tabindex="0"][role]';
 		const announcer = ".chart-tooltip-announcer[aria-live]";
 		const expected_tooltip_text = {
-			0: /Created|Completed/,
-			1: /Open ToDos/,
+			[trend_chart]: /Created|Completed/,
+			[top_owners_chart]: /Open ToDos/,
 		};
 
-		const focus_plot_area = (widget_index) =>
-			cy.get(".dashboard-widget-box").eq(widget_index).find(plot_area).focus();
-		const press = (widget_index, key) => {
-			focus_plot_area(widget_index);
-			cy.focused().trigger("keydown", { key: key });
+		const key_codes = { ArrowRight: 39, ArrowLeft: 37, Home: 36, End: 35, Escape: 27 };
+
+		const focus_plot_area = (title) => chart_widget(title).find(plot_area).focus();
+		const press = (title, key) => {
+			focus_plot_area(title);
+			cy.focused().trigger("keydown", {
+				key: key,
+				keyCode: key_codes[key],
+				which: key_codes[key],
+			});
 		};
-		const tooltip_title = (widget_index) =>
-			cy
-				.get(".dashboard-widget-box")
-				.eq(widget_index)
-				.find(".graph-svg-tip .title")
-				.invoke("text");
+		const tooltip_title = (title) =>
+			chart_widget(title).find(".graph-svg-tip .title").invoke("text");
 
-		// frappe-charts renders placeholder series during its entry animation; the first keyboard
-		// move is repeated until the chart holds the series it was loaded with
-		const reveal_first_point = (widget_index, attempt = 0) => {
-			press(widget_index, attempt === 0 ? "ArrowRight" : "Home");
-			cy.get(".dashboard-widget-box")
-				.eq(widget_index)
-				.find(".graph-svg-tip")
-				.then(($tip) => {
-					const revealed =
-						$tip[0].style.opacity === "1" &&
-						expected_tooltip_text[widget_index].test($tip[0].innerText);
+		// Steps to the first data point once the entry animation has left the chart, re-dispatching
+		// the move until the tooltip holds the loaded series (RE-9).
+		const reveal_first_point = (title) => {
+			chart_widget(title)
+				.find("svg.frappe-chart")
+				.find("animate, animateTransform")
+				.should("have.length", 0);
+			focus_plot_area(title);
 
-					if (!revealed && attempt < 9) {
-						cy.wait(500);
-						reveal_first_point(widget_index, attempt + 1);
-					}
+			let moves = 0;
+
+			chart_widget(title)
+				.find(plot_area)
+				.should(($plot) => {
+					const win = $plot[0].ownerDocument.defaultView;
+					const tip = $plot.closest(".dashboard-widget-box").find(".graph-svg-tip")[0];
+
+					// every move after the first returns to the first data point
+					const key = moves++ === 0 ? "ArrowRight" : "Home";
+
+					$plot[0].dispatchEvent(
+						new win.KeyboardEvent("keydown", {
+							key: key,
+							keyCode: key_codes[key],
+							which: key_codes[key],
+							bubbles: true,
+							cancelable: true,
+						})
+					);
+
+					expect(tip.style.opacity).to.equal("1");
+					expect(tip.innerText).to.match(expected_tooltip_text[title]);
 				});
 		};
 
-		[0, 1].forEach((widget_index) => {
+		[trend_chart, top_owners_chart].forEach((title) => {
 			// the plot area is a labelled focus stop
-			cy.get(".dashboard-widget-box")
-				.eq(widget_index)
+			chart_widget(title)
 				.find(plot_area)
 				.should(($plot) => {
 					expect($plot.attr("role")).to.not.be.empty;
 					expect($plot.attr("aria-label")).to.not.be.empty;
 				});
-			focus_plot_area(widget_index);
+			focus_plot_area(title);
 			cy.focused().should(($focused) => {
-				const widget = Cypress.$(".dashboard-widget-box")[widget_index];
-
 				expect($focused.hasClass("chart-plot-area")).to.be.true;
-				expect(widget.contains($focused[0])).to.be.true;
+				expect($focused.closest(".dashboard-widget-box").text()).to.contain(title);
 			});
 
 			// ArrowRight reveals the same tooltip the mouse shows
-			reveal_first_point(widget_index);
-			cy.get(".dashboard-widget-box")
-				.eq(widget_index)
+			reveal_first_point(title);
+			chart_widget(title)
 				.find(".graph-svg-tip")
 				.should(($tip) => {
 					expect($tip[0].style.opacity).to.equal("1");
 					expect($tip[0].innerText.trim()).to.not.be.empty;
-					expect($tip[0].innerText).to.match(expected_tooltip_text[widget_index]);
+					expect($tip[0].innerText).to.match(expected_tooltip_text[title]);
 				});
 
 			// the live region carries the tooltip title and a value
-			cy.get(".dashboard-widget-box")
-				.eq(widget_index)
+			chart_widget(title)
 				.find(announcer)
 				.should(($announcer) => {
-					const widget = Cypress.$(".dashboard-widget-box")[widget_index];
+					const widget = $announcer.closest(".dashboard-widget-box")[0];
 					const tip = widget.querySelector(".graph-svg-tip");
-					const title = tip.querySelector(".title").innerText.trim();
+					const tip_title = tip.querySelector(".title").innerText.trim();
 					const value = tip.querySelector(".tooltip-value").innerText.trim();
 					const announcement = $announcer.text();
 
 					expect($announcer.attr("aria-live")).to.equal("polite");
-					expect(announcement.toUpperCase()).to.contain(title.toUpperCase());
+					expect(announcement.toUpperCase()).to.contain(tip_title.toUpperCase());
 					expect(announcement).to.contain(value);
 				});
 
 			// ArrowRight again moves to the next data point
-			tooltip_title(widget_index).then((first_title) => {
-				press(widget_index, "ArrowRight");
-				tooltip_title(widget_index).should("not.equal", first_title);
+			tooltip_title(title).then((first_title) => {
+				press(title, "ArrowRight");
+				tooltip_title(title).should("not.equal", first_title);
 
 				// Home returns to the first data point, End jumps to the last one
-				press(widget_index, "Home");
-				tooltip_title(widget_index).should("equal", first_title);
+				press(title, "Home");
+				tooltip_title(title).should("equal", first_title);
 
-				press(widget_index, "End");
-				tooltip_title(widget_index).then((last_title) => {
+				press(title, "End");
+				tooltip_title(title).then((last_title) => {
 					expect(last_title).to.not.equal(first_title);
 
 					// End is clamped to the last data point
-					press(widget_index, "End");
-					tooltip_title(widget_index).should("equal", last_title);
+					press(title, "End");
+					tooltip_title(title).should("equal", last_title);
 
-					cy.get(".dashboard-widget-box")
-						.eq(widget_index)
+					chart_widget(title)
 						.find(".graph-svg-tip")
 						.should(($tip) => {
 							expect($tip[0].style.opacity).to.equal("1");
 						});
 
-					// Escape hides the tooltip again
-					press(widget_index, "Escape");
-					cy.get(".dashboard-widget-box")
-						.eq(widget_index)
+					// Escape hides the tooltip again and keeps the keyboard on the plot area (RE-10)
+					press(title, "Escape");
+					chart_widget(title)
 						.find(".graph-svg-tip")
 						.should(($tip) => {
 							expect($tip[0].style.opacity).to.equal("0");
 						});
-					cy.get(".dashboard-widget-box")
-						.eq(widget_index)
-						.find(announcer)
-						.should("have.text", "");
+					chart_widget(title).find(announcer).should("have.text", "");
+					cy.focused().should(($focused) => {
+						expect($focused.hasClass("chart-plot-area")).to.be.true;
+						expect($focused.closest(".dashboard-widget-box").text()).to.contain(title);
+					});
 				});
 			});
 		});
 
+		// the live region carries the dataset name as characters, not as HTML entities (RE-11)
+		reveal_first_point(trend_chart);
+		chart_widget(trend_chart).should(($widget) => {
+			const labels = Array.from(
+				$widget[0].querySelectorAll(".graph-svg-tip .tooltip-label")
+			).map((node) => node.textContent.trim());
+			const announcement = $widget.find(announcer).text();
+
+			expect(labels, "tooltip series labels").to.include(trend_dataset_name);
+			expect(announcement, "announcement").to.contain(trend_dataset_name);
+			expect(announcement, "announcement").to.not.contain("&amp;");
+		});
+
 		// arrow keys on the plot area do not take over the widget dropdowns
-		cy.get(".dashboard-widget-box")
-			.eq(0)
+		chart_widget(trend_chart)
 			.find(".chart-menu")
 			.focus()
 			.trigger("keydown", { key: "ArrowDown", keyCode: 40, which: 40 })
 			.parent()
 			.should("have.class", "show");
-		cy.get(".dashboard-widget-box")
-			.eq(0)
+		chart_widget(trend_chart)
 			.find(".chart-menu")
 			.trigger("keydown", { key: "Escape", keyCode: 27, which: 27 });
 
 		// the mouse path still reveals the Top Owners tooltip
-		cy.get(".dashboard-widget-box")
-			.eq(1)
-			.should(($widget) => {
-				const bar = $widget.find("rect.bar")[0];
-				const tip = $widget.find(".graph-svg-tip")[0];
-				const box = bar.getBoundingClientRect();
-				const win = bar.ownerDocument.defaultView;
+		chart_widget(top_owners_chart).should(($widget) => {
+			const bar = $widget.find("rect.bar")[0];
+			const tip = $widget.find(".graph-svg-tip")[0];
+			const box = bar.getBoundingClientRect();
+			const win = bar.ownerDocument.defaultView;
 
-				bar.dispatchEvent(
-					new win.MouseEvent("mousemove", {
-						bubbles: true,
-						clientX: box.left + box.width / 2,
-						clientY: box.top + box.height / 2,
-					})
-				);
+			bar.dispatchEvent(
+				new win.MouseEvent("mousemove", {
+					bubbles: true,
+					clientX: box.left + box.width / 2,
+					clientY: box.top + box.height / 2,
+				})
+			);
 
-				expect(tip.style.opacity).to.equal("1");
-				expect(tip.innerText).to.contain("Open ToDos");
-			});
+			expect(tip.style.opacity).to.equal("1");
+			expect(tip.innerText).to.contain("Open ToDos");
+		});
 	});
 
 	it("dashboard text and controls meet WCAG AA contrast", () => {
@@ -800,19 +1697,12 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		});
 
 		// placeholder of the date-range input the trend widget reveals
-		cy.get(".dashboard-widget-box")
-			.first()
-			.find('.timespan-filter button[data-toggle="dropdown"]')
-			.click();
-		cy.get(".dashboard-widget-box")
-			.first()
+		chart_widget(trend_chart).find('.timespan-filter button[data-toggle="dropdown"]').click();
+		chart_widget(trend_chart)
 			.find(".timespan-filter .dropdown-item")
 			.contains("Select Date Range")
 			.click();
-		cy.get(".dashboard-widget-box")
-			.first()
-			.find(".dashboard-date-field input")
-			.should("exist");
+		chart_widget(trend_chart).find(".dashboard-date-field input").should("exist");
 		cy.window().then((win) => {
 			const input = [
 				...win.document.querySelectorAll(
@@ -826,18 +1716,13 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			expect(ratio, "date-range placeholder contrast").to.be.at.least(4.5);
 		});
 
-		// leave Dashboard Settings as they were found
-		cy.get(".dashboard-widget-box")
-			.first()
-			.find('.timespan-filter button[data-toggle="dropdown"]')
-			.click();
-		cy.get(".dashboard-widget-box")
-			.first()
+		// a preset window applied again, which removes the date-range control
+		chart_widget(trend_chart).find('.timespan-filter button[data-toggle="dropdown"]').click();
+		chart_widget(trend_chart)
 			.find(".timespan-filter .dropdown-item")
 			.contains("Last Week")
 			.click();
-		cy.get(".dashboard-widget-box")
-			.first()
+		chart_widget(trend_chart)
 			.find(".timespan-filter .filter-label")
 			.should("have.text", "Last Week");
 
@@ -914,17 +1799,23 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		cy.get(".number-widget-box").should("have.length", 2);
 
 		// every tile carries the class holding the hover treatment and is a named tab stop
+		// whose name states the destination its Document Type card opens
 		cy.get(".number-widget-box").each(($tile) => {
 			cy.wrap($tile)
 				.should("have.class", "widget-shadow")
 				.and("have.attr", "tabindex", "0")
 				.and("have.attr", "role", "link");
-			expect($tile.attr("aria-label")).to.match(/\S/);
+
+			cy.wrap($tile).should(($rendered) => {
+				const title = $rendered.find(".widget-title").text().trim();
+				expect(title, "tile title").to.match(/\S/);
+				expect($rendered.attr("aria-label"), "tile name").to.equal(
+					`${title}: open the ToDo list`
+				);
+			});
 		});
 
-		// checks that a CSS :hover rule for the tile is loaded: a synthetic mouseover cannot
-		// trigger CSS :hover, so the hover path is covered by rule presence while the
-		// focus-visible path below is exercised on the element itself
+		// the loaded stylesheets carry a :hover rule for the tile (RG-4)
 		cy.window().then((win) => {
 			const selectors = [];
 			for (const sheet of win.document.styleSheets) {
@@ -976,6 +1867,80 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
 		cy.get(".number-widget-box").should("have.length", 2);
+		cy.window()
+			.its("frappe.dashboard.number_card_group.widgets_list.0.card_doc")
+			.should("exist");
+
+		// the tile's name follows the card's type and destination, and only a card with a
+		// destination carries link semantics
+		cy.window().then((win) => {
+			const widget = win.frappe.dashboard.number_card_group.widgets_list[0];
+			const tile = widget.widget;
+			const title = widget.title || widget.label || widget.name;
+			const card_doc = widget.card_doc;
+			const data = widget.data;
+
+			widget.card_doc = { type: "Report", report_name: "ToDo Report" };
+			widget.update_tile_operability();
+			expect(tile.attr("aria-label"), "report card name").to.equal(
+				`${title}: open the ToDo Report report`
+			);
+
+			widget.card_doc = { type: "Document Type", document_type: "System Settings" };
+			widget.update_tile_operability();
+			expect(tile.attr("aria-label"), "single document type card name").to.equal(
+				`${title}: open System Settings`
+			);
+
+			widget.card_doc = { type: "Custom" };
+			widget.data = { route: ["List", "ToDo"] };
+			widget.update_tile_operability();
+			expect(tile.attr("aria-label"), "custom card name").to.equal(`${title}: open ToDo`);
+			expect(tile.attr("role"), "custom card role").to.equal("link");
+
+			widget.data = { route: "/desk/todo?status=Open" };
+			widget.update_tile_operability();
+			expect(tile.attr("aria-label"), "custom card path route name").to.equal(
+				`${title}: open todo`
+			);
+
+			widget.data = {};
+			widget.update_tile_operability();
+			expect(tile.attr("role"), "routeless card role").to.be.undefined;
+			expect(tile.attr("tabindex"), "routeless card tab stop").to.be.undefined;
+			expect(tile.attr("aria-label"), "routeless card name").to.be.undefined;
+
+			widget.card_doc = card_doc;
+			widget.data = data;
+			widget.update_tile_operability();
+			expect(tile.attr("aria-label"), "document type card name").to.equal(
+				`${title}: open the ToDo list`
+			);
+		});
+
+		// a tile switched into customize mode after it was rendered drops its link semantics
+		// and its key handler
+		cy.window().then((win) => {
+			const widget = win.frappe.dashboard.number_card_group.widgets_list[0];
+			const tile = widget.widget;
+
+			widget.customize(win.frappe.dashboard.number_card_group.options);
+			expect(tile.attr("role"), "customize mode role").to.be.undefined;
+			expect(tile.attr("tabindex"), "customize mode tab stop").to.be.undefined;
+			expect(tile.attr("aria-label"), "customize mode name").to.be.undefined;
+
+			const events = win.$._data(tile[0], "events");
+			expect(events && events.keydown, "customize mode tile key handler").to.be.undefined;
+		});
+
+		// rebuilding the tile outside customize mode puts them back
+		cy.visit("/desk/dashboard-view/ToDo Analytics");
+		cy.get(".number-widget-box").should("have.length", 2);
+		cy.get(".number-widget-box")
+			.first()
+			.should("have.attr", "role", "link")
+			.and("have.attr", "tabindex", "0")
+			.and("have.attr", "aria-label", "ToDo Total Open: open the ToDo list");
 	});
 
 	it("does not write empty dynamic filter values into the widget filter state", () => {
@@ -983,6 +1948,7 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		const chart_name = "Cypress Empty Dynamic Filter Chart";
 		const dashboard_name = "Cypress Empty Dynamic Filter Dashboard";
 		const unset_expression = 'frappe.defaults.get_user_default("no_such_default_key")';
+		const set_array_expression = '["Open"]';
 
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
 		cy.window().its("frappe.dashboard_utils").should("exist");
@@ -1027,6 +1993,37 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			expect(win.frappe.dashboard_utils.is_unset_filter_value("   ")).to.equal(true);
 			expect(win.frappe.dashboard_utils.is_unset_filter_value([])).to.equal(true);
 
+			// an array holding entries is a value: only a zero-length array is unset
+			expect(win.frappe.dashboard_utils.is_unset_filter_value([""])).to.equal(false);
+			expect(win.frappe.dashboard_utils.is_unset_filter_value([null])).to.equal(false);
+			expect(win.frappe.dashboard_utils.is_unset_filter_value([0])).to.equal(false);
+			expect(win.frappe.dashboard_utils.is_unset_filter_value([[]])).to.equal(false);
+
+			// list-shaped state: a non-empty array keeps its shape, a zero-length one is dropped
+			const array_list_filters = win.frappe.dashboard_utils.get_all_filters({
+				filters_json: "[]",
+				dynamic_filters_json: JSON.stringify([
+					["ToDo", "status", "in", '[""]', false],
+					["ToDo", "priority", "in", "[null]", false],
+					["ToDo", "reference_type", "in", "[]", false],
+				]),
+			});
+			expect(array_list_filters).to.deep.equal([
+				["ToDo", "status", "in", [""], false],
+				["ToDo", "priority", "in", [null], false],
+			]);
+
+			// dict-shaped state: a non-empty array is written, a zero-length one writes no key
+			const array_dict_filters = win.frappe.dashboard_utils.get_all_filters({
+				filters_json: JSON.stringify({ status: "Open" }),
+				dynamic_filters_json: JSON.stringify({
+					priority: '[""]',
+					reference_type: "[]",
+				}),
+			});
+			expect(array_dict_filters).to.deep.equal({ status: "Open", priority: [""] });
+			expect(Object.keys(array_dict_filters)).to.not.include("reference_type");
+
 			// an invalid expression is still reported instead of being silently dropped
 			expect(() =>
 				win.frappe.dashboard_utils.get_all_filters({
@@ -1038,67 +2035,54 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			cy.clear_dialogs();
 		});
 
-		// the unset filter also never reaches the server for widgets rendered on a dashboard
+		// for widgets rendered on a dashboard, the unset filter never reaches the server while
+		// the non-empty array filter arrives with its shape
 		cy.remove_doc("Dashboard", dashboard_name, true);
 		cy.remove_doc("Number Card", card_name, true);
 		cy.remove_doc("Dashboard Chart", chart_name, true);
 
-		cy.insert_doc(
-			"ToDo",
-			{
-				description: "Cypress empty dynamic filter seed",
-				allocated_to: "Administrator",
-				assigned_by: "Administrator",
-			},
-			true
-		);
+		seed_doc("ToDo", {
+			description: "Cypress empty dynamic filter seed",
+			allocated_to: "Administrator",
+			assigned_by: "Administrator",
+		});
 
-		cy.insert_doc(
-			"Number Card",
-			{
-				label: card_name,
-				type: "Document Type",
-				document_type: "ToDo",
-				function: "Count",
-				is_public: 1,
-				show_percentage_stats: 0,
-				filters_json: JSON.stringify([["ToDo", "status", "=", "Open", false]]),
-				dynamic_filters_json: JSON.stringify([
-					["ToDo", "allocated_to", "=", unset_expression, false],
-				]),
-			},
-			true
-		);
+		seed_doc("Number Card", {
+			label: card_name,
+			type: "Document Type",
+			document_type: "ToDo",
+			function: "Count",
+			is_public: 1,
+			show_percentage_stats: 0,
+			filters_json: JSON.stringify([["ToDo", "status", "=", "Open", false]]),
+			dynamic_filters_json: JSON.stringify([
+				["ToDo", "allocated_to", "=", unset_expression, false],
+				["ToDo", "status", "in", set_array_expression, false],
+			]),
+		});
 
-		cy.insert_doc(
-			"Dashboard Chart",
-			{
-				chart_name: chart_name,
-				chart_type: "Count",
-				document_type: "ToDo",
-				based_on: "creation",
-				timeseries: 1,
-				time_interval: "Daily",
-				timespan: "Last Week",
-				type: "Line",
-				is_public: 1,
-				filters_json: JSON.stringify([["ToDo", "status", "=", "Open", false]]),
-				dynamic_filters_json: JSON.stringify([
-					["ToDo", "allocated_to", "=", unset_expression, false],
-				]),
-			},
-			true
-		);
+		seed_doc("Dashboard Chart", {
+			chart_name: chart_name,
+			chart_type: "Count",
+			document_type: "ToDo",
+			based_on: "creation",
+			timeseries: 1,
+			time_interval: "Daily",
+			timespan: "Last Week",
+			type: "Line",
+			is_public: 1,
+			filters_json: JSON.stringify([["ToDo", "status", "=", "Open", false]]),
+			dynamic_filters_json: JSON.stringify([
+				["ToDo", "allocated_to", "=", unset_expression, false],
+				["ToDo", "status", "in", set_array_expression, false],
+			]),
+		});
 
-		cy.insert_doc(
-			"Dashboard",
-			{
-				dashboard_name: dashboard_name,
-				cards: [{ card: card_name }],
-				charts: [{ chart: chart_name, width: "Full" }],
-			},
-			true
-		);
+		seed_doc("Dashboard", {
+			dashboard_name: dashboard_name,
+			cards: [{ card: card_name }],
+			charts: [{ chart: chart_name, width: "Full" }],
+		});
 
 		cy.intercept("POST", "**/frappe.desk.doctype.number_card.number_card.get_result").as(
 			"card_result"
@@ -1112,6 +2096,7 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		cy.wait("@card_result").then((interception) => {
 			expect(interception.request.body.filters).to.deep.equal([
 				["ToDo", "status", "=", "Open", false],
+				["ToDo", "status", "in", ["Open"], false],
 			]);
 			expect(interception.response.body.message).to.be.greaterThan(0);
 		});
@@ -1119,6 +2104,7 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		cy.wait("@chart_result").then((interception) => {
 			expect(interception.request.body.filters).to.deep.equal([
 				["ToDo", "status", "=", "Open", false],
+				["ToDo", "status", "in", ["Open"], false],
 			]);
 			const values = interception.response.body.message.datasets[0].values;
 			expect(Math.max(...values)).to.be.greaterThan(0);
@@ -1126,10 +2112,6 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 		cy.get(".number-widget-box .widget-title").should("contain.text", card_name);
 		cy.get(".number-widget-box .widget-content .number").should("not.have.text", "0");
-
-		cy.remove_doc("Dashboard", dashboard_name, true);
-		cy.remove_doc("Number Card", card_name, true);
-		cy.remove_doc("Dashboard Chart", chart_name, true);
 	});
 
 	it("serves the dashboard with the security response headers and an intact bundle", () => {

@@ -22,8 +22,8 @@ frappe.dashboard_utils = {
 					</button>`;
 			let options_html;
 
-			// The label of a chart filter always shows the setting that is currently applied,
-			// so the option matching it is the checked option of the menu.
+			// The option whose text matches this control's label is rendered as the checked
+			// option (PR Description decision RD-3).
 			const applied_label = filter.label == null ? "" : String(__(filter.label));
 			const is_applied = (option) =>
 				applied_label !== "" &&
@@ -99,10 +99,40 @@ frappe.dashboard_utils = {
 	// (`menuitem`) and single-selection options (`menuitemradio`).
 	MENU_ITEM_SELECTOR: '[role="menuitem"], [role="menuitemradio"]',
 
+	// Set while an activated menu command routes away from the page its menu is on; read and
+	// cleared by the dropdown close that follows (PR Description decision RD-5).
+	menu_focus_restore_suppressed: false,
+
+	/**
+	 * Suppresses the focus restoration of the widget-menu close that follows this call.
+	 *
+	 * Call it from the click handler of a menu command, immediately before the
+	 * `frappe.set_route(...)` that leaves the page: the next `hidden.bs.dropdown` of a
+	 * keyboard-operable dropdown then leaves focus where the command put it. The suppression
+	 * is consumed by that close and, if no menu closes, dropped at the end of the current
+	 * task, so it never applies to a later close.
+	 *
+	 * See PR Description decision RD-5.
+	 */
+	suppress_menu_focus_restore() {
+		frappe.dashboard_utils.menu_focus_restore_suppressed = true;
+		setTimeout(() => {
+			frappe.dashboard_utils.menu_focus_restore_suppressed = false;
+		}, 0);
+	},
+
+	// Returns whether focus restoration is suppressed for the close being handled, and clears
+	// the suppression.
+	consume_menu_focus_restore_suppression() {
+		const suppressed = frappe.dashboard_utils.menu_focus_restore_suppressed;
+		frappe.dashboard_utils.menu_focus_restore_suppressed = false;
+		return suppressed;
+	},
+
 	/**
 	 * Makes one widget menu (chart actions, card actions, timespan / interval / heatmap-year
-	 * dropdown) fully operable from the keyboard and restores focus to its toggle whenever the
-	 * menu closes.
+	 * dropdown) fully operable from the keyboard, and returns focus to its toggle after a close
+	 * that left focus unplaced.
 	 *
 	 * Behaviour installed on `$dropdown` (a Bootstrap `.dropdown` container holding one
 	 * `[data-toggle="dropdown"]` toggle and one `.dropdown-menu`):
@@ -111,12 +141,16 @@ frappe.dashboard_utils = {
 	 *  - ArrowDown / ArrowUp move between options and wrap around; Home and End jump to the
 	 *    first and last option.
 	 *  - Enter and Space activate the focused option.
-	 *  - Escape closes the menu; Tab and Shift+Tab close it and let focus continue along the
-	 *    document's own tab order.
+	 *  - Escape closes an open menu and keeps the key from reaching the document; with the menu
+	 *    closed the key is left to the document's own handlers.
+	 *  - Tab and Shift+Tab close the menu and let focus continue along the document's own tab
+	 *    order.
 	 *  - On `hidden.bs.dropdown` — which covers Escape, an outside click, option activation and
-	 *    a programmatic close — focus returns to the toggle when focus is on `body`, inside the
-	 *    menu that just closed, or nowhere. Focus that an action moved elsewhere (a dialog, a
-	 *    new route) is left where the action put it.
+	 *    a programmatic close — focus returns to the toggle if the toggle is still in the
+	 *    document and focus is on `body`, inside the menu that just closed, or nowhere. Two
+	 *    closes are exempt: one performed by Tab or Shift+Tab, and one whose command marked
+	 *    itself as navigating away with `frappe.dashboard_utils.suppress_menu_focus_restore()`.
+	 *    Focus that an action moved elsewhere (a dialog, a new route) stays where it was put.
 	 *  - The menu is given `role="menu"` and is labelled by its toggle through `aria-labelledby`.
 	 *
 	 * Usage: call once per rendered dropdown, e.g.
@@ -129,8 +163,7 @@ frappe.dashboard_utils = {
 		const $menu = $dropdown.find(".dropdown-menu").first();
 
 		if (!$toggle.length || !$menu.length) return;
-		// One binding per rendered dropdown: widgets rebuild their action area on refresh,
-		// which discards the old nodes together with their handlers.
+		// One binding per rendered dropdown (PR Description decision RD-8).
 		if ($dropdown.data("keyboard-operable")) return;
 		$dropdown.data("keyboard-operable", true);
 
@@ -138,8 +171,8 @@ frappe.dashboard_utils = {
 
 		const items = () => $menu.find(this.MENU_ITEM_SELECTOR).filter(":visible").toArray();
 		const is_open = () => $dropdown.hasClass("show");
-		// Bootstrap's own `hide()` leaves `aria-expanded` untouched, so the menu is always
-		// closed through the toggle, which routes through `Dropdown._clearMenus`.
+		// The menu is opened and closed by triggering a click on its toggle (PR Description
+		// decision RD-7).
 		const open_menu = () => !is_open() && $toggle.trigger("click");
 		const close_menu = () => is_open() && $toggle.trigger("click");
 
@@ -163,6 +196,10 @@ frappe.dashboard_utils = {
 			}
 
 			if (!["Enter", " ", "ArrowDown", "ArrowUp", "Escape"].includes(e.key)) return;
+
+			// Escape is this handler's key only while there is an open menu to close; with the
+			// menu closed it is left to the document (PR Description decision RD-4).
+			if (e.key === "Escape" && !is_open()) return;
 
 			e.preventDefault();
 			e.stopPropagation();
@@ -218,7 +255,8 @@ frappe.dashboard_utils = {
 		});
 
 		$dropdown.on("hidden.bs.dropdown", () => {
-			if (leaving_by_tab) return;
+			const focus_restore_suppressed = this.consume_menu_focus_restore_suppression();
+			if (focus_restore_suppressed || leaving_by_tab) return;
 
 			const toggle = $toggle[0];
 			if (!toggle.isConnected) return;
@@ -385,7 +423,7 @@ frappe.dashboard_utils = {
 	},
 
 	// A filter value counts as unset when it is undefined, null, an empty or whitespace-only
-	// string, or an array that holds nothing but such values. 0 and false are set values.
+	// string, or an array with no entries. 0, false and arrays with entries are set values.
 	is_unset_filter_value(value) {
 		if (value === undefined || value === null) {
 			return true;
@@ -396,10 +434,7 @@ frappe.dashboard_utils = {
 		}
 
 		if (Array.isArray(value)) {
-			return (
-				!value.length ||
-				value.every((entry) => frappe.dashboard_utils.is_unset_filter_value(entry))
-			);
+			return value.length === 0;
 		}
 
 		return false;

@@ -88,10 +88,8 @@ class FrappeClient:
 			raise AuthError
 
 	def set_csrf_token(self, csrf_token):
-		"""Send `csrf_token` with every subsequent request of this cookie session.
-
-		A server that returns no token - one older than this client - leaves the header unset, and
-		key-authenticated clients never reach this method because they hold no session cookie.
+		"""Store a truthy `csrf_token` as `CSRF_TOKEN_HEADER` in `self.headers`, which every
+		subsequent request of this client then sends; a falsy `csrf_token` is ignored (RI-5).
 		"""
 		if csrf_token:
 			self.headers[CSRF_TOKEN_HEADER] = csrf_token

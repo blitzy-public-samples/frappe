@@ -81,15 +81,15 @@ frappe.ui.form.on("File", {
 				</video>
 			</div>`);
 		} else if (file_extension === "pdf") {
+			const preview_title = frappe.utils.escape_html(__("PDF preview"));
 			$preview = $(`<div class="img_preview">
-				<object style="background:#323639;" width="100%">
-					<embed
-						style="background:#323639;"
-						width="100%"
-						height="1190"
-						src="${src_url}" type="application/pdf"
-					>
-				</object>
+				<iframe
+					style="background:#323639;"
+					width="100%"
+					height="1190"
+					src="${src_url}"
+					title="${preview_title}"
+				></iframe>
 			</div>`);
 		} else if (file_extension === "mp3") {
 			$preview = $(`<div class="img_preview">

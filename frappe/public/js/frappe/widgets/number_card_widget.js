@@ -69,26 +69,102 @@ export default class NumberCardWidget extends Widget {
 			this.set_route();
 		});
 
-		if (this.in_customize_mode) return;
-
-		this.make_tile_operable();
+		this.update_tile_operability();
 	}
 
 	/**
-	 * Makes the tile itself keyboard-operable: it carries a link role, an accessible name and
-	 * a tab stop, and Enter or Space performs the same navigation as a click on the tile body.
+	 * Switches the widget into customize mode and updates the tile's interactive semantics,
+	 * which a customize-mode tile does not carry.
+	 */
+	customize(options) {
+		super.customize(options);
+		this.update_tile_operability();
+	}
+
+	/**
+	 * Brings the tile's interactive semantics in line with the widget's current state: a tile
+	 * that resolves to a destination is operable, and a tile in customize mode or with no
+	 * destination is not.
+	 *
+	 * Runs on every render, on entry to customize mode, and again once `get_data()` has
+	 * resolved, at which point a Custom card's route is known.
+	 */
+	update_tile_operability() {
+		const action_name = this.in_customize_mode ? null : this.get_tile_action_name();
+
+		if (action_name) {
+			this.make_tile_operable(action_name);
+		} else {
+			this.make_tile_inoperable();
+		}
+	}
+
+	/**
+	 * Returns the accessible name of the tile's action - the card's title followed by the
+	 * destination activating the tile navigates to - or null when the card resolves to no
+	 * destination: a card whose document is still loading, a Report card without a report, a
+	 * Document Type card without a document type, or a Custom card whose data carries no route.
+	 *
+	 * The destination is the document type's list view, or the document itself for a Single
+	 * document type, or the card's report, or the page a Custom card's route points at.
+	 */
+	get_tile_action_name() {
+		if (!this.card_doc) return null;
+
+		const tile_label = __(this.title || this.label || this.name);
+		const card_type = this.card_doc.type || "Document Type";
+
+		if (card_type === "Custom") {
+			const destination = this.get_custom_route_label();
+			return destination ? __("{0}: open {1}", [tile_label, destination]) : null;
+		}
+
+		if (card_type === "Report") {
+			if (!this.card_doc.report_name) return null;
+
+			return __("{0}: open the {1} report", [tile_label, __(this.card_doc.report_name)]);
+		}
+
+		const document_type = this.card_doc.document_type;
+		if (!document_type) return null;
+
+		if (frappe.model.is_single(document_type)) {
+			return __("{0}: open {1}", [tile_label, __(document_type)]);
+		}
+
+		return __("{0}: open the {1} list", [tile_label, __(document_type)]);
+	}
+
+	/**
+	 * Returns the name of the destination a Custom card routes to, taken from the last
+	 * meaningful segment of `data.route` with the desk prefix and any query string dropped, or
+	 * an empty string when the card's data carries no route.
+	 */
+	get_custom_route_label() {
+		const route = this.data?.route;
+		if (!route) return "";
+
+		const segments = (Array.isArray(route) ? route : String(route).split("/"))
+			.map((segment) => String(segment).split(/[?#]/)[0].trim())
+			.filter((segment) => segment && !["app", "desk"].includes(segment.toLowerCase()));
+
+		return segments.length ? __(segments[segments.length - 1]) : "";
+	}
+
+	/**
+	 * Makes the tile itself keyboard-operable: it carries a link role, the accessible name of
+	 * its action and a tab stop, and Enter or Space performs the same navigation as a click on
+	 * the tile body.
 	 *
 	 * The keydown binding is namespaced and rebound on every render, and it handles only
 	 * events whose target is the tile element - keys pressed on the card actions dropdown
 	 * nested inside the tile are left to that control.
 	 */
-	make_tile_operable() {
-		const tile_label = this.title || this.label || this.name;
-
+	make_tile_operable(action_name) {
 		this.widget.attr({
 			role: "link",
 			tabindex: 0,
-			"aria-label": __("{0}: open list", [__(tile_label)]),
+			"aria-label": action_name,
 		});
 
 		this.widget.off("keydown.number_card").on("keydown.number_card", (e) => {
@@ -99,6 +175,16 @@ export default class NumberCardWidget extends Widget {
 			e.preventDefault();
 			this.set_route();
 		});
+	}
+
+	/**
+	 * Takes the tile's interactive semantics back off: the link role, the tab stop, the
+	 * accessible action name and the tile key handler all go, leaving a plain container that
+	 * is neither a tab stop nor announced as a control.
+	 */
+	make_tile_inoperable() {
+		this.widget.removeAttr("role tabindex aria-label");
+		this.widget.off("keydown.number_card");
 	}
 
 	set_route() {
@@ -214,6 +300,7 @@ export default class NumberCardWidget extends Widget {
 
 		this.render_number();
 		this.render_stats();
+		this.update_tile_operability();
 	}
 
 	set_loading_state() {
@@ -398,6 +485,7 @@ export default class NumberCardWidget extends Widget {
 				action: "action-edit",
 				handler: () => {
 					let number_card = this.number_card_name || this.name;
+					frappe.dashboard_utils.suppress_menu_focus_restore();
 					frappe.set_route("Form", "Number Card", number_card);
 				},
 			},

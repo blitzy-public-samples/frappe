@@ -209,6 +209,10 @@ def init_request(request):
 	if request.method != "OPTIONS":
 		frappe.local.http_request = HTTPRequest()
 
+		# a CSRF rejection deferred to explicit authentication is settled before any hook runs
+		if frappe.flags.deferred_csrf_rejection:
+			validate_auth()
+
 	for before_request_task in frappe.get_hooks("before_request"):
 		frappe.call(before_request_task)
 
@@ -261,13 +265,16 @@ DEFAULT_CONTENT_SECURITY_POLICY = (
 	"img-src 'self' data: blob: https:; "
 	"font-src 'self' data: https:; "
 	"connect-src 'self' ws: wss: https:; "
-	"frame-src 'self' https:; "
+	"frame-src 'self' blob: https:; "
 	"media-src 'self' data: blob: https:; "
 	"worker-src 'self' blob:; "
 	"object-src 'none'; "
 	"base-uri 'self'; "
 	"frame-ancestors 'self'"
 )
+
+# Ports a URL scheme implies when a CSP host source omits one.
+DEFAULT_SCHEME_PORTS = {"http": "80", "https": "443", "ws": "80", "wss": "443"}
 
 # Site config key -> (header name, default value). An empty configured value omits the header.
 SECURITY_HEADER_CONFIG_KEYS = {
@@ -368,10 +375,7 @@ def set_security_headers(response: Response):
 	if cint(conf.get("disable_security_headers")):
 		return
 
-	request_headers = getattr(frappe.local, "response_headers", None) or {}
-	explicit_csp = response.headers.get("Content-Security-Policy") or request_headers.get(
-		"Content-Security-Policy"
-	)
+	explicit_csp = effective_content_security_policy(response)
 
 	for config_key, (header, default) in SECURITY_HEADER_CONFIG_KEYS.items():
 		value = conf[config_key] if config_key in conf else default
@@ -385,27 +389,88 @@ def set_security_headers(response: Response):
 				continue
 			value = add_dev_socketio_source(value)
 		elif header == "X-Frame-Options" and explicit_csp and frame_ancestors_allow_other_hosts(explicit_csp):
-			# omitted while the response's own policy allows framing by other hosts
+			# omitted while the effective policy allows framing by other hosts
 			continue
 
 		response.headers.setdefault(header, value)
 
 
+def effective_content_security_policy(response: Response) -> str | None:
+	"""Return the Content-Security-Policy `response` carries once the per-request headers are merged.
+
+	A value in `frappe.local.response_headers` takes precedence over one already on the response,
+	which is the order `process_response` merges them in; a key present there with an empty value
+	resolves to that empty value.
+	"""
+	request_headers = getattr(frappe.local, "response_headers", None) or {}
+
+	if "Content-Security-Policy" in request_headers:
+		return request_headers["Content-Security-Policy"]
+
+	return response.headers.get("Content-Security-Policy")
+
+
 def frame_ancestors_allow_other_hosts(policy: str) -> bool:
-	"""Return whether `policy`'s frame-ancestors directive names a host beyond 'self'/'none'."""
+	"""Return whether `policy`'s frame-ancestors directive can match an origin other than this request's."""
 	for directive in policy.split(";"):
 		sources = directive.split()
 		if sources and sources[0].lower() == "frame-ancestors":
-			return any(source.strip("'\"").lower() not in ("self", "none") for source in sources[1:])
+			return any(is_other_origin_source(source) for source in sources[1:])
 
 	return False
 
 
-def add_dev_socketio_source(policy: str) -> str:
-	"""Return `policy` with the development server's socketio origin added to connect-src.
+def is_other_origin_source(source: str) -> bool:
+	"""Return whether CSP `source` can match an origin other than the one serving this request.
 
-	The Desk realtime client connects to `window.location.origin` behind a reverse proxy, but to
-	`<scheme>://<hostname>:<socketio_port>` when served by the development server.
+	`'self'` and `'none'` cannot. A wildcard, a scheme-only source, or a host source naming
+	another scheme, host or port can; a host source spelling out the current origin cannot. A
+	source resolved outside a request is reported as another origin.
+	"""
+	token = source.strip("'\"").lower()
+
+	if token in ("self", "none"):
+		return False
+
+	if "*" in token or (token.endswith(":") and "//" not in token):
+		return True
+
+	request = getattr(frappe.local, "request", None)
+	if not request:
+		return True
+
+	scheme, separator, authority = token.partition("://")
+	if not separator:
+		scheme, authority = request.scheme, token
+
+	authority = authority.split("/")[0]
+
+	if not authority:
+		return True
+
+	return normalized_origin(scheme, authority) != normalized_origin(request.scheme, request.host)
+
+
+def normalized_origin(scheme: str, host: str) -> tuple[str, str, str]:
+	"""Return (scheme, hostname, port) for `scheme` and `host`, with the scheme's default port filled in."""
+	scheme = scheme.lower()
+
+	if host.startswith("["):
+		hostname, _, port = host.partition("]")
+		hostname, port = f"{hostname}]", port.lstrip(":")
+	else:
+		hostname, _, port = host.partition(":")
+
+	return scheme, hostname.lower(), port or DEFAULT_SCHEME_PORTS.get(scheme, "")
+
+
+def add_dev_socketio_source(policy: str) -> str:
+	"""Return `policy` with the development server's socketio origin allowed for connections.
+
+	The origin is appended to `connect-src` when that directive is present, and otherwise to a
+	`connect-src` synthesized from `default-src`'s sources. A policy that restricts neither
+	directive, a policy that already lists the origin, and any policy resolved outside the
+	development server are returned unchanged.
 	"""
 	if not frappe._dev_server:
 		return policy
@@ -419,16 +484,29 @@ def add_dev_socketio_source(policy: str) -> str:
 
 	source = f"{request.scheme}://{request.host.split(':')[0]}:{socketio_port}"
 	directives = [directive.strip() for directive in policy.split(";") if directive.strip()]
+	default_sources = None
 
 	for index, directive in enumerate(directives):
 		sources = directive.split()
-		if sources[0].lower() == "connect-src":
-			if source in sources:
+		name = sources[0].lower()
+
+		if name == "connect-src":
+			if source in sources[1:]:
 				return policy
+
 			directives[index] = f"{directive} {source}"
 			return "; ".join(directives)
 
-	return policy
+		if name == "default-src":
+			default_sources = sources[1:]
+
+	if default_sources is None:
+		return policy
+
+	fallback = [s for s in default_sources if s.strip("'\"").lower() != "none"]
+	directives.append(" ".join(["connect-src", *fallback, source]))
+
+	return "; ".join(directives)
 
 
 def set_authenticate_headers(response: Response):

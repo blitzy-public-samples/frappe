@@ -2,6 +2,7 @@
 # License: MIT. See LICENSE
 """Coverage for the baseline security response headers `frappe.app.set_security_headers` adds."""
 
+from pathlib import Path
 from unittest.mock import patch
 
 from werkzeug.datastructures import Headers
@@ -37,7 +38,7 @@ def get_directive(policy: str, name: str) -> str:
 
 
 class TestSecurityHeaders(IntegrationTestCase):
-	"""Drive `process_response` directly, the way `frappe.tests.test_cors` does."""
+	"""Direct `process_response` coverage of the header baseline (decision RJ-9)."""
 
 	def setUp(self):
 		self.original_response_headers = frappe.local.response_headers
@@ -87,6 +88,20 @@ class TestSecurityHeaders(IntegrationTestCase):
 		self.assertEqual(get_directive(policy, "frame-ancestors"), "'self'")
 		self.assertEqual(get_directive(policy, "object-src"), "'none'")
 		self.assertEqual(get_directive(policy, "base-uri"), "'self'")
+
+	def test_policy_allows_same_origin_and_blob_backed_frames(self):
+		frame_src = get_directive(self.process().headers["Content-Security-Policy"], "frame-src")
+
+		self.assertIn("'self'", frame_src)
+		self.assertIn("blob:", frame_src)
+
+	def test_file_form_pdf_preview_is_a_framed_source(self):
+		"""The shipped File form renders its PDF preview through an iframe, not a plugin element."""
+		file_js = Path(frappe.get_app_path("frappe", "core", "doctype", "file", "file.js")).read_text()
+
+		self.assertIn("<iframe", file_js)
+		self.assertNotIn("<object", file_js)
+		self.assertNotIn("<embed", file_js)
 
 	def test_policy_is_not_a_wildcard_policy_and_keeps_the_desk_bundle_working(self):
 		policy = self.process().headers["Content-Security-Policy"]
@@ -139,6 +154,62 @@ class TestSecurityHeaders(IntegrationTestCase):
 		response = self.process()
 
 		self.assertEqual(response.headers["Content-Security-Policy"], "frame-ancestors 'self'")
+		self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+
+	def test_current_origin_frame_ancestors_keeps_x_frame_options(self):
+		current_origin_policy = "frame-ancestors http://test.localhost:8000"
+		frappe.local.response_headers["Content-Security-Policy"] = current_origin_policy
+
+		response = self.process(headers={"Host": "test.localhost:8000"})
+
+		self.assertEqual(response.headers["Content-Security-Policy"], current_origin_policy)
+		self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+
+	def test_other_origin_frame_ancestors_omits_x_frame_options(self):
+		other_origin_policies = (
+			"frame-ancestors https://test.localhost:8000",
+			"frame-ancestors http://test.localhost:9000",
+			"frame-ancestors http://embed.localhost:8000",
+			"frame-ancestors https:",
+			"frame-ancestors http://*.localhost:8000",
+		)
+
+		for policy in other_origin_policies:
+			with self.subTest(policy=policy):
+				frappe.local.response_headers["Content-Security-Policy"] = policy
+
+				response = self.process(headers={"Host": "test.localhost:8000"})
+
+				self.assertEqual(response.headers["Content-Security-Policy"], policy)
+				self.assertNotIn("X-Frame-Options", response.headers)
+
+	def test_request_policy_wins_over_a_self_only_renderer_policy(self):
+		embedding_policy = "frame-ancestors 'self' https://embed.example"
+		response = Response()
+		response.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
+		frappe.local.response_headers["Content-Security-Policy"] = embedding_policy
+
+		self.process(response=response)
+
+		self.assertEqual(response.headers["Content-Security-Policy"], embedding_policy)
+		self.assertNotIn("X-Frame-Options", response.headers)
+
+	def test_self_only_request_policy_wins_over_an_embedding_renderer_policy(self):
+		response = Response()
+		response.headers["Content-Security-Policy"] = "frame-ancestors 'self' https://embed.example"
+		frappe.local.response_headers["Content-Security-Policy"] = "frame-ancestors 'self'"
+
+		self.process(response=response)
+
+		self.assertEqual(response.headers["Content-Security-Policy"], "frame-ancestors 'self'")
+		self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
+
+	def test_empty_request_policy_is_served_empty_and_keeps_x_frame_options(self):
+		frappe.local.response_headers["Content-Security-Policy"] = ""
+
+		response = self.process()
+
+		self.assertEqual(response.headers["Content-Security-Policy"], "")
 		self.assertEqual(response.headers["X-Frame-Options"], "SAMEORIGIN")
 
 	def test_explicit_x_frame_options_wins(self):
@@ -223,6 +294,37 @@ class TestSecurityHeaders(IntegrationTestCase):
 		self.assertIn("http://test.localhost:9000", connect_src)
 		self.assertIn("'self'", connect_src)
 
+	def test_dev_server_adds_the_socketio_origin_to_a_default_src_fallback(self):
+		self.set_conf(socketio_port=9000, content_security_policy="default-src 'self' https:")
+
+		with patch("frappe._dev_server", 1):
+			response = self.process(headers={"Host": "test.localhost:8000"})
+
+		policy = response.headers["Content-Security-Policy"]
+		self.assertEqual(get_directive(policy, "default-src"), "'self' https:")
+		self.assertEqual(get_directive(policy, "connect-src"), "'self' https: http://test.localhost:9000")
+
+	def test_dev_server_socketio_origin_omits_a_none_default_source(self):
+		self.set_conf(socketio_port=9000, content_security_policy="default-src 'none'; img-src 'self'")
+
+		with patch("frappe._dev_server", 1):
+			response = self.process(headers={"Host": "test.localhost:8000"})
+
+		policy = response.headers["Content-Security-Policy"]
+		self.assertEqual(get_directive(policy, "connect-src"), "http://test.localhost:9000")
+		self.assertEqual(get_directive(policy, "default-src"), "'none'")
+
+	def test_dev_server_leaves_a_policy_without_connect_or_default_sources_unchanged(self):
+		configured_policy = "img-src 'self'; frame-ancestors 'self'"
+		self.set_conf(socketio_port=9000, content_security_policy=configured_policy)
+
+		with patch("frappe._dev_server", 1):
+			response = self.process(headers={"Host": "test.localhost:8000"})
+
+		policy = response.headers["Content-Security-Policy"]
+		self.assertEqual(policy, configured_policy)
+		self.assertEqual(get_directive(policy, "connect-src"), "")
+
 	def test_socketio_origin_absent_without_the_dev_server(self):
 		self.set_conf(socketio_port=9000)
 
@@ -299,7 +401,7 @@ class TestSecurityHeadersOnDesk(FrappeAPITestCase):
 				{"fieldname": "description", "fieldtype": "Text Editor", "label": "Description"}
 			],
 		).insert(ignore_permissions=True)
-		# the request is served on another database connection, which reads committed rows only
+		# commit the HTTP-visible fixture (decision RJ-10)
 		frappe.db.commit()  # nosemgrep: frappe-manual-commit
 		self.addCleanup(self.delete_web_form, web_form.name)
 
@@ -315,5 +417,5 @@ class TestSecurityHeadersOnDesk(FrappeAPITestCase):
 
 	def delete_web_form(self, name):
 		frappe.delete_doc("Web Form", name, force=True, ignore_permissions=True)
-		# the deletion crosses the same connection boundary as the insert
+		# commit the fixture cleanup (decision RJ-10)
 		frappe.db.commit()  # nosemgrep: frappe-manual-commit

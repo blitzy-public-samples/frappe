@@ -33,16 +33,57 @@ export default class ChartWidget extends Widget {
 	}
 
 	refresh() {
-		delete this.dashboard_chart;
+		this.release_chart_watchers();
+		this.invalidate_pending_fetches();
+		this.invalidate_pending_renders();
+		this.destroy_dashboard_chart();
 		this.clear_date_range_field();
 		this.set_body();
 		this.make_chart();
 	}
 
 	delete(animate = true, dismissed = false) {
+		this.deleted = true;
+		this.release_chart_watchers();
+		this.invalidate_pending_fetches();
+		this.invalidate_pending_renders();
 		this.clear_date_range_field();
-		delete this.dashboard_chart;
+		this.destroy_dashboard_chart();
 		super.delete(animate, dismissed);
+	}
+
+	// Makes every request already in flight stale: neither its data nor its error reaches the
+	// widget (RB-2).
+	invalidate_pending_fetches() {
+		this.fetch_sequence = (this.fetch_sequence || 0) + 1;
+	}
+
+	// Makes every render still waiting on a doctype meta load stale: when it resumes it draws
+	// nothing into this widget and binds no watcher (RB-2).
+	invalidate_pending_renders() {
+		this.render_sequence = (this.render_sequence || 0) + 1;
+	}
+
+	// Removes the chart this widget last drew — the current one, or one whose reference was
+	// dropped without it — along with the window listeners and the ResizeObserver frappe-charts
+	// holds for it.
+	destroy_dashboard_chart() {
+		const chart = this.dashboard_chart || this.rendered_chart;
+
+		if (chart && typeof chart.destroy === "function") {
+			chart.destroy();
+		}
+
+		delete this.dashboard_chart;
+		delete this.rendered_chart;
+	}
+
+	// Draws a new chart into this widget's wrapper, releasing the chart a previous draw left
+	// behind first.
+	create_dashboard_chart(chart_args) {
+		this.destroy_dashboard_chart();
+		this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
+		this.rendered_chart = this.dashboard_chart;
 	}
 
 	set_chart_title() {
@@ -97,9 +138,8 @@ export default class ChartWidget extends Widget {
 		this.set_chart_title();
 	}
 
-	// Fills the error container with the message region screen readers announce and the Retry
-	// control that re-fetches the chart. Runs once per error container: repeated calls keep the
-	// existing nodes, so no duplicate button and no duplicate handler can accumulate.
+	// Fills the error container with the announced message region and the Retry control that
+	// re-fetches the chart, once per container: a repeated call keeps the existing nodes (RC-1).
 	setup_error_state_content() {
 		if (!this.error_state) {
 			return;
@@ -123,7 +163,7 @@ export default class ChartWidget extends Widget {
 
 		this.retry_button.on("click", () => this.retry_fetch());
 		this.retry_button.on("keydown", (event) => {
-			// preventDefault stops the browser's own button activation from firing a second retry
+			// retries on Enter and Space, suppressing the button's native activation (RC-6)
 			if (event.key === "Enter" || event.key === " " || event.key === "Spacebar") {
 				event.preventDefault();
 				this.retry_fetch();
@@ -198,22 +238,37 @@ export default class ChartWidget extends Widget {
 		}
 	}
 
-	// The window the controls display: this instance's live selection, else this user's saved
-	// setting, else the chart record's own value.
+	// The effective window of this widget: this instance's live selection, else this user's saved
+	// setting, else the chart record's own value. from_date and to_date are returned for the
+	// timespan "Select Date Range" and are null for every other timespan, whatever the selection,
+	// the setting or the record hold. Decision RB-4.
 	get_time_window() {
+		const timespan =
+			this.selected_timespan ||
+			this.chart_settings.timespan ||
+			this.chart_doc.timespan ||
+			null;
+		const uses_date_range = timespan === "Select Date Range";
+
 		return {
-			timespan:
-				this.selected_timespan ||
-				this.chart_settings.timespan ||
-				this.chart_doc.timespan ||
-				null,
+			timespan: timespan,
 			time_interval:
 				this.selected_time_interval ||
 				this.chart_settings.time_interval ||
 				this.chart_doc.time_interval ||
 				null,
-			from_date: this.selected_from_date || this.chart_settings.from_date || null,
-			to_date: this.selected_to_date || this.chart_settings.to_date || null,
+			from_date: uses_date_range
+				? this.selected_from_date ||
+				  this.chart_settings.from_date ||
+				  this.chart_doc.from_date ||
+				  null
+				: null,
+			to_date: uses_date_range
+				? this.selected_to_date ||
+				  this.chart_settings.to_date ||
+				  this.chart_doc.to_date ||
+				  null
+				: null,
 			heatmap_year:
 				this.selected_heatmap_year ||
 				this.chart_settings.heatmap_year ||
@@ -222,12 +277,16 @@ export default class ChartWidget extends Widget {
 		};
 	}
 
+	// Builds the time-window dropdowns. Every toggle label, and with it the option
+	// render_chart_filters marks as checked, comes from the one window captured here. Each
+	// selection handler reads the window again, after it has recorded the new selection.
 	get_time_series_filters() {
+		const time_window = this.get_time_window();
 		let filters;
 		if (this.chart_doc.type == "Heatmap") {
 			filters = [
 				{
-					label: __(this.chart_settings.heatmap_year) || __(this.chart_doc.heatmap_year),
+					label: __(time_window.heatmap_year),
 					options: frappe.dashboard_utils.get_years_since_creation(
 						frappe.boot.user.creation
 					),
@@ -246,8 +305,7 @@ export default class ChartWidget extends Widget {
 		} else {
 			filters = [
 				{
-					label:
-						__(this.chart_settings.time_interval) || __(this.chart_doc.time_interval),
+					label: __(time_window.time_interval),
 					options: ["Yearly", "Quarterly", "Monthly", "Weekly", "Daily"],
 					icon: "calendar",
 					class: "time-interval-filter",
@@ -266,7 +324,7 @@ export default class ChartWidget extends Widget {
 					},
 				},
 				{
-					label: __(this.chart_settings.timespan) || __(this.chart_doc.timespan),
+					label: __(time_window.timespan),
 					options: [
 						"Select Date Range",
 						"Last Year",
@@ -286,15 +344,7 @@ export default class ChartWidget extends Widget {
 								'.timespan-filter [data-toggle="dropdown"]';
 							this.selected_from_date = null;
 							this.selected_to_date = null;
-							if (this.date_field_wrapper) {
-								this.clear_date_range_field();
-
-								// Title maybe hidden becuase of date range fields
-								// in half width chart
-								this.title_field.show();
-								this.subtitle_field.show();
-								this.head.css("flex-direction", "row");
-							}
+							this.clear_date_range_field();
 
 							this.save_chart_config_for_user({
 								timespan: this.selected_timespan,
@@ -318,8 +368,8 @@ export default class ChartWidget extends Widget {
 		const focus_control = this.selection_focus_control;
 		this.selection_focus_control = null;
 
-		return this.fetch(this.filters, true, this.args).then((data) => {
-			if (request_sequence !== this.fetch_sequence) {
+		return this.fetch(this.filters, true, this.args, request_sequence).then((data) => {
+			if (request_sequence !== this.fetch_sequence || this.widget_disconnected()) {
 				return;
 			}
 
@@ -345,15 +395,18 @@ export default class ChartWidget extends Widget {
 
 		const time_window = this.get_time_window();
 
+		// The rendered control, this instance's live selection and the next save all carry the
+		// window resolved here, including a window that only the saved setting or the chart
+		// record held until now.
+		this.selected_timespan = time_window.timespan;
+		this.selected_from_date = time_window.from_date;
+		this.selected_to_date = time_window.to_date;
+
 		this.date_field_wrapper = $(
 			`<div class="dashboard-date-field pull-right"></div>`
 		).insertAfter(this.action_area.find(".timespan-filter"));
 
-		if (this.width !== "Full" && this.widget.width() < 700) {
-			this.title_field.hide();
-			this.subtitle_field.hide();
-			this.head.css("flex-direction", "row-reverse");
-		}
+		this.collapse_header_for_date_field();
 
 		this.date_range_field = frappe.ui.form.make_control({
 			df: {
@@ -371,11 +424,12 @@ export default class ChartWidget extends Widget {
 					this.selection_focus_control = ".dashboard-date-field input";
 
 					if (selected_date_range && selected_date_range.length == 2) {
+						const selected_window = this.get_time_window();
 						this.save_chart_config_for_user({
-							timespan: this.selected_timespan,
-							time_interval: this.get_time_window().time_interval,
-							from_date: this.selected_from_date,
-							to_date: this.selected_to_date,
+							timespan: selected_window.timespan,
+							time_interval: selected_window.time_interval,
+							from_date: selected_window.from_date,
+							to_date: selected_window.to_date,
 						});
 						this.fetch_and_update_chart();
 					}
@@ -392,7 +446,35 @@ export default class ChartWidget extends Widget {
 		focus_input && this.date_range_field.$input.focus();
 	}
 
-	// Removes this instance's date range control, its datepicker and the references to both.
+	// Hides the title and subtitle and reverses the header of a narrow widget, making room for
+	// the date range control, and records that this widget's header is collapsed for it.
+	collapse_header_for_date_field() {
+		if (this.width === "Full" || this.widget.width() >= 700) {
+			return;
+		}
+
+		this.title_field.hide();
+		this.subtitle_field.hide();
+		this.head.css("flex-direction", "row-reverse");
+		this.header_collapsed_for_date_field = true;
+	}
+
+	// Shows the title and subtitle again and restores the header direction, for a header this
+	// widget collapsed for its date range control. A header hidden by anything else is left as
+	// it is.
+	restore_header_after_date_field() {
+		if (!this.header_collapsed_for_date_field) {
+			return;
+		}
+
+		this.header_collapsed_for_date_field = false;
+		this.title_field.show();
+		this.subtitle_field.show();
+		this.head.css("flex-direction", "row");
+	}
+
+	// Removes this instance's date range control, its datepicker and the references to both,
+	// and restores the header the control was given room in.
 	clear_date_range_field() {
 		if (this.date_range_field) {
 			const datepicker = this.date_range_field.datepicker;
@@ -404,6 +486,8 @@ export default class ChartWidget extends Widget {
 			this.date_field_wrapper.remove();
 			this.date_field_wrapper = null;
 		}
+
+		this.restore_header_after_date_field();
 	}
 
 	get_report_chart_data(result) {
@@ -443,6 +527,7 @@ export default class ChartWidget extends Widget {
 				label: __("Edit"),
 				action: "action-edit",
 				handler: () => {
+					frappe.dashboard_utils.suppress_menu_focus_restore();
 					frappe.set_route("Form", "Dashboard Chart", this.chart_doc.name);
 				},
 			},
@@ -502,6 +587,7 @@ export default class ChartWidget extends Widget {
 				label: __("{0} List", [__(this.chart_doc.document_type)]),
 				action: "action-list",
 				handler: () => {
+					frappe.dashboard_utils.suppress_menu_focus_restore();
 					frappe.set_route("List", this.chart_doc.document_type);
 				},
 			});
@@ -510,6 +596,7 @@ export default class ChartWidget extends Widget {
 				label: __("{0} Report", [__(this.chart_doc.report_name)]),
 				action: "action-list",
 				handler: () => {
+					frappe.dashboard_utils.suppress_menu_focus_restore();
 					frappe.set_route("query-report", this.chart_doc.report_name, this.filters);
 				},
 			});
@@ -596,8 +683,7 @@ export default class ChartWidget extends Widget {
 			primary_action_label: __("Set"),
 		});
 
-		// Bound to `hidden.bs.modal` rather than the dialog's `onhide`: the Desk's global
-		// Escape handler blurs the active element while the dialog is still hiding.
+		// Restores focus on `hidden.bs.modal`, once the dialog has finished hiding (RD-2).
 		dialog.$wrapper.on("hidden.bs.modal", () =>
 			this.restore_focus_to_filter_button(dialog.$wrapper)
 		);
@@ -625,16 +711,38 @@ export default class ChartWidget extends Widget {
 		this.save_chart_config_for_user(null, 1);
 	}
 
+	/**
+	 * Merges the given settings into this widget's settings and persists them for this user.
+	 *
+	 * The settings sent are a snapshot taken when the write is queued, and one write per widget
+	 * is in flight at a time: each call waits for the previous one to settle before its request
+	 * is sent, leaving this widget's writes in the order the calls were made. The returned
+	 * promise resolves once this write has settled and never rejects; a failed request is
+	 * reported to the user by the request layer.
+	 *
+	 * @param {Object|null} config Settings to merge, or null to send the settings as they are.
+	 * @param {number} [reset] 1 clears this chart's stored settings, 0 stores them.
+	 * @returns {Promise} Resolves when this write has settled.
+	 */
 	save_chart_config_for_user(config, reset = 0) {
 		this.chart_settings = Object.assign({}, this.chart_settings, config);
-		frappe.xcall(
-			"frappe.desk.doctype.dashboard_settings.dashboard_settings.save_chart_config",
-			{
-				reset: reset,
-				config: this.chart_settings,
-				chart_name: this.chart_doc.chart_name,
-			}
-		);
+
+		const args = {
+			reset: reset,
+			config: this.clone_value(this.chart_settings),
+			chart_name: this.chart_doc.chart_name,
+		};
+
+		const send = () =>
+			frappe.xcall(
+				"frappe.desk.doctype.dashboard_settings.dashboard_settings.save_chart_config",
+				args
+			);
+
+		const pending = this.chart_config_save || Promise.resolve();
+		this.chart_config_save = pending.then(send).catch(() => null);
+
+		return this.chart_config_save;
 	}
 
 	create_filter_group_and_add_filters() {
@@ -691,9 +799,8 @@ export default class ChartWidget extends Widget {
 	}
 
 	/**
-	 * Returns focus to this widget's filter button after the dialog or filter popover it opened
-	 * has closed, so the keyboard is not dropped on `body`. Focus that the closing control moved
-	 * somewhere else on purpose is left where it is.
+	 * Focuses this widget's filter button once the dialog or filter popover it opened has closed,
+	 * and only while focus is on `body`, inside the closed container, or nowhere (RD-2, RD-5).
 	 *
 	 * @param {Object} [$closed] jQuery object wrapping the container that just closed.
 	 */
@@ -711,8 +818,7 @@ export default class ChartWidget extends Widget {
 		}
 	}
 
-	// True while the keyboard sits on one of this widget's controls, which a chart action that
-	// rebuilds the control row would otherwise drop.
+	// True while the keyboard sits on one of this widget's action-area controls (RB-6).
 	action_area_holds_focus() {
 		const focused = document.activeElement;
 		const area = this.action_area && this.action_area[0];
@@ -772,7 +878,10 @@ export default class ChartWidget extends Widget {
 		focus_lost && this.focus_control(selector);
 	}
 
-	fetch(filters, refresh = false, args) {
+	// Requests this chart's data. `request_sequence` tags the request: a response, successful or
+	// failed, reaches the widget only while it is still this widget's latest request (RB-2). Callers
+	// that pass no sequence are tagged with the current one.
+	fetch(filters, refresh = false, args, request_sequence) {
 		let method = this.settings.method;
 
 		if (this.chart_doc.chart_type == "Report") {
@@ -794,26 +903,33 @@ export default class ChartWidget extends Widget {
 			};
 		}
 
-		this.last_fetch_response = null;
+		const sequence = request_sequence === undefined ? this.fetch_sequence : request_sequence;
+		let fetch_response = null;
 
 		return frappe.xcall(method, args, undefined, {
 			silent: true,
 			// The request layer hands this the parsed response body for both outcomes, and hands
-			// the error callback below nothing at all on 401/403/404/413/500/502/504/508.
+			// the error callback below nothing at all on 401/403/404/413/500/502/504/508. It runs
+			// before that callback for the same request, which reads what it captured here.
 			always: (response) => {
-				this.last_fetch_response = response;
+				fetch_response = response;
 			},
 			error: (err) => {
-				this.show_error_state(this.get_fetch_error_message(err));
+				// a superseded request and a disconnected widget leave the rendered chart alone
+				if (sequence !== this.fetch_sequence || this.widget_disconnected()) {
+					return;
+				}
+
+				this.show_error_state(this.get_fetch_error_message(err, fetch_response));
 			},
 		});
 	}
 
 	// Reads a displayable message out of whatever the request layer has: the argument passed to
-	// the error callback (a parsed response, a jqXHR, or nothing), then the response body of this
-	// request, and finally a generic message.
-	get_fetch_error_message(err) {
-		const responses = [err, err && err.responseJSON, this.last_fetch_response].filter(
+	// the error callback (a parsed response, a jqXHR, or nothing), then `fetch_response`, the
+	// response body captured for that same request, and finally a generic message.
+	get_fetch_error_message(err, fetch_response = null) {
+		const responses = [err, err && err.responseJSON, fetch_response].filter(
 			(response) => response && typeof response === "object"
 		);
 
@@ -891,8 +1007,8 @@ export default class ChartWidget extends Widget {
 		this.fetch_and_update_chart();
 	}
 
-	// Returns the keyboard to the chart's action menu after a retry that started from the keyboard
-	// or the mouse inside this widget, which hiding the Retry button would otherwise drop on body.
+	// Moves the keyboard to a rendered, visible element of this widget after a retry that started
+	// inside it, and only while focus has been dropped (RC-3).
 	restore_focus_after_retry() {
 		if (!this.retry_focus_pending) {
 			return;
@@ -900,11 +1016,88 @@ export default class ChartWidget extends Widget {
 
 		this.retry_focus_pending = false;
 
-		const $menu = this.chart_actions && this.chart_actions.find(".chart-menu");
-
-		if ($menu && $menu.length) {
-			$menu.trigger("focus");
+		if (!this.retry_focus_dropped()) {
+			return;
 		}
+
+		const $target = this.get_retry_focus_target();
+
+		if (!$target) {
+			return;
+		}
+
+		if (!$target.is("button, a[href], input, select, textarea, [tabindex]")) {
+			$target.attr("tabindex", "-1");
+		}
+
+		$target.trigger("focus");
+	}
+
+	// True while the keyboard sits on the document itself, or on an element of this widget that is
+	// no longer in the document or no longer visible.
+	retry_focus_dropped() {
+		const focused = document.activeElement;
+
+		if (
+			!focused ||
+			focused === document.body ||
+			focused === document.documentElement ||
+			!focused.isConnected
+		) {
+			return true;
+		}
+
+		return this.widget_holds_focus() && !$(focused).is(":visible");
+	}
+
+	/**
+	 * The first connected and visible element of this widget that can take the keyboard once the
+	 * Retry control is hidden: its action menu, the plot area, the "No Data" container, then the
+	 * widget itself (RC-3).
+	 *
+	 * @returns {Object|null} jQuery object wrapping the focus target, or null when the widget
+	 * itself is no longer rendered.
+	 */
+	get_retry_focus_target() {
+		const candidates = [
+			this.chart_actions && this.chart_actions.find("button.chart-menu"),
+			this.chart_wrapper,
+			this.empty,
+			this.widget,
+		];
+
+		for (const $candidate of candidates) {
+			const node = $candidate && $candidate.length ? $candidate[0] : null;
+
+			if (node && node.isConnected && $(node).is(":visible")) {
+				return $(node);
+			}
+		}
+
+		return null;
+	}
+
+	// True once this widget has been deleted, and once its element has left the document after
+	// having been in it. False for a widget whose element has not been inserted yet: a chart built
+	// inside a detached container renders and binds its watchers as usual.
+	widget_disconnected() {
+		if (this.deleted) {
+			return true;
+		}
+
+		const element = this.widget && this.widget[0];
+
+		if (!element) {
+			return false;
+		}
+
+		if (element.isConnected) {
+			this.widget_was_connected = true;
+
+			return false;
+		}
+
+		return Boolean(this.widget_was_connected);
 	}
 
 	// True while the keyboard sits on one of this widget's own elements.
@@ -927,17 +1120,36 @@ export default class ChartWidget extends Widget {
 	}
 
 	async render() {
+		// a deleted widget, and one whose element has left the document, draw nothing
+		if (this.widget_disconnected()) {
+			return;
+		}
+
+		const render_sequence = (this.render_sequence = (this.render_sequence || 0) + 1);
+
+		// True while this render is still this widget's latest and the widget is still in the
+		// document: false for a render resumed after a refresh or a delete.
+		const render_is_current = () =>
+			render_sequence === this.render_sequence && !this.widget_disconnected();
+
 		let setup_dashboard_chart = () => {
+			// frappe.model.with_doctype() below resumes this after loading the meta, by which
+			// time a refresh or a delete may have taken the widget it would draw into
+			if (!render_is_current()) {
+				return;
+			}
+
 			const chart_args = this.get_chart_args();
 
 			const is_circular_chart = ["Pie", "Donut", "Percentage"].includes(this.chart_doc.type);
 
 			if (!this.dashboard_chart) {
-				this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
+				this.create_dashboard_chart(chart_args);
 			} else if (is_circular_chart) {
 				this.recreate_chart(chart_args);
 			} else {
 				try {
+					this.apply_axis_label_ratio(this.get_effective_axis_label_ratio());
 					this.dashboard_chart.update(this.data);
 				} catch (error) {
 					console.warn("Chart update failed, redrawing the chart", error);
@@ -947,8 +1159,8 @@ export default class ChartWidget extends Widget {
 
 			this.bind_plot_area_tooltip();
 			this.make_chart_keyboard_accessible();
-			this.watch_chart_value_labels();
 			this.bind_axis_label_resize();
+			this.watch_chart_value_labels();
 		};
 
 		if (!this.data || !this.data.labels || !Object.keys(this.data).length) {
@@ -965,6 +1177,10 @@ export default class ChartWidget extends Widget {
 			this.chart_wrapper.show();
 			this.chart_doc.document_type = await this.get_source_doctype();
 
+			if (!render_is_current()) {
+				return;
+			}
+
 			if (this.chart_doc.document_type) {
 				frappe.model.with_doctype(this.chart_doc.document_type, setup_dashboard_chart);
 			} else {
@@ -980,8 +1196,7 @@ export default class ChartWidget extends Widget {
 	// Draws a new chart from the current arguments in place of the rendered one.
 	recreate_chart(chart_args) {
 		this.chart_wrapper.empty();
-		delete this.dashboard_chart;
-		this.dashboard_chart = frappe.utils.make_chart(this.chart_wrapper[0], chart_args);
+		this.create_dashboard_chart(chart_args);
 	}
 
 	// Makes the whole plot area a tooltip target on charts that print their values over points.
@@ -1025,30 +1240,40 @@ export default class ChartWidget extends Widget {
 		return frappe.utils.get_chart_plot_width(measured);
 	}
 
-	// Axis options that keep the x labels of this widget legible at its current width.
+	// Axis options that keep the x labels of this widget legible at its current width, thinning them
+	// whether or not the width can be measured yet.
 	get_axis_label_options() {
 		if (!["Line", "Bar"].includes(this.chart_doc.type)) {
 			return {};
 		}
 
-		const ratio = frappe.utils.get_axis_label_space_ratio(
-			this.data?.labels,
-			this.get_chart_plot_width(),
-			Boolean(this.chart_doc.timeseries)
+		return Object.assign(
+			{ xIsSeries: 1 },
+			frappe.utils.get_axis_label_options(this.data?.labels, this.get_chart_plot_width())
 		);
-
-		return ratio ? { seriesLabelSpaceRatio: ratio } : {};
 	}
 
-	// Re-applies the x label density of this widget after the window has been resized, and drops the
-	// listener once the widget has left the document.
+	// Re-applies the x label density of this widget on a debounced (200 ms) window resize and on a
+	// resize of its chart wrapper, which covers a width change the window does not report (RA-4).
+	// release_chart_watchers() drops both on refresh, on delete and when the wrapper is replaced,
+	// and a resize that finds the widget gone from the document releases them as well.
 	bind_axis_label_resize() {
-		if (!this.dashboard_chart || this.axis_label_resize_handler) {
+		if (!this.dashboard_chart || this.widget_disconnected()) {
 			return;
 		}
 
+		const wrapper = (this.chart_wrapper && this.chart_wrapper[0]) || null;
+
+		if (this.axis_label_resize_handler) {
+			if (this.axis_label_resize_wrapper === wrapper) {
+				return;
+			}
+
+			this.release_chart_watchers();
+		}
+
 		this.axis_label_resize_handler = frappe.utils.debounce(() => {
-			if (!this.dashboard_chart || !this.widget || !document.body.contains(this.widget[0])) {
+			if (!this.dashboard_chart || !this.widget || this.widget_disconnected()) {
 				this.release_chart_watchers();
 				return;
 			}
@@ -1056,14 +1281,49 @@ export default class ChartWidget extends Widget {
 			this.update_axis_label_density();
 		}, 200);
 
+		this.axis_label_resize_wrapper = wrapper;
 		$(window).on("resize", this.axis_label_resize_handler);
+		this.observe_chart_wrapper_resize(wrapper);
 	}
 
+	// Feeds a width change of `wrapper` into the debounced density handler, which redraws once per
+	// resize storm. A callback that measures the plot width it was observed at — the observer's own
+	// first callback, and every height-only change — redraws nothing.
+	observe_chart_wrapper_resize(wrapper) {
+		if (typeof ResizeObserver !== "function" || !wrapper) {
+			return;
+		}
+
+		this.axis_label_resize_plot_width = this.get_chart_plot_width();
+		this.axis_label_resize_observer = new ResizeObserver(() => {
+			const plot_width = this.get_chart_plot_width();
+
+			if (plot_width === this.axis_label_resize_plot_width) {
+				return;
+			}
+
+			this.axis_label_resize_plot_width = plot_width;
+			this.axis_label_resize_handler && this.axis_label_resize_handler();
+		});
+		this.axis_label_resize_observer.observe(wrapper);
+	}
+
+	// Drops every watcher this widget holds on the rendered chart: the window resize listener with
+	// its pending debounced work, the chart wrapper observer, and the value label observer.
 	release_chart_watchers() {
 		if (this.axis_label_resize_handler) {
 			$(window).off("resize", this.axis_label_resize_handler);
+			this.axis_label_resize_handler.cancel && this.axis_label_resize_handler.cancel();
 			delete this.axis_label_resize_handler;
 		}
+
+		if (this.axis_label_resize_observer) {
+			this.axis_label_resize_observer.disconnect();
+			delete this.axis_label_resize_observer;
+		}
+
+		delete this.axis_label_resize_wrapper;
+		delete this.axis_label_resize_plot_width;
 
 		if (this.value_label_observer) {
 			this.value_label_observer.disconnect();
@@ -1071,21 +1331,84 @@ export default class ChartWidget extends Widget {
 		}
 	}
 
+	// Re-applies the x label density of the rendered chart and redraws it when the density changed.
 	update_axis_label_density() {
-		const chart = this.dashboard_chart;
-		const ratio = this.get_axis_label_options().seriesLabelSpaceRatio;
-
-		if (!chart || !chart.config || !ratio) {
+		if (!this.apply_axis_label_ratio(this.get_effective_axis_label_ratio())) {
 			return;
 		}
 
-		if (chart.config.seriesLabelSpaceRatio === ratio) {
-			return;
-		}
-
-		chart.config.seriesLabelSpaceRatio = ratio;
-		chart.update(this.data);
+		this.dashboard_chart.update(this.data);
 		this.format_chart_value_labels();
+	}
+
+	// The x label density this widget draws with: the ratio configured through custom options, else
+	// the ratio measured for the current width.
+	get_effective_axis_label_ratio() {
+		return (
+			this.get_configured_axis_label_ratio() ||
+			this.get_axis_label_options().seriesLabelSpaceRatio
+		);
+	}
+
+	// The `axisOptions.seriesLabelSpaceRatio` this widget's custom options set, the chart record's
+	// options winning over this instance's, or undefined when neither sets one.
+	get_configured_axis_label_ratio() {
+		const sources = [this.custom_options, this.chart_doc && this.chart_doc.custom_options];
+		let ratio;
+
+		for (const source of sources) {
+			const axis_options = this.parse_custom_options(source).axisOptions;
+
+			if (axis_options && axis_options.seriesLabelSpaceRatio !== undefined) {
+				ratio = axis_options.seriesLabelSpaceRatio;
+			}
+		}
+
+		return ratio;
+	}
+
+	// A custom options value as an object: a JSON string is parsed, an object is taken as it is, and
+	// anything else — a malformed JSON string included — is an empty object.
+	parse_custom_options(options) {
+		if (!options) {
+			return {};
+		}
+
+		if (typeof options === "object") {
+			return options;
+		}
+
+		if (typeof options !== "string") {
+			return {};
+		}
+
+		try {
+			const parsed = JSON.parse(options);
+
+			return parsed && typeof parsed === "object" ? parsed : {};
+		} catch (error) {
+			return {};
+		}
+	}
+
+	// Writes `ratio` to the config frappe-charts reads on every redraw and returns whether that
+	// changed the config. A falsy ratio is written as undefined, the library's unset value.
+	apply_axis_label_ratio(ratio) {
+		const chart = this.dashboard_chart;
+
+		if (!chart || !chart.config) {
+			return false;
+		}
+
+		const value = ratio || undefined;
+
+		if (chart.config.seriesLabelSpaceRatio === value) {
+			return false;
+		}
+
+		chart.config.seriesLabelSpaceRatio = value;
+
+		return true;
 	}
 
 	// Keeps the values printed over points in the number format of the axis ticks, including after
@@ -1114,6 +1437,45 @@ export default class ChartWidget extends Widget {
 		});
 	}
 
+	// The finite number a dataset value holds: the number itself, or the number a non-blank
+	// numeric string spells. A blank string, a boolean, an object, null, undefined, NaN and
+	// Infinity hold no number and return null.
+	chart_value_number(value) {
+		if (typeof value === "number") {
+			return Number.isFinite(value) ? value : null;
+		}
+
+		if (typeof value !== "string" || !value.trim()) {
+			return null;
+		}
+
+		const number = Number(value);
+
+		return Number.isFinite(number) ? number : null;
+	}
+
+	// The running total of `datasets` at each point index, summed over the values that hold a
+	// number. An index no dataset holds a number at carries no total.
+	get_stacked_chart_totals(datasets) {
+		const totals = [];
+
+		datasets.forEach((dataset) => {
+			const values = (dataset && dataset.values) || [];
+
+			values.forEach((value, point_index) => {
+				const number = this.chart_value_number(value);
+
+				if (number === null) {
+					return;
+				}
+
+				totals[point_index] = (totals[point_index] || 0) + number;
+			});
+		});
+
+		return totals;
+	}
+
 	format_chart_value_labels() {
 		const chart = this.dashboard_chart;
 
@@ -1121,16 +1483,23 @@ export default class ChartWidget extends Widget {
 			return;
 		}
 
-		// a stacked bar prints cumulative totals rather than its own dataset values
-		if (chart.barOptions && chart.barOptions.stacked) {
-			return;
-		}
-
 		const datasets = (this.data && this.data.datasets) || [];
+		const stacked = !!(chart.barOptions && chart.barOptions.stacked);
+		// a stacked chart prints the running total of every dataset over its top bar layer
+		const totals = stacked ? this.get_stacked_chart_totals(datasets) : null;
+		const top_layer = datasets.length - 1;
 
 		this.chart_wrapper.find("g.dataset-units").each((_index, layer) => {
-			const dataset = (layer.getAttribute("class") || "").match(/\bdataset-(\d+)\b/);
-			const values = dataset && datasets[cint(dataset[1])]?.values;
+			const layer_class = layer.getAttribute("class") || "";
+			const dataset = layer_class.match(/\bdataset-(\d+)\b/);
+
+			if (!dataset) {
+				return;
+			}
+
+			const cumulative =
+				stacked && cint(dataset[1]) === top_layer && /\bdataset-bars\b/.test(layer_class);
+			const values = cumulative ? totals : datasets[cint(dataset[1])]?.values;
 
 			if (!values) {
 				return;
@@ -1143,9 +1512,9 @@ export default class ChartWidget extends Widget {
 					return;
 				}
 
-				const value = values[cint(point_index)];
+				const value = this.chart_value_number(values[cint(point_index)]);
 
-				if (typeof value !== "number") {
+				if (value === null) {
 					return;
 				}
 
@@ -1232,7 +1601,9 @@ export default class ChartWidget extends Widget {
 				next_index = current_index == null ? 0 : current_index;
 				break;
 			case "Escape":
+				// hides the tooltip and is not passed on to the document (RE-4, RE-10)
 				event.preventDefault();
+				event.stopPropagation();
 				this.hide_plot_area_tooltip();
 				return;
 			default:
@@ -1295,21 +1666,26 @@ export default class ChartWidget extends Widget {
 			return "";
 		}
 
-		const title = strip_html(
-			String(data_point.formattedLabel ?? data_point.label ?? "")
-		).trim();
+		const title = this.get_announcement_text(data_point.formattedLabel ?? data_point.label);
 		const values = (data_point.values || [])
-			.map((dataset_value) => {
-				const value = dataset_value.formatted ?? dataset_value.value;
-				const formatted_value = strip_html(String(value ?? "")).trim();
-				return dataset_value.title
-					? `${dataset_value.title} ${formatted_value}`
-					: formatted_value;
-			})
+			.map((dataset_value) =>
+				[
+					this.get_announcement_text(dataset_value.title),
+					this.get_announcement_text(dataset_value.formatted ?? dataset_value.value),
+				]
+					.filter((text) => text.length)
+					.join(" ")
+			)
 			.filter((text) => text.length)
 			.join(", ");
 
 		return values ? `${title}: ${values}` : title;
+	}
+
+	// One fragment of the tooltip as plain text: markup removed, and the HTML entities
+	// frappe-charts stores in `dataByIndex` decoded to the characters they stand for (RE-11).
+	get_announcement_text(value) {
+		return frappe.utils.unescape_html(strip_html(String(value ?? ""))).trim();
 	}
 
 	get_chart_args() {
