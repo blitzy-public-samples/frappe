@@ -15,8 +15,33 @@ FOLDER_NAME = "dashboard_chart_source"
 
 @frappe.whitelist()
 def get_config(name: str) -> str:
+	if not has_config_permission(name):
+		frappe.throw(
+			_("Not permitted to read the configuration of this Dashboard Chart Source"),
+			frappe.PermissionError,
+		)
+
 	doc: DashboardChartSource = frappe.get_doc("Dashboard Chart Source", name)
 	return doc.read_config()
+
+
+def has_config_permission(name: str, user: str | None = None) -> bool:
+	"""Return whether `user` may read the client config of a dashboard chart source.
+
+	Access is granted by read permission on Dashboard Chart Source, or by read permission on
+	at least one Dashboard Chart that renders through this source.
+	"""
+	if frappe.has_permission("Dashboard Chart Source", "read", user=user):
+		return True
+
+	for chart in frappe.get_all("Dashboard Chart", filters={"source": name}, pluck="name"):
+		try:
+			if frappe.has_permission("Dashboard Chart", doc=chart, user=user):
+				return True
+		except frappe.DoesNotExistError:
+			frappe.clear_last_message()
+
+	return False
 
 
 class DashboardChartSource(Document):

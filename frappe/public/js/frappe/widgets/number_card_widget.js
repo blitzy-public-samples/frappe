@@ -23,7 +23,8 @@ export default class NumberCardWidget extends Widget {
 	}
 
 	set_body() {
-		this.widget.addClass("number-widget-box");
+		// widget-shadow carries the tile's hover elevation
+		this.widget.addClass("number-widget-box widget-shadow");
 		this.make_card();
 	}
 
@@ -67,6 +68,123 @@ export default class NumberCardWidget extends Widget {
 			if (this.in_customize_mode) return;
 			this.set_route();
 		});
+
+		this.update_tile_operability();
+	}
+
+	/**
+	 * Switches the widget into customize mode and updates the tile's interactive semantics,
+	 * which a customize-mode tile does not carry.
+	 */
+	customize(options) {
+		super.customize(options);
+		this.update_tile_operability();
+	}
+
+	/**
+	 * Brings the tile's interactive semantics in line with the widget's current state: a tile
+	 * that resolves to a destination is operable, and a tile in customize mode or with no
+	 * destination is not.
+	 *
+	 * Runs on every render, on entry to customize mode, and again once `get_data()` has
+	 * resolved, at which point a Custom card's route is known.
+	 */
+	update_tile_operability() {
+		const action_name = this.in_customize_mode ? null : this.get_tile_action_name();
+
+		if (action_name) {
+			this.make_tile_operable(action_name);
+		} else {
+			this.make_tile_inoperable();
+		}
+	}
+
+	/**
+	 * Returns the accessible name of the tile's action - the card's title followed by the
+	 * destination activating the tile navigates to - or null when the card resolves to no
+	 * destination: a card whose document is still loading, a Report card without a report, a
+	 * Document Type card without a document type, or a Custom card whose data carries no route.
+	 *
+	 * The destination is the document type's list view, or the document itself for a Single
+	 * document type, or the card's report, or the page a Custom card's route points at.
+	 */
+	get_tile_action_name() {
+		if (!this.card_doc) return null;
+
+		const tile_label = __(this.title || this.label || this.name);
+		const card_type = this.card_doc.type || "Document Type";
+
+		if (card_type === "Custom") {
+			const destination = this.get_custom_route_label();
+			return destination ? __("{0}: open {1}", [tile_label, destination]) : null;
+		}
+
+		if (card_type === "Report") {
+			if (!this.card_doc.report_name) return null;
+
+			return __("{0}: open the {1} report", [tile_label, __(this.card_doc.report_name)]);
+		}
+
+		const document_type = this.card_doc.document_type;
+		if (!document_type) return null;
+
+		if (frappe.model.is_single(document_type)) {
+			return __("{0}: open {1}", [tile_label, __(document_type)]);
+		}
+
+		return __("{0}: open the {1} list", [tile_label, __(document_type)]);
+	}
+
+	/**
+	 * Returns the name of the destination a Custom card routes to, taken from the last
+	 * meaningful segment of `data.route` with the desk prefix and any query string dropped, or
+	 * an empty string when the card's data carries no route.
+	 */
+	get_custom_route_label() {
+		const route = this.data?.route;
+		if (!route) return "";
+
+		const segments = (Array.isArray(route) ? route : String(route).split("/"))
+			.map((segment) => String(segment).split(/[?#]/)[0].trim())
+			.filter((segment) => segment && !["app", "desk"].includes(segment.toLowerCase()));
+
+		return segments.length ? __(segments[segments.length - 1]) : "";
+	}
+
+	/**
+	 * Makes the tile itself keyboard-operable: it carries a link role, the accessible name of
+	 * its action and a tab stop, and Enter or Space performs the same navigation as a click on
+	 * the tile body.
+	 *
+	 * The keydown binding is namespaced and rebound on every render, and it handles only
+	 * events whose target is the tile element - keys pressed on the card actions dropdown
+	 * nested inside the tile are left to that control.
+	 */
+	make_tile_operable(action_name) {
+		this.widget.attr({
+			role: "link",
+			tabindex: 0,
+			"aria-label": action_name,
+		});
+
+		this.widget.off("keydown.number_card").on("keydown.number_card", (e) => {
+			if (e.target !== this.widget[0]) return;
+			if (this.in_customize_mode) return;
+			if (!["Enter", " ", "Spacebar"].includes(e.key)) return;
+
+			e.preventDefault();
+			this.set_route();
+		});
+	}
+
+	/**
+	 * Takes the tile's interactive semantics back off: the link role, the tab stop, the
+	 * accessible action name and the tile key handler all go, leaving a plain container that
+	 * is neither a tab stop nor announced as a control.
+	 */
+	make_tile_inoperable() {
+		this.widget.removeAttr("role tabindex aria-label");
+		this.widget.off("keydown.number_card");
 	}
 
 	set_route() {
@@ -167,7 +285,11 @@ export default class NumberCardWidget extends Widget {
 	}
 
 	async render_card() {
+		// The control the keyboard sits on is remembered by selector before the action area is
+		// rebuilt and re-matched in the rebuilt one (PR Description decision RD-12).
+		this.pending_focus_control = this.pending_focus_control || this.get_focused_control();
 		this.prepare_actions();
+		this.restore_rebuilt_control_focus();
 		this.set_title();
 		this.card_doc?.background_color &&
 			this.widget.css("background-color", this.card_doc.background_color);
@@ -182,6 +304,7 @@ export default class NumberCardWidget extends Widget {
 
 		this.render_number();
 		this.render_stats();
+		this.update_tile_operability();
 	}
 
 	set_loading_state() {
@@ -358,6 +481,9 @@ export default class NumberCardWidget extends Widget {
 				label: __("Refresh"),
 				action: "action-refresh",
 				handler: () => {
+					// The rebuild this command triggers returns the keyboard to the rebuilt
+					// card actions toggle (PR Description decision RD-12).
+					this.pending_focus_control = ".card-menu";
 					this.render_card();
 				},
 			},
@@ -366,6 +492,7 @@ export default class NumberCardWidget extends Widget {
 				action: "action-edit",
 				handler: () => {
 					let number_card = this.number_card_name || this.name;
+					frappe.dashboard_utils.suppress_menu_focus_restore();
 					frappe.set_route("Form", "Number Card", number_card);
 				},
 			},
@@ -376,15 +503,18 @@ export default class NumberCardWidget extends Widget {
 
 	set_card_actions(actions) {
 		this.card_actions = $(`<div class="card-actions dropdown pull-right">
-				<a data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+				<button type="button" class="btn btn-xs card-menu" data-toggle="dropdown"
+					tabindex="0" aria-haspopup="true" aria-expanded="false"
+					aria-label="${__("Card Actions")}" title="${__("Card Actions")}">
 				...
-				</a>
-				<ul class="dropdown-menu" style="max-height: 300px; overflow-y: auto;">
+				</button>
+				<ul class="dropdown-menu" role="menu" style="max-height: 300px; overflow-y: auto;">
 					${actions
 						.map(
 							(action) =>
-								`<li class="dropdown-item">
-									<a data-action="${action.action}">${action.label}</a>
+								`<li role="none">
+									<a class="dropdown-item" role="menuitem" tabindex="-1"
+										data-action="${action.action}">${action.label}</a>
 								</li>`
 						)
 						.join("")}
@@ -396,6 +526,88 @@ export default class NumberCardWidget extends Widget {
 			$(o).click(actions.find((a) => a.action === action));
 		});
 
+		frappe.dashboard_utils.make_dropdown_keyboard_operable(this.card_actions);
+
 		this.action_area.html(this.card_actions);
+	}
+
+	/**
+	 * True while the keyboard sits on one of this widget's action-area controls.
+	 *
+	 * See PR Description decision RD-12.
+	 */
+	action_area_holds_focus() {
+		const focused = document.activeElement;
+		const area = this.action_area && this.action_area[0];
+
+		return Boolean(focused && area && area.contains(focused));
+	}
+
+	/**
+	 * The selector of the control in this widget's action area that holds the keyboard - the
+	 * card actions toggle, the one control that area renders - or null while the keyboard sits
+	 * anywhere else. `restore_rebuilt_control_focus()` matches the selector again in the
+	 * rebuilt action area.
+	 *
+	 * See PR Description decision RD-12.
+	 */
+	get_focused_control() {
+		return this.action_area_holds_focus() ? ".card-menu" : null;
+	}
+
+	/**
+	 * Focuses the control `selector` matches in this widget's action area. An empty selector,
+	 * and a selector the area holds no match for - the card actions toggle of a card in
+	 * customize mode, which renders no menu - leave focus untouched.
+	 *
+	 * @param {string} [selector] CSS selector of the control, e.g. `".card-menu"`.
+	 */
+	focus_control(selector) {
+		const area = this.action_area;
+
+		if (!selector || !area) {
+			return;
+		}
+
+		const $control = area.find(selector).first();
+		$control.length && $control.trigger("focus");
+	}
+
+	/**
+	 * Returns the keyboard to the control recorded in `pending_focus_control` once this
+	 * widget's action area has been rebuilt, and clears the record, so a later render restores
+	 * nothing of its own accord.
+	 *
+	 * Focus that the rebuild's command placed on a connected element outside this widget - a
+	 * dialog, another widget, a new route - is left where it was put. Focus on `body`, on the
+	 * document element, on an element the rebuild detached, or nowhere at all counts as
+	 * unplaced and is returned to the recorded control.
+	 *
+	 * See PR Description decisions RD-11 and RD-12.
+	 */
+	restore_rebuilt_control_focus() {
+		const selector = this.pending_focus_control;
+		this.pending_focus_control = null;
+
+		if (!selector) {
+			return;
+		}
+
+		const focused = document.activeElement;
+		const widget = this.widget && this.widget[0];
+		const placed_outside_widget = Boolean(
+			focused &&
+				focused !== document.body &&
+				focused !== document.documentElement &&
+				focused.isConnected &&
+				widget &&
+				!widget.contains(focused)
+		);
+
+		if (placed_outside_widget) {
+			return;
+		}
+
+		this.focus_control(selector);
 	}
 }

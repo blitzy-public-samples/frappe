@@ -196,6 +196,18 @@ frappe.ui.FilterGroup = class {
 		}
 	}
 
+	/**
+	 * True while `fieldname` is a filterable field of `doctype`, false while it names no field
+	 * of it.
+	 *
+	 * A rejected fieldname is reported to the user in a message, unless this group was built
+	 * with `report_invalid_filters: false`, in which case it is rejected without a message and
+	 * the owner of the group reports the condition itself.
+	 *
+	 * @param {string} doctype The DocType the filter reads.
+	 * @param {string} fieldname The field the filter reads.
+	 * @returns {boolean} True for a filterable field, false for a field that does not exist.
+	 */
 	validate_args(doctype, fieldname) {
 		if (
 			doctype &&
@@ -203,10 +215,12 @@ frappe.ui.FilterGroup = class {
 			!frappe.meta.has_field(doctype, fieldname) &&
 			frappe.model.is_non_std_field(fieldname)
 		) {
-			frappe.msgprint({
-				message: __("Invalid filter: {0}", [fieldname.bold()]),
-				indicator: "red",
-			});
+			if (this.report_invalid_filters !== false) {
+				frappe.msgprint({
+					message: __("Invalid filter: {0}", [fieldname.bold()]),
+					indicator: "red",
+				});
+			}
 
 			return false;
 		}

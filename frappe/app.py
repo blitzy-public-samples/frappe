@@ -4,7 +4,9 @@
 import functools
 import logging
 import os
+import re
 import sys
+from urllib.parse import urlsplit
 
 import orjson
 from werkzeug.exceptions import HTTPException, NotFound
@@ -209,6 +211,10 @@ def init_request(request):
 	if request.method != "OPTIONS":
 		frappe.local.http_request = HTTPRequest()
 
+		# a CSRF rejection deferred to explicit authentication is settled before any hook runs
+		if frappe.flags.deferred_csrf_rejection:
+			validate_auth()
+
 	for before_request_task in frappe.get_hooks("before_request"):
 		frappe.call(before_request_task)
 
@@ -250,6 +256,57 @@ def log_request(request, response):
 
 NO_CACHE_HEADERS = {"Cache-Control": "no-store,no-cache,must-revalidate,max-age=0"}
 
+# Baseline security response headers applied to every dynamic response.
+DEFAULT_X_FRAME_OPTIONS = "SAMEORIGIN"
+DEFAULT_X_CONTENT_TYPE_OPTIONS = "nosniff"
+DEFAULT_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
+# Origins besides the site's own that shipped framework code loads executable script from.
+SCRIPT_SOURCE_ORIGINS = (
+	"https://accounts.google.com",
+	"https://apis.google.com",
+	"https://cdn.crowdin.com",
+	"https://chat.frappe.cloud",
+	"https://pulse.m.frappe.cloud",
+	"https://www.google-analytics.com",
+	"https://www.youtube.com",
+)
+
+# Origins besides the site's own that shipped framework code loads stylesheets from.
+STYLE_SOURCE_ORIGINS = ("https://fonts.googleapis.com",)
+
+# Site config keys holding the base URL of the Cloud Settings embed bundle, in precedence order.
+CLOUD_SETTINGS_EMBED_CONFIG_KEYS = ("cloud_settings_embed_url", "pilot_endpoint")
+
+DEFAULT_CONTENT_SECURITY_POLICY = (
+	"default-src 'self'; "
+	f"script-src 'self' 'unsafe-inline' 'unsafe-eval' {' '.join(SCRIPT_SOURCE_ORIGINS)}; "
+	f"style-src 'self' 'unsafe-inline' {' '.join(STYLE_SOURCE_ORIGINS)}; "
+	"img-src 'self' data: blob: https:; "
+	"font-src 'self' data: https:; "
+	"connect-src 'self' ws: wss: https:; "
+	"frame-src 'self' blob: https:; "
+	"media-src 'self' data: blob: https:; "
+	"worker-src 'self' blob:; "
+	"object-src 'none'; "
+	"base-uri 'self'; "
+	"frame-ancestors 'self'"
+)
+
+# Ports a URL scheme implies when a CSP host source omits one.
+DEFAULT_SCHEME_PORTS = {"http": "80", "https": "443", "ws": "80", "wss": "443"}
+
+# Site config key -> (header name, default value). An empty configured value omits the header.
+SECURITY_HEADER_CONFIG_KEYS = {
+	"x_frame_options": ("X-Frame-Options", DEFAULT_X_FRAME_OPTIONS),
+	"content_security_policy": ("Content-Security-Policy", DEFAULT_CONTENT_SECURITY_POLICY),
+	"x_content_type_options": ("X-Content-Type-Options", DEFAULT_X_CONTENT_TYPE_OPTIONS),
+	"referrer_policy": ("Referrer-Policy", DEFAULT_REFERRER_POLICY),
+}
+
+# A header value the WSGI layer can send: one line of printable ASCII, horizontal tab included.
+HEADER_VALUE_PATTERN = re.compile(r"[\t\x20-\x7e]*")
+
 
 def process_response(response: Response):
 	if not response:
@@ -271,6 +328,9 @@ def process_response(response: Response):
 
 	if response.status_code in (401, 403) and is_oauth_metadata_enabled("resource"):
 		set_authenticate_headers(response)
+
+	# Security headers, applied before the per-request headers are merged
+	set_security_headers(response)
 
 	# Update custom headers added during request processing
 	response.headers.update(frappe.local.response_headers)
@@ -319,6 +379,282 @@ def set_cors_headers(response):
 			cors_headers["Access-Control-Max-Age"] = "86400"
 
 	response.headers.update(cors_headers)
+
+
+def set_security_headers(response: Response):
+	"""Add the baseline security headers to `response`.
+
+	Each header is added with `setdefault`, so a header already set on the response - e.g. the
+	`frame-ancestors` Content-Security-Policy a Web Form with allowed embedding domains sets - is
+	kept as it is. Every header can be overridden per site through the site config keys in
+	`SECURITY_HEADER_CONFIG_KEYS`; an empty or null configured value omits that header, a configured
+	value that cannot be sent as a header is replaced by the default (decision RJ-14), and
+	`disable_security_headers` omits all of them. `X-Frame-Options` is omitted while the policy the
+	client receives allows framing by another origin, whichever layer sets that policy - the
+	per-request headers, the response, or this baseline (decision RJ-13).
+
+	    # site_config.json
+	    {"referrer_policy": "same-origin", "x_frame_options": "DENY"}
+	"""
+	conf = getattr(frappe.local, "conf", None) or {}
+
+	if cint(conf.get("disable_security_headers")):
+		return
+
+	explicit_csp = explicit_content_security_policy(response)
+	baseline_csp = baseline_content_security_policy(conf)
+	effective_csp = baseline_csp if explicit_csp is None else explicit_csp
+
+	for config_key, (header, default) in SECURITY_HEADER_CONFIG_KEYS.items():
+		if header == "Content-Security-Policy":
+			if explicit_csp:
+				continue
+
+			value = baseline_csp
+		else:
+			value = configured_header_value(conf, config_key, default)
+
+			if header == "X-Frame-Options" and frame_ancestors_allow_other_hosts(effective_csp):
+				continue
+
+		if not value:
+			continue
+
+		response.headers.setdefault(header, value)
+
+
+def configured_header_value(conf: dict, config_key: str, default: str) -> str:
+	"""Return the value the site config contributes to one baseline header.
+
+	A key the site does not set takes `default`. A key set to a null or empty value - empty once
+	surrounding whitespace is dropped included - resolves to an empty string, which omits the
+	header. A value that is not a single-line printable-ASCII header value is logged against
+	`config_key` and replaced by `default` (decision RJ-14).
+	"""
+	if config_key not in conf:
+		return default
+
+	configured = conf[config_key]
+
+	if not configured:
+		return ""
+
+	value = str(configured).strip()
+
+	if not HEADER_VALUE_PATTERN.fullmatch(value):
+		log_unsendable_header_value(config_key)
+		return default
+
+	return value
+
+
+def log_unsendable_header_value(config_key: str):
+	"""Report that the site config value of `config_key` cannot be sent as a header value.
+
+	The report is written to the site's `frappe.web` log, and to the process logger when that log
+	cannot be opened, so that reporting it never fails the response (decision RJ-14).
+	"""
+	message = (
+		f"Ignoring site config '{config_key}': a response header value must be a single line of "
+		"printable ASCII. Sending the framework default for this header instead."
+	)
+
+	try:
+		frappe.logger("frappe.web").error(message)
+	except Exception:
+		logging.getLogger("frappe.web").error(message)
+
+
+def baseline_content_security_policy(conf: dict) -> str:
+	"""Return the Content-Security-Policy this baseline emits, or an empty string when it emits none.
+
+	The value is the site's configured `content_security_policy`, and the framework default when the
+	site configures none or configures one that cannot be sent as a header. The site's Cloud Settings
+	embed origin is added to the framework default only (decision RJ-12); the development server's
+	socket.io origin is added to either (decision RJ-7).
+	"""
+	policy = configured_header_value(conf, "content_security_policy", DEFAULT_CONTENT_SECURITY_POLICY)
+
+	if not policy:
+		return ""
+
+	if policy == DEFAULT_CONTENT_SECURITY_POLICY:
+		policy = add_cloud_settings_source(policy)
+
+	return add_dev_socketio_source(policy)
+
+
+def explicit_content_security_policy(response: Response) -> str | None:
+	"""Return the Content-Security-Policy set for this response outside the baseline, else None.
+
+	A value in `frappe.local.response_headers` takes precedence over one already on the response,
+	which is the order `process_response` merges them in; a key present there with an empty value
+	resolves to that empty value.
+	"""
+	request_headers = getattr(frappe.local, "response_headers", None) or {}
+
+	if "Content-Security-Policy" in request_headers:
+		return request_headers["Content-Security-Policy"]
+
+	return response.headers.get("Content-Security-Policy")
+
+
+def frame_ancestors_allow_other_hosts(policy: str) -> bool:
+	"""Return whether `policy`'s frame-ancestors directive can match an origin other than this request's."""
+	for directive in policy.split(";"):
+		sources = directive.split()
+		if sources and sources[0].lower() == "frame-ancestors":
+			return any(is_other_origin_source(source) for source in sources[1:])
+
+	return False
+
+
+def is_other_origin_source(source: str) -> bool:
+	"""Return whether CSP `source` can match an origin other than the one serving this request.
+
+	`'self'` and `'none'` cannot. A wildcard, a scheme-only source, or a host source naming
+	another scheme, host or port can; a host source spelling out the current origin cannot. A
+	source resolved outside a request is reported as another origin.
+	"""
+	token = source.strip("'\"").lower()
+
+	if token in ("self", "none"):
+		return False
+
+	if "*" in token or (token.endswith(":") and "//" not in token):
+		return True
+
+	request = getattr(frappe.local, "request", None)
+	if not request:
+		return True
+
+	scheme, separator, authority = token.partition("://")
+	if not separator:
+		scheme, authority = request.scheme, token
+
+	authority = authority.split("/")[0]
+
+	if not authority:
+		return True
+
+	return normalized_origin(scheme, authority) != normalized_origin(request.scheme, request.host)
+
+
+def normalized_origin(scheme: str, host: str) -> tuple[str, str, str]:
+	"""Return (scheme, hostname, port) for `scheme` and `host`, with the scheme's default port filled in."""
+	scheme = scheme.lower()
+
+	if host.startswith("["):
+		hostname, _, port = host.partition("]")
+		hostname, port = f"{hostname}]", port.lstrip(":")
+	else:
+		hostname, _, port = host.partition(":")
+
+	return scheme, hostname.lower(), port or DEFAULT_SCHEME_PORTS.get(scheme, "")
+
+
+def add_cloud_settings_source(policy: str) -> str:
+	"""Return `policy` with the site's configured Cloud Settings embed origin allowed for scripts.
+
+	Desk loads that bundle from the URL `frappe.integrations.frappe_providers.cloud_settings` builds
+	out of the first configured key in `CLOUD_SETTINGS_EMBED_CONFIG_KEYS`, so its origin is per-site
+	configuration rather than a fixed source. The origin is appended to `script-src` when the site
+	configures one; a site with no such key, a base URL that names no http(s) origin, a policy with no
+	`script-src` directive, and a directive already carrying the origin are all returned unchanged.
+
+	    # site_config.json
+	    {"pilot_endpoint": "https://pilot.example.com"}
+	"""
+	conf = getattr(frappe.local, "conf", None) or {}
+	base = next((conf.get(key) for key in CLOUD_SETTINGS_EMBED_CONFIG_KEYS if conf.get(key)), None)
+
+	if not base:
+		return policy
+
+	source = origin_of(str(base))
+
+	if not source:
+		return policy
+
+	directives = [directive.strip() for directive in policy.split(";") if directive.strip()]
+
+	for index, directive in enumerate(directives):
+		sources = directive.split()
+
+		if sources[0].lower() == "script-src":
+			if source in sources[1:]:
+				return policy
+
+			directives[index] = f"{directive} {source}"
+			return "; ".join(directives)
+
+	return policy
+
+
+def origin_of(url: str) -> str | None:
+	"""Return `url`'s `<scheme>://<host>[:<port>]` origin, or None when it names no http(s) origin."""
+	parts = urlsplit(url)
+
+	if parts.scheme not in ("http", "https"):
+		return None
+
+	try:
+		hostname, port = parts.hostname, parts.port
+	except ValueError:
+		return None
+
+	if not hostname:
+		return None
+
+	# an IPv6 literal is bracketed in an origin
+	host = f"[{hostname}]" if ":" in hostname else hostname
+
+	return f"{parts.scheme}://{host}:{port}" if port else f"{parts.scheme}://{host}"
+
+
+def add_dev_socketio_source(policy: str) -> str:
+	"""Return `policy` with the development server's socketio origin allowed for connections.
+
+	The origin is appended to `connect-src` when that directive is present, and otherwise to a
+	`connect-src` synthesized from `default-src`'s sources. A policy that restricts neither
+	directive, a policy that already lists the origin, and any policy resolved outside the
+	development server are returned unchanged.
+	"""
+	if not frappe._dev_server:
+		return policy
+
+	conf = getattr(frappe.local, "conf", None) or {}
+	socketio_port = conf.get("socketio_port")
+	request = getattr(frappe.local, "request", None)
+
+	if not (socketio_port and request):
+		return policy
+
+	source = f"{request.scheme}://{request.host.split(':')[0]}:{socketio_port}"
+	directives = [directive.strip() for directive in policy.split(";") if directive.strip()]
+	default_sources = None
+
+	for index, directive in enumerate(directives):
+		sources = directive.split()
+		name = sources[0].lower()
+
+		if name == "connect-src":
+			if source in sources[1:]:
+				return policy
+
+			directives[index] = f"{directive} {source}"
+			return "; ".join(directives)
+
+		if name == "default-src":
+			default_sources = sources[1:]
+
+	if default_sources is None:
+		return policy
+
+	fallback = [s for s in default_sources if s.strip("'\"").lower() != "none"]
+	directives.append(" ".join(["connect-src", *fallback, source]))
+
+	return "; ".join(directives)
 
 
 def set_authenticate_headers(response: Response):

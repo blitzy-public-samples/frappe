@@ -1,0 +1,33 @@
+{
+ "cards": [
+  {
+   "card": "ToDo Total Open"
+  },
+  {
+   "card": "ToDo Total Closed"
+  }
+ ],
+ "chart_options": "",
+ "charts": [
+  {
+   "chart": "ToDo Created vs Completed",
+   "width": "Full"
+  },
+  {
+   "chart": "ToDo Top Owners",
+   "width": "Full"
+  }
+ ],
+ "creation": "2026-09-18 12:00:00",
+ "dashboard_name": "ToDo Analytics",
+ "docstatus": 0,
+ "doctype": "Dashboard",
+ "idx": 0,
+ "is_default": 0,
+ "is_standard": 1,
+ "modified": "2026-09-18 12:00:00",
+ "modified_by": "Administrator",
+ "module": "Desk",
+ "name": "ToDo Analytics",
+ "owner": "Administrator"
+}

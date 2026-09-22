@@ -7,7 +7,7 @@ import requests
 
 import frappe
 from frappe.core.doctype.user.user import generate_keys
-from frappe.frappeclient import FrappeClient, FrappeException
+from frappe.frappeclient import CSRF_TOKEN_HEADER, FrappeClient, FrappeException
 from frappe.model import default_fields
 from frappe.tests import IntegrationTestCase
 from frappe.utils.data import get_url
@@ -196,6 +196,21 @@ class TestFrappeClient(IntegrationTestCase):
 		NAME_TO_DELETE = server.insert({"doctype": "Note", "title": "Sing"}).get("name")
 		server.delete("Note", NAME_TO_DELETE)
 		self.assertFalse(frappe.db.get_value("Note", NAME_TO_DELETE))
+
+	def test_client_sends_csrf_token_after_login(self):
+		"""The login response's CSRF token is sent with every request of the cookie session."""
+		server = FrappeClient(get_url(), "Administrator", self.PASSWORD, verify=False)
+
+		csrf_token = server.headers.get(CSRF_TOKEN_HEADER)
+		self.assertIsInstance(csrf_token, str)
+		self.assertTrue(csrf_token)
+
+		# exercise a cookie-session write (RI-5)
+		response = server.insert({"doctype": "Note", "title": "test_client_sends_csrf_token"})
+		self.assertEqual(response.get("title"), "test_client_sends_csrf_token")
+
+		server.logout()
+		self.assertNotIn(CSRF_TOKEN_HEADER, server.headers)
 
 	def test_auth_via_api_key_secret(self):
 		# generate API key and API secret for administrator

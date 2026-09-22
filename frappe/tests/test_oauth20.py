@@ -33,6 +33,10 @@ class FrappeRequestTestCase(IntegrationTestCase):
 
 		return self._sid
 
+	def forget_sid_cookie(self):
+		"""Remove the `sid` cookie from the test client so later requests carry no session cookie."""
+		self.TEST_CLIENT.delete_cookie("sid")
+
 	def get(self, path: str, params: dict | None = None, **kwargs) -> TestResponse:
 		return make_request(
 			target=self.TEST_CLIENT.get, args=(path,), kwargs={"data": params, **kwargs}, site=self.site
@@ -121,6 +125,9 @@ class TestOAuth20(FrappeRequestTestCase):
 		query = parse_qs(resp.request.environ["QUERY_STRING"])
 		auth_code = query.get("code")[0]
 
+		# the OAuth client requests below carry no `sid` cookie
+		self.forget_sid_cookie()
+
 		# Request for bearer token
 		token_response = self.post(
 			"/api/method/frappe.integrations.oauth2.get_token",
@@ -172,6 +179,9 @@ class TestOAuth20(FrappeRequestTestCase):
 		query = parse_qs(resp.request.environ["QUERY_STRING"])
 		auth_code = query.get("code")[0]
 
+		# the OAuth client requests below carry no `sid` cookie
+		self.forget_sid_cookie()
+
 		# Request for bearer token
 		token_response = self.post(
 			"/api/method/frappe.integrations.oauth2.get_token",
@@ -218,6 +228,9 @@ class TestOAuth20(FrappeRequestTestCase):
 		# Get authorization code from redirected URL
 		query = parse_qs(resp.request.environ["QUERY_STRING"])
 		auth_code = query.get("code")[0]
+
+		# the OAuth client requests below carry no `sid` cookie
+		self.forget_sid_cookie()
 
 		# Request for bearer token
 		token_response = self.post(
@@ -337,6 +350,9 @@ class TestOAuth20(FrappeRequestTestCase):
 		# Get authorization code from redirected URL
 		query = parse_qs(resp.request.environ["QUERY_STRING"])
 		auth_code = query.get("code")[0]
+
+		# the OAuth client requests below carry no `sid` cookie
+		self.forget_sid_cookie()
 
 		# Request for bearer token
 		token_response = self.post(

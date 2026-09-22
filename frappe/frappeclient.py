@@ -8,6 +8,8 @@ import json
 import frappe
 from frappe.utils.data import cstr
 
+CSRF_TOKEN_HEADER = "X-Frappe-CSRF-Token"
+
 
 class AuthError(Exception):
 	pass
@@ -71,6 +73,7 @@ class FrappeClient:
 		)
 
 		if r.status_code == 200 and r.json().get("message") in ("Logged In", "No App"):
+			self.set_csrf_token(r.json().get("csrf_token"))
 			return r.json()
 		elif r.status_code == 502:
 			raise SiteUnreachableError
@@ -83,6 +86,13 @@ class FrappeClient:
 				error = r.text
 				print(error)
 			raise AuthError
+
+	def set_csrf_token(self, csrf_token):
+		"""Store a truthy `csrf_token` as `CSRF_TOKEN_HEADER` in `self.headers`, which every
+		subsequent request of this client then sends; a falsy `csrf_token` is ignored (RI-5).
+		"""
+		if csrf_token:
+			self.headers[CSRF_TOKEN_HEADER] = csrf_token
 
 	def setup_key_authentication_headers(self):
 		if self.api_key and self.api_secret:
@@ -106,6 +116,7 @@ class FrappeClient:
 			verify=self.verify,
 			headers=self.headers,
 		)
+		self.headers.pop(CSRF_TOKEN_HEADER, None)
 
 	def get_list(
 		self,

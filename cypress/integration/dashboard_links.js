@@ -23,6 +23,21 @@ context("Dashboard links", () => {
 			});
 	});
 
+	it("writes through cy.insert_doc right after logging in, before any page load", () => {
+		const description = `dashboard-links-csrf-${Date.now()}`;
+
+		// covers the sequence in this spec's before() hook: an API login, then a write with
+		// no page load in between
+		Cypress.session.clearAllSavedSessions();
+		cy.visit("/login");
+		cy.login("Administrator");
+		cy.insert_doc("ToDo", { description }).then((todo) => {
+			expect(todo.name).to.be.a("string");
+			expect(todo.description).to.contain(description);
+			cy.remove_doc("ToDo", todo.name);
+		});
+	});
+
 	it("Adding a new contact, checking for the counter on the dashboard and deleting the created contact", () => {
 		cy.visit("/desk/contact");
 		cy.clear_filters();

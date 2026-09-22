@@ -30,6 +30,92 @@ UNSAFE_HTTP_METHODS = frozenset(("POST", "PUT", "DELETE", "PATCH"))
 assert SAFE_HTTP_METHODS.isdisjoint(UNSAFE_HTTP_METHODS), "a HTTP method cannot be both safe and unsafe"
 MAX_PASSWORD_SIZE = 512
 
+# `Sec-Fetch-Site` values that report an initiator which is not another site.
+SAME_SITE_FETCH_SITES = frozenset(("same-origin", "none"))
+
+# Ports a URL scheme implies when an origin omits one.
+DEFAULT_SCHEME_PORTS = {"http": "80", "https": "443"}
+
+# The request path that authenticates a user and creates their session.
+LOGIN_PATH = "/api/method/login"
+
+# The `Authorization` schemes `validate_auth` authenticates: `bearer` through `validate_oauth`,
+# `basic` and `token` through `validate_auth_via_api_keys`.
+EXPLICIT_AUTH_SCHEMES = frozenset(("basic", "token", "bearer"))
+
+
+def get_authorization_header() -> list[str]:
+	"""Return the `Authorization` request header split on spaces, `[""]` when the header is absent."""
+	return frappe.get_request_header("Authorization", "").split(" ")
+
+
+def has_explicit_credential() -> bool:
+	"""Return whether the request carries an `Authorization` credential in a supported scheme.
+
+	A supported credential is a two-part `Authorization` header whose scheme, compared
+	case-insensitively, is one of `EXPLICIT_AUTH_SCHEMES`. Any other header value - absent, a single
+	part, more than two parts, or an unsupported scheme - is not a supported credential.
+	"""
+	authorization_header = get_authorization_header()
+
+	return len(authorization_header) == 2 and authorization_header[0].lower() in EXPLICIT_AUTH_SCHEMES
+
+
+def reject_csrf_request() -> None:
+	"""Throw `frappe.CSRFTokenError` for the current request, without a traceback."""
+	frappe.flags.disable_traceback = True
+	frappe.throw(_("Invalid Request"), frappe.CSRFTokenError)
+
+
+def get_hostname(url: str | None) -> str:
+	"""Return the lower-cased host of `url` without a leading `www.`, or an empty string.
+
+	Accepts an absolute URL (`https://example.com/x`), an origin (`https://example.com`) and a
+	bare host with an optional port (`example.com:8000`).
+	"""
+	if not url:
+		return ""
+
+	try:
+		hostname = urlparse(url if "//" in url else f"//{url}").hostname or ""
+	except ValueError:
+		return ""
+
+	return hostname.lower().removeprefix("www.")
+
+
+def get_origin(url: str | None, scheme: str = "", port: str = "") -> tuple[str, str, str] | None:
+	"""Return the normalized `(scheme, hostname, port)` of `url`, or `None` when it names no host.
+
+	The hostname is the one `get_hostname` reports. The scheme is the one `url` spells out, lower-cased,
+	and otherwise the `scheme` argument. The port is the one `url` spells out; otherwise the default port
+	of the scheme `url` spells out, so `https://example.com` resolves to port `443` whatever the `port`
+	argument holds; otherwise the `port` argument; otherwise the default port of the resolved scheme.
+	A component that none of those supply is an empty string.
+
+	Accepts the same inputs as `get_hostname` - an absolute URL, an origin and a bare host with an
+	optional port - and reports `None` for a value with no host and for a port outside 0-65535.
+	"""
+	if not (hostname := get_hostname(url)):
+		return None
+
+	try:
+		parsed = urlparse(url if "//" in url else f"//{url}")
+		url_scheme, url_port = parsed.scheme.lower(), parsed.port
+	except ValueError:
+		return None
+
+	resolved_scheme = url_scheme or scheme.lower()
+
+	if url_port is not None:
+		resolved_port = str(url_port)
+	elif url_scheme:
+		resolved_port = DEFAULT_SCHEME_PORTS.get(url_scheme) or port
+	else:
+		resolved_port = port or DEFAULT_SCHEME_PORTS.get(resolved_scheme, "")
+
+	return resolved_scheme, hostname, resolved_port
+
 
 class HTTPRequest:
 	def __init__(self):
@@ -80,25 +166,159 @@ class HTTPRequest:
 		frappe.local.login_manager = LoginManager()
 
 	def validate_csrf_token(self):
+		"""Validate the CSRF token of an unsafe request made on this site's cookie session (RI-4).
+
+		Only an unsafe method on a logged-in user's cookie session is validated (`is_cookie_session`),
+		and the login request (`LOGIN_PATH`) is not validated. Such a request is accepted when it
+		supplies the session's CSRF token; a session that holds no token is accepted only with the
+		same-site evidence `is_allowed_without_csrf_token` reports. A request that is otherwise
+		rejected and carries a supported `Authorization` credential (`is_ambient_cookie_session`) has
+		its rejection deferred to `validate_deferred_csrf_rejection`; any other such request is
+		rejected here with `frappe.CSRFTokenError`.
+		"""
 		if (
 			not frappe.request
 			or frappe.request.method not in UNSAFE_HTTP_METHODS
 			or frappe.conf.ignore_csrf
 			or not frappe.session
-			or not (saved_token := frappe.session.data.csrf_token)
-			or (
-				(frappe.get_request_header("X-Frappe-CSRF-Token") or frappe.form_dict.pop("csrf_token", None))
-				== saved_token
-			)
-			or self.is_allowed_referrer()
 		):
 			return
 
-		frappe.flags.disable_traceback = True
-		frappe.throw(_("Invalid Request"), frappe.CSRFTokenError)
+		supplied_token = frappe.get_request_header("X-Frappe-CSRF-Token") or frappe.form_dict.pop(
+			"csrf_token", None
+		)
+
+		if frappe.request.path == LOGIN_PATH or not self.is_cookie_session():
+			return
+
+		if saved_token := frappe.session.data.csrf_token:
+			if supplied_token == saved_token or self.is_allowed_referrer():
+				return
+		elif self.is_allowed_without_csrf_token():
+			return
+
+		if not self.is_ambient_cookie_session():
+			# rejection deferred to `validate_deferred_csrf_rejection`
+			frappe.flags.deferred_csrf_rejection = True
+			return
+
+		reject_csrf_request()
 
 	def set_lang(self):
 		frappe.local.lang = get_language()
+
+	def is_cookie_session(self) -> bool:
+		"""Return whether this request's session is identified by a logged-in user's `sid` cookie.
+
+		A Guest session, a request that carries no `sid` cookie, and a session identified by an
+		`sid` in the body or query string are all reported as not a cookie session.
+		"""
+		if frappe.session.user == "Guest" or not frappe.request.cookies.get("sid"):
+			return False
+
+		session_obj = getattr(frappe.local, "session_obj", None)
+
+		return not (session_obj and getattr(session_obj, "sid_from_request_parameter", False))
+
+	def is_ambient_cookie_session(self) -> bool:
+		"""Return whether this request is authenticated by a logged-in user's `sid` cookie alone (RI-4).
+
+		Four forms of request are not ambient: a Guest session, a request that carries no `sid`
+		cookie, a session identified by an `sid` in the body or query string, and a request that
+		carries an `Authorization` credential in a scheme `validate_auth` authenticates
+		(`has_explicit_credential`).
+		"""
+		return self.is_cookie_session() and not has_explicit_credential()
+
+	def is_allowed_without_csrf_token(self) -> bool:
+		"""Return whether an unsafe request whose session holds no CSRF token may proceed.
+
+		It may proceed when a request header positively reports this site as the initiator, or
+		when the referrer or origin is allow-listed through the `allowed_referrers` site
+		configuration or named by an explicit `allow_cors` origin list.
+		"""
+		return self.is_same_site_request() or self.is_allowed_referrer() or self.is_allowed_cors_origin()
+
+	def is_same_site_request(self) -> bool:
+		"""Return whether a request header positively reports this site as the initiator.
+
+		`Sec-Fetch-Site` is read first, then `Origin`, then `Referer`. An `Origin` or a `Referer` is
+		held to its own scheme and port: it reports this site only when its normalized
+		`(scheme, hostname, port)` origin is one of `site_origins`, so the same host reached on another
+		scheme or another port is not this site. A request that reports an initiator outside this site,
+		and a request that carries none of the three headers - a non-browser client - are both reported
+		as not same-site.
+		"""
+		fetch_site = frappe.get_request_header("Sec-Fetch-Site")
+		if fetch_site and fetch_site not in SAME_SITE_FETCH_SITES:
+			return False
+
+		for header in ("Origin", "Referer"):
+			if value := frappe.get_request_header(header):
+				return get_origin(value) in self.site_origins
+
+		return bool(fetch_site)
+
+	@property
+	def request_scheme(self) -> str:
+		"""Return the lower-cased scheme this request reached the site on.
+
+		`https` when the `X-Forwarded-Proto` request header reports it, whatever the scheme the
+		application itself was reached on; otherwise `frappe.request.scheme`.
+		"""
+		if frappe.get_request_header("X-Forwarded-Proto", "").lower() == "https":
+			return "https"
+
+		return (frappe.request.scheme or "").lower()
+
+	@property
+	def site_origins(self) -> set[tuple[str, str, str]]:
+		"""Return the `(scheme, hostname, port)` origins this site answers on (RI-12).
+
+		The request's own origin is its `Host` on the scheme `request_scheme` reports. The site name,
+		`host_name` and `hostname` each contribute an origin too, held to any scheme or port they spell
+		out and otherwise taking the scheme and port of the request's own origin. A candidate that
+		names no host contributes nothing.
+		"""
+		if getattr(self, "_site_origins", None) is None:
+			request_origin = get_origin(frappe.request.host, scheme=self.request_scheme)
+			scheme, port = (
+				(request_origin[0], request_origin[2]) if request_origin else (self.request_scheme, "")
+			)
+
+			origins = {
+				origin
+				for candidate in (
+					frappe.local.site,
+					frappe.local.conf.host_name,
+					frappe.local.conf.hostname,
+				)
+				if (origin := get_origin(candidate, scheme=scheme, port=port))
+			}
+			if request_origin:
+				origins.add(request_origin)
+
+			self._site_origins = origins
+
+		return self._site_origins
+
+	def is_allowed_cors_origin(self) -> bool:
+		"""Return whether the request `Origin` is named by the site's `allow_cors` setting (RI-3).
+
+		An explicitly configured origin is accepted, whether `allow_cors` holds a single origin
+		string or a list of origins. A wildcard `allow_cors` of `"*"`, an unset `allow_cors` and a
+		request that carries no `Origin` header are not accepted.
+		"""
+		if not (origin := frappe.get_request_header("Origin")):
+			return False
+
+		if not (allowed_origins := frappe.conf.allow_cors) or allowed_origins == "*":
+			return False
+
+		if not isinstance(allowed_origins, list):
+			allowed_origins = [allowed_origins]
+
+		return origin in allowed_origins
 
 	def is_allowed_referrer(self):
 		referrer = frappe.get_request_header("Referer")
@@ -128,7 +348,7 @@ class LoginManager:
 		self.full_name = None
 		self.user_type = None
 
-		if frappe.local.request.path == "/api/method/login":
+		if frappe.local.request.path == LOGIN_PATH:
 			if self.login() is False:
 				return
 			self.resume = False
@@ -168,6 +388,9 @@ class LoginManager:
 				return False
 		frappe.form_dict.pop("pwd", None)
 		self.post_login()
+
+		# the API login response carries the new session's CSRF token for non-browser clients
+		frappe.local.response["csrf_token"] = frappe.session.data.csrf_token
 
 	def post_login(self, session_end: str | None = None, audit_user: str | None = None):
 		self.run_trigger("on_login")
@@ -641,8 +864,14 @@ class LoginAttemptTracker:
 def validate_auth():
 	"""
 	Authenticate and sets user for the request.
+
+	Runs once per request: a second call, after `frappe.app.init_request` has resolved a deferred
+	CSRF rejection through this function, returns without repeating the authentication (RI-4).
 	"""
-	authorization_header = frappe.get_request_header("Authorization", "").split(" ")
+	if frappe.flags.auth_validated:
+		return
+
+	authorization_header = get_authorization_header()
 
 	if len(authorization_header) == 2:
 		validate_oauth(authorization_header)
@@ -654,6 +883,32 @@ def validate_auth():
 	# should terminate here.
 	if len(authorization_header) == 2 and frappe.session.user in ("", "Guest"):
 		raise frappe.AuthenticationError
+
+	frappe.flags.auth_validated = True
+
+	# apply any CSRF rejection `HTTPRequest.validate_csrf_token` deferred to this point
+	validate_deferred_csrf_rejection()
+
+
+def validate_deferred_csrf_rejection() -> None:
+	"""Apply the CSRF rejection `HTTPRequest.validate_csrf_token` deferred for this request (RI-4).
+
+	The deferral is cleared, and the request is rejected with `frappe.CSRFTokenError` unless its
+	`Authorization` credential authenticated the user the request runs as - the credential's user
+	(`frappe.flags.explicitly_authenticated_user`) is `frappe.session.user`. A request with no
+	deferred rejection is left untouched.
+	"""
+	if not frappe.flags.deferred_csrf_rejection:
+		return
+
+	frappe.flags.pop("deferred_csrf_rejection", None)
+
+	if (
+		authenticated_user := frappe.flags.explicitly_authenticated_user
+	) and authenticated_user == frappe.session.user:
+		return
+
+	reject_csrf_request()
 
 
 def validate_oauth(authorization_header):
@@ -701,6 +956,8 @@ def validate_oauth(authorization_header):
 				frappe.throw(_("User {0} is disabled").format(user), frappe.AuthenticationError)
 			frappe.set_user(user)
 			frappe.local.form_dict = form_dict
+			# the user this bearer token authenticated
+			frappe.flags.explicitly_authenticated_user = user
 	except AttributeError:
 		pass
 
@@ -756,6 +1013,8 @@ def validate_api_key_secret(api_key, api_secret, frappe_authorization_source=Non
 		if frappe.local.login_manager.user in ("", "Guest"):
 			frappe.set_user(user)
 		frappe.local.form_dict = form_dict
+		# the user this api key and secret authenticated
+		frappe.flags.explicitly_authenticated_user = user
 	else:
 		raise frappe.AuthenticationError
 
