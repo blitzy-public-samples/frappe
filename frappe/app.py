@@ -5,6 +5,7 @@ import functools
 import logging
 import os
 import sys
+from urllib.parse import urlsplit
 
 import orjson
 from werkzeug.exceptions import HTTPException, NotFound
@@ -258,10 +259,28 @@ NO_CACHE_HEADERS = {"Cache-Control": "no-store,no-cache,must-revalidate,max-age=
 DEFAULT_X_FRAME_OPTIONS = "SAMEORIGIN"
 DEFAULT_X_CONTENT_TYPE_OPTIONS = "nosniff"
 DEFAULT_REFERRER_POLICY = "strict-origin-when-cross-origin"
+
+# Origins besides the site's own that shipped framework code loads executable script from.
+SCRIPT_SOURCE_ORIGINS = (
+	"https://accounts.google.com",
+	"https://apis.google.com",
+	"https://cdn.crowdin.com",
+	"https://chat.frappe.cloud",
+	"https://pulse.m.frappe.cloud",
+	"https://www.google-analytics.com",
+	"https://www.youtube.com",
+)
+
+# Origins besides the site's own that shipped framework code loads stylesheets from.
+STYLE_SOURCE_ORIGINS = ("https://fonts.googleapis.com",)
+
+# Site config keys holding the base URL of the Cloud Settings embed bundle, in precedence order.
+CLOUD_SETTINGS_EMBED_CONFIG_KEYS = ("cloud_settings_embed_url", "pilot_endpoint")
+
 DEFAULT_CONTENT_SECURITY_POLICY = (
 	"default-src 'self'; "
-	"script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; "
-	"style-src 'self' 'unsafe-inline' https:; "
+	f"script-src 'self' 'unsafe-inline' 'unsafe-eval' {' '.join(SCRIPT_SOURCE_ORIGINS)}; "
+	f"style-src 'self' 'unsafe-inline' {' '.join(STYLE_SOURCE_ORIGINS)}; "
 	"img-src 'self' data: blob: https:; "
 	"font-src 'self' data: https:; "
 	"connect-src 'self' ws: wss: https:; "
@@ -387,6 +406,8 @@ def set_security_headers(response: Response):
 		if header == "Content-Security-Policy":
 			if explicit_csp:
 				continue
+			if config_key not in conf:
+				value = add_cloud_settings_source(value)
 			value = add_dev_socketio_source(value)
 		elif header == "X-Frame-Options" and explicit_csp and frame_ancestors_allow_other_hosts(explicit_csp):
 			# omitted while the effective policy allows framing by other hosts
@@ -462,6 +483,65 @@ def normalized_origin(scheme: str, host: str) -> tuple[str, str, str]:
 		hostname, _, port = host.partition(":")
 
 	return scheme, hostname.lower(), port or DEFAULT_SCHEME_PORTS.get(scheme, "")
+
+
+def add_cloud_settings_source(policy: str) -> str:
+	"""Return `policy` with the site's configured Cloud Settings embed origin allowed for scripts.
+
+	Desk loads that bundle from the URL `frappe.integrations.frappe_providers.cloud_settings` builds
+	out of the first configured key in `CLOUD_SETTINGS_EMBED_CONFIG_KEYS`, so its origin is per-site
+	configuration rather than a fixed source. The origin is appended to `script-src` when the site
+	configures one; a site with no such key, a base URL that names no http(s) origin, a policy with no
+	`script-src` directive, and a directive already carrying the origin are all returned unchanged.
+
+	    # site_config.json
+	    {"pilot_endpoint": "https://pilot.example.com"}
+	"""
+	conf = getattr(frappe.local, "conf", None) or {}
+	base = next((conf.get(key) for key in CLOUD_SETTINGS_EMBED_CONFIG_KEYS if conf.get(key)), None)
+
+	if not base:
+		return policy
+
+	source = origin_of(str(base))
+
+	if not source:
+		return policy
+
+	directives = [directive.strip() for directive in policy.split(";") if directive.strip()]
+
+	for index, directive in enumerate(directives):
+		sources = directive.split()
+
+		if sources[0].lower() == "script-src":
+			if source in sources[1:]:
+				return policy
+
+			directives[index] = f"{directive} {source}"
+			return "; ".join(directives)
+
+	return policy
+
+
+def origin_of(url: str) -> str | None:
+	"""Return `url`'s `<scheme>://<host>[:<port>]` origin, or None when it names no http(s) origin."""
+	parts = urlsplit(url)
+
+	if parts.scheme not in ("http", "https"):
+		return None
+
+	try:
+		hostname, port = parts.hostname, parts.port
+	except ValueError:
+		return None
+
+	if not hostname:
+		return None
+
+	# an IPv6 literal is bracketed in an origin
+	host = f"[{hostname}]" if ":" in hostname else hostname
+
+	return f"{parts.scheme}://{host}:{port}" if port else f"{parts.scheme}://{host}"
 
 
 def add_dev_socketio_source(policy: str) -> str:

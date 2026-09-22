@@ -242,6 +242,11 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		const tick_format = /^-?(\d{1,3}(,\d{3})*|\d+)(\.\d{1,2})?( [A-Za-z]+)?$/;
 		// the shape frappe-charts prints with its own shortener, such as "1.3K"
 		const library_shortened_number = /^\d+(\.\d+)?[KMB]$/;
+		// the markers frappe-charts leaves at the end of a label it cut short
+		const truncation_marker = /( \.\.\.|\.\.)$/;
+		// whether `text` is one of frappe-charts' cut-short forms of `label`
+		const is_truncation_of = (text, label) =>
+			truncation_marker.test(text) && label.startsWith(text.replace(truncation_marker, ""));
 		// the Top Owners data this case supplies: long distinct names sharing a prefix, and counts
 		// on both sides of the grouping and abbreviation thresholds
 		const owner_labels = [
@@ -253,6 +258,12 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		];
 		const owner_values = [2000, 1250, 640, 120, 12];
 		const owner_value_texts = ["2 K", "1,250", "640", "120", "12"];
+		// two labels of equal length that differ only in their final character, which no
+		// truncation narrower than the labels themselves keeps apart
+		const equal_tail_labels = ["Alexandra Fitzgerald A", "Alexandra Fitzgerald B"];
+		// two labels already distinct in their first character, which a plot too narrow for the
+		// " ..." form keeps apart with frappe-charts' short ".." form
+		const short_marker_labels = ["AAAA", "BBBB"];
 		let probe_chart;
 
 		const label_texts = ($widget, axis) =>
@@ -425,6 +436,91 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			});
 		};
 
+		// Renders `labels` into a container `container_width` pixels wide with the ratio
+		// `get_axis_label_space_ratio` returns for a non-series axis, asserts the axis
+		// frappe-charts draws from that ratio, and takes the probe back out of the document.
+		// `truncated` is whether the allowance that ratio carries is narrower than the labels.
+		const assert_non_series_probe_axis = (labels, container_width, truncated) => {
+			const where = `for ${labels.length} non-series labels in ${container_width}px`;
+
+			cy.window().then((win) => {
+				const element = win.document.createElement("div");
+
+				element.className = "blitzy-axis-probe";
+				element.style.width = `${container_width}px`;
+				element.style.position = "relative";
+				win.document.body.appendChild(element);
+
+				const plot_width = win.frappe.utils.get_chart_plot_width(element.clientWidth);
+				const ratio = win.frappe.utils.get_axis_label_space_ratio(
+					labels,
+					plot_width,
+					false
+				);
+				const series_ratio = win.frappe.utils.get_axis_label_space_ratio(
+					labels,
+					plot_width,
+					true
+				);
+
+				expect(plot_width, `plot width ${where}`).to.be.greaterThan(0);
+				expect(Number.isFinite(ratio), `finite non-series ratio ${ratio} ${where}`).to.be
+					.true;
+				expect(ratio, `non-series label space ratio ${where}`).to.be.greaterThan(0);
+				// the non-series allowance per label is wider than the series one, which thins
+				// the labels to one per stride (RA-3)
+				expect(
+					ratio,
+					`non-series ratio ${ratio} over series ratio ${series_ratio} ${where}`
+				).to.be.greaterThan(series_ratio);
+
+				probe_chart = win.frappe.utils.make_chart(element, {
+					type: "line",
+					data: {
+						labels,
+						datasets: [{ name: "Probe", values: labels.map((_, index) => index + 1) }],
+					},
+					axisOptions: { xIsSeries: 0, seriesLabelSpaceRatio: ratio },
+				});
+			});
+
+			// one text node per label, which the placeholder draw carries one fewer of
+			cy.get(".blitzy-axis-probe svg.frappe-chart g.x.axis text").should(
+				"have.length",
+				labels.length
+			);
+			cy.get(".blitzy-axis-probe svg.frappe-chart")
+				.find("animate, animateTransform")
+				.should("have.length", 0);
+			cy.get(".blitzy-axis-probe svg.frappe-chart g.x.axis text").should(($texts) => {
+				const texts = Array.from($texts).map((node) => node.textContent);
+
+				texts.forEach((text) => {
+					// a non-series axis blanks no label: it truncates the ones that do not fit
+					expect(text.trim(), `label text "${text}" ${where}`).to.not.eq("");
+					expect(
+						labels.some((label) => label === text || is_truncation_of(text, label)),
+						`whole or truncated label "${text}" ${where}`
+					).to.be.true;
+				});
+				expect(new Set(texts).size, `distinct labels in ${texts} ${where}`).to.eq(
+					texts.length
+				);
+				expect(
+					texts.some((text) => truncation_marker.test(text)),
+					`truncated labels in ${texts} ${where}`
+				).to.eq(truncated);
+			});
+
+			cy.window().then((win) => {
+				probe_chart.destroy();
+				probe_chart = null;
+				win.document
+					.querySelectorAll(".blitzy-axis-probe")
+					.forEach((element) => element.remove());
+			});
+		};
+
 		cy.viewport(1400, 960);
 		cy.intercept(
 			"POST",
@@ -487,6 +583,10 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 			const format_tick = (value) => win.frappe.utils.format_chart_axis_number(value);
 			const site_number_format = win.frappe.boot.sysdefaults.number_format;
+			// the separator a tick carries between its whole part and its decimals, with any
+			// number system symbol taken off first
+			const tick_decimal_separator = (text) =>
+				(text.replace(/ [A-Za-z]+$/, "").match(/\d(\D)\d{1,2}$/) || [])[1];
 			// the sub-cent intervals frappe-charts generates
 			const quarter_cent_ticks = [0, 0.0025, 0.005, 0.0075, 0.01].map(format_tick);
 			const half_cent_ticks = [0, 0.005, 0.01, 0.015, 0.02].map(format_tick);
@@ -511,6 +611,11 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			expect(format_tick(0.00012345), "tick kept to three significant digits").to.eq(
 				"0.000123"
 			);
+			expect(format_tick(1250000), "two-decimal abbreviated tick").to.eq("1.25 M");
+			expect(
+				tick_decimal_separator(format_tick(1250000)),
+				"decimal separator of an abbreviated tick"
+			).to.eq(tick_decimal_separator(format_tick(12345.678)));
 
 			try {
 				win.frappe.boot.sysdefaults.number_format = "#.###,##";
@@ -518,6 +623,14 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				expect(format_tick(12345.678), "decimal tick under #.###,##").to.eq("12.345,68");
 				expect(format_tick(0.0025), "sub-cent tick under #.###,##").to.eq("0,0025");
 				expect(format_tick(2.5e-7), "scientific tick under #.###,##").to.eq("2,5e-7");
+				expect(format_tick(1500000), "abbreviated tick under #.###,##").to.eq("1,5 M");
+				expect(format_tick(1250000), "two-decimal abbreviated tick under #.###,##").to.eq(
+					"1,25 M"
+				);
+				expect(
+					tick_decimal_separator(format_tick(1250000)),
+					"decimal separator of an abbreviated tick under #.###,##"
+				).to.eq(tick_decimal_separator(format_tick(12345.678)));
 
 				win.frappe.boot.sysdefaults.number_format = "#,##,###.##";
 				expect(format_tick(1234567), "grouped tick under #,##,###.##").to.eq("12,34,567");
@@ -538,6 +651,13 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		[8, 31].forEach((count) => {
 			[375, 768].forEach((container_width) => assert_probe_axis(count, container_width));
 		});
+
+		// the non-series return of get_axis_label_space_ratio: the truncation allowance widened
+		// until the truncated labels are as many distinct texts as the labels themselves, and the
+		// full width of the longest label when no allowance below it is
+		assert_non_series_probe_axis(owner_labels, 375, true);
+		assert_non_series_probe_axis(equal_tail_labels, 300, false);
+		assert_non_series_probe_axis(short_marker_labels, 120, true);
 
 		cy.get(".blitzy-axis-probe").should("have.length", 0);
 
@@ -835,7 +955,7 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		const fixture_requests = [];
 		const record_range = {};
 
-		// scoped by title, and still found while a collapsed header keeps that title hidden
+		// scoped by title, which a widget keeps through every header layout of this case
 		const fixture_widget = (chart_name) =>
 			cy.get(`.dashboard-widget-box:has(.widget-title:contains("${chart_name}"))`).first();
 
@@ -965,7 +1085,8 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			expect(args.to_date).to.equal(record_range.to);
 		});
 
-		// the date field collapses this narrow widget's header, and Reset Chart restores it
+		// the date field takes a header row of its own on this narrow widget, leaving the title
+		// and subtitle visible, and Reset Chart returns the header to one row
 		fixture_widget("Cypress Trend One").find(".widget-title").should("be.visible");
 		fixture_widget("Cypress Trend One")
 			.find('.timespan-filter [data-toggle="dropdown"]')
@@ -975,10 +1096,17 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			.contains("Select Date Range")
 			.click();
 		fixture_widget("Cypress Trend One").find(".dashboard-date-field input").should("exist");
-		fixture_widget("Cypress Trend One").find(".widget-title").should("not.be.visible");
-		fixture_widget("Cypress Trend One")
-			.find(".widget-head")
-			.should("have.css", "flex-direction", "row-reverse");
+		fixture_widget("Cypress Trend One").find(".widget-title").should("be.visible");
+		fixture_widget("Cypress Trend One").should("have.class", "date-range-header");
+		fixture_widget("Cypress Trend One").then(($widget) => {
+			const title = $widget.find(".widget-title")[0].getBoundingClientRect();
+			const control = $widget.find(".dashboard-date-field")[0].getBoundingClientRect();
+
+			expect(
+				control.top - title.bottom,
+				"date range control below the title row"
+			).to.be.at.least(-1);
+		});
 		cy.clear_datepickers();
 
 		fixture_widget("Cypress Trend One").find(".chart-menu").click();
@@ -988,9 +1116,7 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 		fixture_widget("Cypress Trend One").find(".dashboard-date-field").should("not.exist");
 		fixture_widget("Cypress Trend One").find(".widget-title").should("be.visible");
-		fixture_widget("Cypress Trend One")
-			.find(".widget-head")
-			.should("have.css", "flex-direction", "row");
+		fixture_widget("Cypress Trend One").should("not.have.class", "date-range-header");
 		fixture_widget("Cypress Trend One").find(".x.axis text").should("have.length", 8);
 
 		// a window changed on one instance is neither read nor written by the other
@@ -1213,6 +1339,44 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 				.trigger("keydown", ENTER);
 		};
 
+		// the accessible name of one element, resolved in the order the accessible name
+		// computation applies it: aria-labelledby, aria-label, an associated or wrapping
+		// label, then title. A placeholder is not a name and is never read here.
+		const accessible_name = (element) => {
+			const in_document = element.ownerDocument;
+			const labelled_by = element.getAttribute("aria-labelledby");
+
+			if (labelled_by) {
+				const from_ids = labelled_by
+					.split(/\s+/)
+					.map((id) => in_document.getElementById(id))
+					.filter(Boolean)
+					.map((node) => node.textContent.trim())
+					.filter(Boolean)
+					.join(" ");
+
+				if (from_ids) {
+					return from_ids;
+				}
+			}
+
+			const aria_label = (element.getAttribute("aria-label") || "").trim();
+
+			if (aria_label) {
+				return aria_label;
+			}
+
+			const label =
+				(element.id && in_document.querySelector(`label[for="${element.id}"]`)) ||
+				element.closest("label");
+
+			if (label) {
+				return label.textContent.trim();
+			}
+
+			return (element.getAttribute("title") || "").trim();
+		};
+
 		const assert_only_checked = (menu_selector, label) => {
 			cy.get(`${menu_selector} [role="menuitemradio"]`).each(($option) => {
 				const expected = $option.text().trim() === label ? "true" : "false";
@@ -1285,6 +1449,31 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			.parent()
 			.should("have.class", "timespan-filter");
 
+		// 1b. the "Select Date Range" option puts the keyboard on a date input that carries its
+		// own accessible name, and the widget keeps its title while the control is displayed
+		select_timespan("Select%20Date%20Range");
+		trend_widget().find(".dashboard-date-field input").should("have.focus");
+		trend_widget()
+			.find(".dashboard-date-field input")
+			.then(($input) => {
+				const input = $input[0];
+
+				expect(accessible_name(input), "accessible name of the date range input").to.equal(
+					"Date Range"
+				);
+				expect($input.attr("placeholder"), "placeholder of the date range input").to.equal(
+					"Date Range"
+				);
+
+				// the control's own label is associated with the input it labels
+				expect(input.id, "id of the date range input").to.not.equal("");
+				const label = input.ownerDocument.querySelector(`label[for="${input.id}"]`);
+				expect(Boolean(label), `label for #${input.id}`).to.equal(true);
+				expect(label.textContent.trim(), "text of that label").to.equal("Date Range");
+			});
+		trend_widget().find(".widget-title").should("be.visible");
+		cy.clear_datepickers();
+
 		// re-applying "Last Week" marks it and leaves it applied
 		select_timespan("Last%20Week");
 		cy.get(".dashboard-widget-box .timespan-filter .filter-label").should(
@@ -1292,6 +1481,8 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			"Last Week"
 		);
 		assert_only_checked(".dashboard-widget-box .timespan-filter", "Last Week");
+		trend_widget().find(".dashboard-date-field").should("not.exist");
+		trend_widget().find(".x.axis text").should("have.length", 8);
 
 		// 2. interval dropdown: same open, Escape and focus-return cycle, "Daily" marked
 		cy.get(interval_toggle).focus().trigger("keydown", ARROW_DOWN);
@@ -1678,119 +1869,190 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			return "rgb(255, 255, 255)";
 		};
 
+		// The theme this spec found active, restored once both passes have run.
+		let original_theme = null;
+
+		// The page background each pass measured its text against, keyed by theme.
+		const measured_backgrounds = {};
+
+		// Applies a Desk theme through the framework's own switcher, which rewrites the
+		// `data-theme` attribute the token blocks key on.
+		const apply_theme = (theme) =>
+			cy.window().then((win) => {
+				win.frappe.ui.set_theme(theme);
+				expect(
+					win.document.documentElement.getAttribute("data-theme"),
+					"active Desk theme"
+				).to.equal(theme);
+			});
+
+		// Every surface D7 names, measured in the theme that is active when this runs.
+		// `ring_width` is the focus-ring geometry that theme's scoped block declares.
+		const assert_dashboard_contrast = (theme, ring_width) => {
+			// breadcrumb links and the "/" separator generated before each one
+			cy.window().then((win) => {
+				measured_backgrounds[theme] = win.getComputedStyle(
+					win.document.body
+				).backgroundColor;
+
+				const links = [...win.document.querySelectorAll(".navbar-breadcrumbs a")];
+				expect(links.length, `${theme}: breadcrumb links`).to.be.greaterThan(0);
+				links.forEach((link) => {
+					const ratio = contrast(
+						win.getComputedStyle(link).color,
+						effective_background(win, link)
+					);
+					expect(
+						ratio,
+						`${theme}: breadcrumb "${link.innerText.trim()}" contrast`
+					).to.be.at.least(4.5);
+				});
+
+				const separators = links.filter(
+					(link) => win.getComputedStyle(link, "::before").content !== "none"
+				);
+				expect(separators.length, `${theme}: breadcrumb separators`).to.be.greaterThan(0);
+				separators.forEach((link) => {
+					const ratio = contrast(
+						win.getComputedStyle(link, "::before").color,
+						effective_background(win, link)
+					);
+					expect(
+						ratio,
+						`${theme}: separator before "${link.innerText.trim()}" contrast`
+					).to.be.at.least(4.5);
+				});
+			});
+
+			// placeholder of the date-range input the trend widget reveals
+			chart_widget(trend_chart)
+				.find('.timespan-filter button[data-toggle="dropdown"]')
+				.click();
+			chart_widget(trend_chart)
+				.find(".timespan-filter .dropdown-item")
+				.contains("Select Date Range")
+				.click();
+			chart_widget(trend_chart).find(".dashboard-date-field input").should("exist");
+			cy.window().then((win) => {
+				const input = [
+					...win.document.querySelectorAll(
+						".dashboard-widget-box .dashboard-date-field input"
+					),
+				].pop();
+				const ratio = contrast(
+					win.getComputedStyle(input, "::placeholder").color,
+					win.getComputedStyle(input).backgroundColor
+				);
+				expect(ratio, `${theme}: date-range placeholder contrast`).to.be.at.least(4.5);
+			});
+
+			// a preset window applied again, which removes the date-range control
+			chart_widget(trend_chart)
+				.find('.timespan-filter button[data-toggle="dropdown"]')
+				.click();
+			chart_widget(trend_chart)
+				.find(".timespan-filter .dropdown-item")
+				.contains("Last Week")
+				.click();
+			chart_widget(trend_chart)
+				.find(".timespan-filter .filter-label")
+				.should("have.text", "Last Week");
+
+			// error text, measured while the normally hidden container is shown
+			cy.window().then((win) => {
+				const error = win
+					.$(".dashboard-widget-box .chart-loading-state.text-danger")
+					.first()
+					.show()
+					.text("contrast probe");
+				const ratio = contrast(
+					win.getComputedStyle(error[0]).color,
+					effective_background(win, error[0])
+				);
+				error.text("").hide();
+				expect(ratio, `${theme}: chart error text contrast`).to.be.at.least(4.5);
+			});
+
+			// placeholder text of the loading / no-data state
+			cy.window().then((win) => {
+				const muted = win
+					.$(".dashboard-widget-box .chart-loading-state.text-extra-muted")
+					.first()
+					.show()
+					.text("contrast probe");
+				const ratio = contrast(
+					win.getComputedStyle(muted[0]).color,
+					effective_background(win, muted[0])
+				);
+				muted.text("").hide();
+				expect(ratio, `${theme}: chart placeholder text contrast`).to.be.at.least(4.5);
+			});
+
+			// focus ring of a widget control: the geometry this theme declares, then its
+			// contrast against the widget and its own background
+			cy.get(".dashboard-widget-box .chart-menu").first().focus();
+			cy.window().then((win) => {
+				const control = win.document.querySelector(".dashboard-widget-box .chart-menu");
+				const style = win.getComputedStyle(control);
+				const collapse = (value) => (value || "").replace(/\s+/g, " ").trim();
+				const declared = collapse(style.getPropertyValue("--focus-default"));
+				const outline = collapse(style.getPropertyValue("--focus-outline-default"));
+				const painted = style.boxShadow;
+				const ring = parse_colour(painted) ? painted : declared;
+				const widget = effective_background(win, control.closest(".widget"));
+				expect(declared, `${theme}: --focus-default geometry`).to.contain(
+					`0px 0px 0px ${ring_width}`
+				);
+				expect(outline, `${theme}: --focus-outline-default geometry`).to.contain(
+					`${ring_width} solid`
+				);
+				expect(
+					contrast(ring, widget),
+					`${theme}: focus ring contrast against the widget background`
+				).to.be.at.least(3);
+				expect(
+					contrast(ring, style.backgroundColor),
+					`${theme}: focus ring contrast against the control background`
+				).to.be.at.least(3);
+			});
+
+			// tile text of the number cards
+			cy.window().then((win) => {
+				[
+					".number-widget-box .widget-title",
+					".number-widget-box .widget-body",
+					".dashboard-widget-box .widget-title",
+					".dashboard-widget-box .widget-subtitle",
+				].forEach((selector) => {
+					const element = win.document.querySelector(selector);
+					expect(element, `${theme}: ${selector} is rendered`).to.not.be.null;
+					const ratio = contrast(
+						win.getComputedStyle(element).color,
+						effective_background(win, element)
+					);
+					expect(ratio, `${theme}: ${selector} contrast`).to.be.at.least(4.5);
+				});
+			});
+		};
+
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
 		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
-
-		// breadcrumb links
 		cy.window().then((win) => {
-			const links = [...win.document.querySelectorAll(".navbar-breadcrumbs a")];
-			expect(links.length, "breadcrumb links").to.be.greaterThan(0);
-			links.forEach((link) => {
-				const ratio = contrast(
-					win.getComputedStyle(link).color,
-					effective_background(win, link)
-				);
-				expect(ratio, `breadcrumb "${link.innerText.trim()}" contrast`).to.be.at.least(
-					4.5
-				);
-			});
+			original_theme = win.frappe.ui.get_current_theme() || "light";
 		});
 
-		// placeholder of the date-range input the trend widget reveals
-		chart_widget(trend_chart).find('.timespan-filter button[data-toggle="dropdown"]').click();
-		chart_widget(trend_chart)
-			.find(".timespan-filter .dropdown-item")
-			.contains("Select Date Range")
-			.click();
-		chart_widget(trend_chart).find(".dashboard-date-field input").should("exist");
-		cy.window().then((win) => {
-			const input = [
-				...win.document.querySelectorAll(
-					".dashboard-widget-box .dashboard-date-field input"
-				),
-			].pop();
-			const ratio = contrast(
-				win.getComputedStyle(input, "::placeholder").color,
-				win.getComputedStyle(input).backgroundColor
-			);
-			expect(ratio, "date-range placeholder contrast").to.be.at.least(4.5);
-		});
+		apply_theme("light");
+		assert_dashboard_contrast("light", "2px");
+		apply_theme("dark");
+		assert_dashboard_contrast("dark", "3px");
 
-		// a preset window applied again, which removes the date-range control
-		chart_widget(trend_chart).find('.timespan-filter button[data-toggle="dropdown"]').click();
-		chart_widget(trend_chart)
-			.find(".timespan-filter .dropdown-item")
-			.contains("Last Week")
-			.click();
-		chart_widget(trend_chart)
-			.find(".timespan-filter .filter-label")
-			.should("have.text", "Last Week");
-
-		// error text, measured while the normally hidden container is shown
-		cy.window().then((win) => {
-			const error = win
-				.$(".dashboard-widget-box .chart-loading-state.text-danger")
-				.first()
-				.show()
-				.text("contrast probe");
-			const ratio = contrast(
-				win.getComputedStyle(error[0]).color,
-				effective_background(win, error[0])
-			);
-			error.text("").hide();
-			expect(ratio, "chart error text contrast").to.be.at.least(4.5);
-		});
-
-		// placeholder text of the loading / no-data state
-		cy.window().then((win) => {
-			const muted = win
-				.$(".dashboard-widget-box .chart-loading-state.text-extra-muted")
-				.first()
-				.show()
-				.text("contrast probe");
-			const ratio = contrast(
-				win.getComputedStyle(muted[0]).color,
-				effective_background(win, muted[0])
-			);
-			muted.text("").hide();
-			expect(ratio, "chart placeholder text contrast").to.be.at.least(4.5);
-		});
-
-		// focus ring of a widget control, against the widget and its own background
-		cy.get(".dashboard-widget-box .chart-menu").first().focus();
-		cy.window().then((win) => {
-			const control = win.document.querySelector(".dashboard-widget-box .chart-menu");
-			const style = win.getComputedStyle(control);
-			const declared = style.getPropertyValue("--focus-default");
-			const painted = style.boxShadow;
-			const ring = parse_colour(painted) ? painted : declared;
-			const widget = effective_background(win, control.closest(".widget"));
+		cy.then(() => {
 			expect(
-				contrast(ring, widget),
-				"focus ring contrast against the widget background"
-			).to.be.at.least(3);
-			expect(
-				contrast(ring, style.backgroundColor),
-				"focus ring contrast against the control background"
-			).to.be.at.least(3);
-		});
+				measured_backgrounds.dark,
+				"the dark pass measured a repainted page background"
+			).to.not.equal(measured_backgrounds.light);
 
-		// tile text of the number cards
-		cy.window().then((win) => {
-			[
-				".number-widget-box .widget-title",
-				".number-widget-box .widget-body",
-				".dashboard-widget-box .widget-title",
-				".dashboard-widget-box .widget-subtitle",
-			].forEach((selector) => {
-				const element = win.document.querySelector(selector);
-				expect(element, `${selector} is rendered`).to.not.be.null;
-				const ratio = contrast(
-					win.getComputedStyle(element).color,
-					effective_background(win, element)
-				);
-				expect(ratio, `${selector} contrast`).to.be.at.least(4.5);
-			});
+			apply_theme(original_theme);
 		});
 	});
 

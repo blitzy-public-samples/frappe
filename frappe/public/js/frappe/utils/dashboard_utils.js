@@ -13,9 +13,8 @@ frappe.dashboard_utils = {
 			}
 
 			let chart_filter_html = `<div class="${button_class} ${filter_class} btn-group dropdown pull-right">
-					<button class="btn btn-secondary btn-xs" data-toggle="dropdown"
-						aria-haspopup="true" aria-expanded="false"
-						style="border-radius: var(--radius);">
+					<button class="btn btn-secondary btn-xs chart-filter-toggle" data-toggle="dropdown"
+						aria-haspopup="true" aria-expanded="false">
 						${icon_html}
 						<span class="filter-label">${__(filter.label)}</span>
 						${frappe.utils.icon("chevrons-up-down", "xs")}
@@ -147,10 +146,11 @@ frappe.dashboard_utils = {
 	 *    order.
 	 *  - On `hidden.bs.dropdown` — which covers Escape, an outside click, option activation and
 	 *    a programmatic close — focus returns to the toggle if the toggle is still in the
-	 *    document and focus is on `body`, inside the menu that just closed, or nowhere. Two
-	 *    closes are exempt: one performed by Tab or Shift+Tab, and one whose command marked
-	 *    itself as navigating away with `frappe.dashboard_utils.suppress_menu_focus_restore()`.
-	 *    Focus that an action moved elsewhere (a dialog, a new route) stays where it was put.
+	 *    document and focus is on `body` or the document element, inside the menu that just
+	 *    closed, or nowhere. Two closes are exempt: one performed by Tab or Shift+Tab, and
+	 *    one whose command marked itself as navigating away with
+	 *    `frappe.dashboard_utils.suppress_menu_focus_restore()`. Focus that an action moved
+	 *    elsewhere (a dialog, a new route) stays where it was put.
 	 *  - The menu is given `role="menu"` and is labelled by its toggle through `aria-labelledby`.
 	 *
 	 * Usage: call once per rendered dropdown, e.g.
@@ -261,8 +261,15 @@ frappe.dashboard_utils = {
 			const toggle = $toggle[0];
 			if (!toggle.isConnected) return;
 
+			// Focus counts as unplaced when it is on `body` or the document element, inside
+			// the menu that just closed, or nowhere (PR Description decisions RD-5, RD-11).
 			const focused = document.activeElement;
-			if (!focused || focused === document.body || $menu[0].contains(focused)) {
+			if (
+				!focused ||
+				focused === document.body ||
+				focused === document.documentElement ||
+				$menu[0].contains(focused)
+			) {
 				toggle.focus();
 			}
 		});

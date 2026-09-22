@@ -110,8 +110,9 @@ function group_chart_axis_number(value) {
 	return write_chart_axis_number(value, chart_axis_decimals(value));
 }
 
-// An axis tick abbreviated in the number system of `country`, or null when the abbreviation would
-// not carry the tick exactly.
+// An axis tick abbreviated in the number system of `country`, its coefficient written with the
+// group and decimal separators of the site number format, or null when the abbreviation would not
+// carry the tick exactly.
 function abbreviate_chart_axis_number(value, country) {
 	const magnitude = Math.abs(value);
 
@@ -134,7 +135,14 @@ function abbreviate_chart_axis_number(value, country) {
 		return null;
 	}
 
-	return frappe.utils.shorten_number(value, country, 4, decimals);
+	// the coefficient carries its own decimals, capped at the abbreviation's allowance
+	const coefficient = Math.round(scaled) / Math.pow(10, decimals);
+	const coefficient_decimals = Math.min(
+		frappe.utils.get_number_of_decimals(coefficient),
+		decimals
+	);
+
+	return `${write_chart_axis_number(coefficient, coefficient_decimals)} ${map.symbol}`;
 }
 
 // The label space ratio that gives frappe-charts `characters` characters per label for `count`

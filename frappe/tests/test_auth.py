@@ -10,7 +10,13 @@ from werkzeug.test import EnvironBuilder
 from werkzeug.wrappers import Request
 
 import frappe
-from frappe.auth import HTTPRequest, LoginAttemptTracker, get_hostname, validate_deferred_csrf_rejection
+from frappe.auth import (
+	HTTPRequest,
+	LoginAttemptTracker,
+	get_hostname,
+	get_origin,
+	validate_deferred_csrf_rejection,
+)
 from frappe.core.doctype.user.user import generate_keys
 from frappe.frappeclient import AuthError, FrappeClient
 from frappe.sessions import Session, get_expired_sessions, get_expiry_in_seconds
@@ -468,6 +474,30 @@ class TestCSRFTokenValidation(IntegrationTestCase):
 		self.validate(headers={"Origin": "https://portal.example.com"})
 		self.assertRejected(headers={"Origin": "https://portal.example.net"})
 
+	def test_same_host_on_another_port_rejected_when_session_has_no_token(self):
+		self.assertRejected(headers={"Origin": f"http://{self.SITE_HOST}:8080"})
+		self.assertRejected(headers={"Referer": f"http://{self.SITE_HOST}:8080/attack.html"})
+		self.assertRejected(headers={"Origin": f"http://{self.SITE_HOST}:0"})
+
+	def test_same_host_on_another_scheme_rejected_when_session_has_no_token(self):
+		self.assertRejected(headers={"Origin": f"https://{self.SITE_HOST}"})
+
+	def test_explicit_default_port_counts_as_same_origin(self):
+		self.validate(headers={"Origin": f"http://{self.SITE_HOST}:80"})
+
+	def test_configured_host_name_with_a_port_is_matched_on_that_port(self):
+		self.addCleanup(self.restore_conf, "host_name", frappe.conf.get("host_name"))
+		frappe.conf.host_name = "http://portal.example.com:8080"
+
+		self.validate(headers={"Origin": "http://portal.example.com:8080"})
+		self.assertRejected(headers={"Origin": "http://portal.example.com"})
+		self.assertRejected(headers={"Origin": "http://portal.example.com:9090"})
+
+	def test_forwarded_https_scheme_defines_the_sites_own_origin(self):
+		"""`X-Forwarded-Proto: https` makes the https origin of the request host this site's own."""
+		self.validate(headers={"X-Forwarded-Proto": "https", "Origin": f"https://{self.SITE_HOST}"})
+		self.assertRejected(headers={"X-Forwarded-Proto": "https", "Origin": f"http://{self.SITE_HOST}"})
+
 	def test_request_without_browser_origin_rejected_when_session_has_no_token(self):
 		"""A non-browser client on a token-less cookie session carries no same-site evidence."""
 		self.assertRejected()
@@ -736,7 +766,7 @@ class TestLoginMintsCSRFToken(IntegrationTestCase):
 	@staticmethod
 	def delete_session_record(sid: str) -> None:
 		frappe.db.delete("Sessions", {"sid": sid})
-		frappe.db.commit()
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit
 		frappe.cache.hdel("session", sid)
 
 
@@ -1017,3 +1047,28 @@ class TestHostname(UnitTestCase):
 		self.assertEqual(get_hostname(""), "")
 		self.assertEqual(get_hostname(None), "")
 		self.assertEqual(get_hostname("http://["), "")
+
+	def test_get_origin_normalizes_scheme_hostname_and_port(self):
+		self.assertEqual(get_origin("https://Example.COM/x"), ("https", "example.com", "443"))
+		self.assertEqual(get_origin("http://example.com"), ("http", "example.com", "80"))
+		self.assertEqual(get_origin("https://www.example.com:8443"), ("https", "example.com", "8443"))
+		self.assertEqual(get_origin("http://example.com:0"), ("http", "example.com", "0"))
+
+	def test_get_origin_completes_omitted_components_from_its_arguments(self):
+		self.assertEqual(
+			get_origin("example.com", scheme="https", port="8443"), ("https", "example.com", "8443")
+		)
+		self.assertEqual(
+			get_origin("example.com:9000", scheme="http", port="80"), ("http", "example.com", "9000")
+		)
+		self.assertEqual(
+			get_origin("https://example.com", scheme="http", port="8200"), ("https", "example.com", "443")
+		)
+		self.assertEqual(
+			get_origin("example.com:0", scheme="http", port="8200"), ("http", "example.com", "0")
+		)
+
+	def test_get_origin_returns_none_for_unusable_input(self):
+		for url in (None, "", "http://[", "/desk/todo", "http://example.com:99999"):
+			with self.subTest(url=url):
+				self.assertIsNone(get_origin(url))

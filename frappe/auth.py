@@ -33,6 +33,9 @@ MAX_PASSWORD_SIZE = 512
 # `Sec-Fetch-Site` values that report an initiator which is not another site.
 SAME_SITE_FETCH_SITES = frozenset(("same-origin", "none"))
 
+# Ports a URL scheme implies when an origin omits one.
+DEFAULT_SCHEME_PORTS = {"http": "80", "https": "443"}
+
 # The request path that authenticates a user and creates their session.
 LOGIN_PATH = "/api/method/login"
 
@@ -79,6 +82,39 @@ def get_hostname(url: str | None) -> str:
 		return ""
 
 	return hostname.lower().removeprefix("www.")
+
+
+def get_origin(url: str | None, scheme: str = "", port: str = "") -> tuple[str, str, str] | None:
+	"""Return the normalized `(scheme, hostname, port)` of `url`, or `None` when it names no host.
+
+	The hostname is the one `get_hostname` reports. The scheme is the one `url` spells out, lower-cased,
+	and otherwise the `scheme` argument. The port is the one `url` spells out; otherwise the default port
+	of the scheme `url` spells out, so `https://example.com` resolves to port `443` whatever the `port`
+	argument holds; otherwise the `port` argument; otherwise the default port of the resolved scheme.
+	A component that none of those supply is an empty string.
+
+	Accepts the same inputs as `get_hostname` - an absolute URL, an origin and a bare host with an
+	optional port - and reports `None` for a value with no host and for a port outside 0-65535.
+	"""
+	if not (hostname := get_hostname(url)):
+		return None
+
+	try:
+		parsed = urlparse(url if "//" in url else f"//{url}")
+		url_scheme, url_port = parsed.scheme.lower(), parsed.port
+	except ValueError:
+		return None
+
+	resolved_scheme = url_scheme or scheme.lower()
+
+	if url_port is not None:
+		resolved_port = str(url_port)
+	elif url_scheme:
+		resolved_port = DEFAULT_SCHEME_PORTS.get(url_scheme) or port
+	else:
+		resolved_port = port or DEFAULT_SCHEME_PORTS.get(resolved_scheme, "")
+
+	return resolved_scheme, hostname, resolved_port
 
 
 class HTTPRequest:
@@ -206,9 +242,12 @@ class HTTPRequest:
 	def is_same_site_request(self) -> bool:
 		"""Return whether a request header positively reports this site as the initiator.
 
-		`Sec-Fetch-Site` is read first, then `Origin`, then `Referer`. A request that reports an
-		initiator outside this site, and a request that carries none of the three headers - a
-		non-browser client - are both reported as not same-site.
+		`Sec-Fetch-Site` is read first, then `Origin`, then `Referer`. An `Origin` or a `Referer` is
+		held to its own scheme and port: it reports this site only when its normalized
+		`(scheme, hostname, port)` origin is one of `site_origins`, so the same host reached on another
+		scheme or another port is not this site. A request that reports an initiator outside this site,
+		and a request that carries none of the three headers - a non-browser client - are both reported
+		as not same-site.
 		"""
 		fetch_site = frappe.get_request_header("Sec-Fetch-Site")
 		if fetch_site and fetch_site not in SAME_SITE_FETCH_SITES:
@@ -216,26 +255,52 @@ class HTTPRequest:
 
 		for header in ("Origin", "Referer"):
 			if value := frappe.get_request_header(header):
-				return get_hostname(value) in self.site_hostnames
+				return get_origin(value) in self.site_origins
 
 		return bool(fetch_site)
 
 	@property
-	def site_hostnames(self) -> set[str]:
-		"""Return the non-empty hosts this site answers on: request host, site name, `host_name`."""
-		if getattr(self, "_site_hostnames", None) is None:
-			self._site_hostnames = {
-				hostname
+	def request_scheme(self) -> str:
+		"""Return the lower-cased scheme this request reached the site on.
+
+		`https` when the `X-Forwarded-Proto` request header reports it, whatever the scheme the
+		application itself was reached on; otherwise `frappe.request.scheme`.
+		"""
+		if frappe.get_request_header("X-Forwarded-Proto", "").lower() == "https":
+			return "https"
+
+		return (frappe.request.scheme or "").lower()
+
+	@property
+	def site_origins(self) -> set[tuple[str, str, str]]:
+		"""Return the `(scheme, hostname, port)` origins this site answers on (RI-12).
+
+		The request's own origin is its `Host` on the scheme `request_scheme` reports. The site name,
+		`host_name` and `hostname` each contribute an origin too, held to any scheme or port they spell
+		out and otherwise taking the scheme and port of the request's own origin. A candidate that
+		names no host contributes nothing.
+		"""
+		if getattr(self, "_site_origins", None) is None:
+			request_origin = get_origin(frappe.request.host, scheme=self.request_scheme)
+			scheme, port = (
+				(request_origin[0], request_origin[2]) if request_origin else (self.request_scheme, "")
+			)
+
+			origins = {
+				origin
 				for candidate in (
-					frappe.request.host,
 					frappe.local.site,
 					frappe.local.conf.host_name,
 					frappe.local.conf.hostname,
 				)
-				if (hostname := get_hostname(candidate))
+				if (origin := get_origin(candidate, scheme=scheme, port=port))
 			}
+			if request_origin:
+				origins.add(request_origin)
 
-		return self._site_hostnames
+			self._site_origins = origins
+
+		return self._site_origins
 
 	def is_allowed_cors_origin(self) -> bool:
 		"""Return whether the request `Origin` is named by the site's `allow_cors` setting (RI-3).

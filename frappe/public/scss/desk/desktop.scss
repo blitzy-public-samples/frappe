@@ -234,6 +234,17 @@ body {
 			gap: 6px;
 		}
 
+		// A narrow widget showing its date range control lays the header out in two rows: the
+		// title and subtitle keep the first, the controls take the second (RB-11).
+		&.date-range-header {
+			.widget-head {
+				.widget-label,
+				.widget-control {
+					flex: 1 0 100%;
+				}
+			}
+		}
+
 		.widget-body {
 			padding-top: 7px;
 		}
@@ -860,6 +871,14 @@ body {
 			z-index: 1;
 		}
 	}
+}
+
+// Overrides bootstrap's compiled `.btn-group > .btn:not(:last-child):not(.dropdown-toggle)
+// { border-top-right-radius: 0; border-bottom-right-radius: 0 }` for the chart filter toggle
+// rendered by `frappe.dashboard_utils.render_chart_filters`.
+// Decision row RD-10 in blitzy/documentation/PR Description.md section 6.
+.btn-group > .btn.chart-filter-toggle:not(:last-child):not(.dropdown-toggle) {
+	border-radius: var(--radius);
 }
 
 .onboarding-success {
@@ -1489,10 +1508,13 @@ body {
 	color: var(--ink-red-8) !important;
 }
 
+// Overrides `.navbar-breadcrumbs a { color: var(--ink-gray-5) }` and its `/` separator
+// `a:before { color: var(--ink-gray-4) }` from frappe/public/scss/desk/breadcrumb.scss.
+// Decision rows RF-6 and RF-7 in blitzy/documentation/PR Description.md section 6.
 body[data-route^="dashboard-view"] .navbar-breadcrumbs a {
 	color: var(--ink-gray-6);
 
 	&:before {
-		color: var(--ink-gray-5);
+		color: var(--ink-gray-6);
 	}
 }

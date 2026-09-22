@@ -14,6 +14,9 @@ from frappe.app import (
 	DEFAULT_REFERRER_POLICY,
 	DEFAULT_X_CONTENT_TYPE_OPTIONS,
 	DEFAULT_X_FRAME_OPTIONS,
+	SCRIPT_SOURCE_ORIGINS,
+	STYLE_SOURCE_ORIGINS,
+	origin_of,
 	process_response,
 )
 from frappe.tests import IntegrationTestCase
@@ -25,6 +28,42 @@ SECURITY_HEADERS = (
 	"X-Content-Type-Options",
 	"Referrer-Policy",
 )
+
+# Directives that keep the scheme-only `https:` source, with the other scheme sources each one carries.
+SCHEME_SOURCE_DIRECTIVES = {
+	"img-src": ("data:", "blob:"),
+	"font-src": ("data:",),
+	"media-src": ("data:", "blob:"),
+	"connect-src": ("ws:", "wss:"),
+	"frame-src": ("blob:",),
+}
+
+# Named policy origin -> (app-relative path, marker) of the shipped file that loads from it.
+SHIPPED_ORIGIN_LOADERS = {
+	"https://accounts.google.com": (
+		"public/js/integrations/google_drive_picker.js",
+		"https://accounts.google.com/gsi/client",
+	),
+	"https://apis.google.com": (
+		"public/js/integrations/google_drive_picker.js",
+		"https://apis.google.com/js/api.js",
+	),
+	"https://cdn.crowdin.com": ("www/desk.html", "https://cdn.crowdin.com/jipt/jipt.js"),
+	"https://chat.frappe.cloud": ("public/js/billing.bundle.js", 'BASE_URL="https://chat.frappe.cloud"'),
+	"https://fonts.googleapis.com": (
+		"website/doctype/website_theme/website_theme_template.scss",
+		'@import url("https://fonts.googleapis.com/',
+	),
+	"https://pulse.m.frappe.cloud": (
+		"public/js/telemetry/pulse.js",
+		"https://pulse.m.frappe.cloud/assets/pulse/js/pulse_client.js",
+	),
+	"https://www.google-analytics.com": (
+		"templates/includes/app_analytics/google_analytics.html",
+		"//www.google-analytics.com/analytics.js",
+	),
+	"https://www.youtube.com": ("public/js/frappe/utils/help.js", 'data-plyr-provider="youtube"'),
+}
 
 
 def get_directive(policy: str, name: str) -> str:
@@ -44,6 +83,8 @@ class TestSecurityHeaders(IntegrationTestCase):
 		self.original_response_headers = frappe.local.response_headers
 		frappe.local.response_headers = Headers()
 		self.addCleanup(self.restore_response_headers)
+		# the Cloud Settings embed keys are unset for every case that asserts the default policy (RJ-12)
+		self.set_conf(cloud_settings_embed_url=None, pilot_endpoint=None)
 
 	def restore_response_headers(self):
 		frappe.local.response_headers = self.original_response_headers
@@ -125,6 +166,128 @@ class TestSecurityHeaders(IntegrationTestCase):
 		connect_src = get_directive(policy, "connect-src")
 		self.assertIn("ws:", connect_src)
 		self.assertIn("wss:", connect_src)
+
+	def test_script_src_names_its_origins_instead_of_every_https_origin(self):
+		"""`script-src`'s sources are asserted as tokens, not as substrings of the directive (RJ-11)."""
+		script_src = get_directive(self.process().headers["Content-Security-Policy"], "script-src").split()
+
+		self.assertIn("'self'", script_src)
+		self.assertIn("'unsafe-inline'", script_src)
+		self.assertIn("'unsafe-eval'", script_src)
+		self.assertNotIn("https:", script_src)
+
+		for origin in SCRIPT_SOURCE_ORIGINS:
+			with self.subTest(origin=origin):
+				self.assertIn(origin, script_src)
+
+	def test_style_src_names_its_origins_instead_of_every_https_origin(self):
+		style_src = get_directive(self.process().headers["Content-Security-Policy"], "style-src").split()
+
+		self.assertIn("'self'", style_src)
+		self.assertIn("'unsafe-inline'", style_src)
+		self.assertNotIn("https:", style_src)
+
+		for origin in STYLE_SOURCE_ORIGINS:
+			with self.subTest(origin=origin):
+				self.assertIn(origin, style_src)
+
+	def test_frame_src_keeps_the_https_scheme_source_for_remote_file_previews(self):
+		"""A remote File's `file_url` is an external URL, and both preview paths frame it (RJ-11)."""
+		frame_src = get_directive(self.process().headers["Content-Security-Policy"], "frame-src").split()
+
+		self.assertIn("https:", frame_src)
+
+		file_py = Path(frappe.get_app_path("frappe", "core/doctype/file/file.py")).read_text()
+		file_js = Path(frappe.get_app_path("frappe", "core/doctype/file/file.js")).read_text()
+		attachments_js = Path(
+			frappe.get_app_path("frappe", "public/js/frappe/form/sidebar/attachments.js")
+		).read_text()
+
+		self.assertIn("def is_remote_file", file_py)
+		self.assertIn("const full_file_url = frm.doc.file_url", file_js)
+		self.assertIn('<iframe src="${escaped_file_url}"', attachments_js)
+
+	def test_asset_and_connection_directives_keep_the_https_scheme_source(self):
+		policy = self.process().headers["Content-Security-Policy"]
+
+		for directive, scheme_sources in SCHEME_SOURCE_DIRECTIVES.items():
+			with self.subTest(directive=directive):
+				sources = get_directive(policy, directive).split()
+
+				self.assertIn("'self'", sources)
+				self.assertIn("https:", sources)
+
+				for scheme_source in scheme_sources:
+					self.assertIn(scheme_source, sources)
+
+	def test_every_named_origin_is_still_loaded_by_a_shipped_file(self):
+		"""Each named origin is asserted against the marker in the shipped file that loads it (RJ-11)."""
+		named_origins = set(SCRIPT_SOURCE_ORIGINS) | set(STYLE_SOURCE_ORIGINS)
+
+		self.assertEqual(set(SHIPPED_ORIGIN_LOADERS), named_origins)
+
+		for origin, (app_relative_path, marker) in SHIPPED_ORIGIN_LOADERS.items():
+			with self.subTest(origin=origin):
+				loader = Path(frappe.get_app_path("frappe", app_relative_path)).read_text()
+
+				self.assertIn(marker, loader)
+
+	def test_cloud_settings_embed_origin_is_allowed_for_scripts(self):
+		"""Desk loads the Cloud Settings bundle from the site's `pilot_endpoint` origin (RJ-12)."""
+		self.set_conf(pilot_endpoint="https://pilot.example.com")
+
+		script_src = get_directive(self.process().headers["Content-Security-Policy"], "script-src").split()
+
+		self.assertIn("https://pilot.example.com", script_src)
+		self.assertNotIn("https:", script_src)
+
+	def test_cloud_settings_embed_url_overrides_the_pilot_endpoint(self):
+		self.set_conf(
+			pilot_endpoint="https://pilot.example.com",
+			cloud_settings_embed_url="https://cdn.example.com/embed/",
+		)
+
+		script_src = get_directive(self.process().headers["Content-Security-Policy"], "script-src").split()
+
+		self.assertIn("https://cdn.example.com", script_src)
+		self.assertNotIn("https://pilot.example.com", script_src)
+
+	def test_cloud_settings_origin_is_the_origin_of_the_embed_bundle_url(self):
+		"""The allowed origin is read from the same keys that build the bundle URL (RJ-12)."""
+		from frappe.integrations.frappe_providers.cloud_settings import _embed_bundle
+
+		self.set_conf(pilot_endpoint="https://pilot.example.com:8443", cloud_settings_embed_version="7")
+
+		bundle_origin = origin_of(_embed_bundle()["js"])
+		script_src = get_directive(self.process().headers["Content-Security-Policy"], "script-src").split()
+
+		self.assertEqual(bundle_origin, "https://pilot.example.com:8443")
+		self.assertIn(bundle_origin, script_src)
+
+	def test_script_src_carries_only_its_named_origins_without_cloud_settings(self):
+		self.set_conf(cloud_settings_embed_url=None, pilot_endpoint=None)
+
+		script_src = get_directive(self.process().headers["Content-Security-Policy"], "script-src").split()
+
+		self.assertEqual(script_src, ["'self'", "'unsafe-inline'", "'unsafe-eval'", *SCRIPT_SOURCE_ORIGINS])
+
+	def test_cloud_settings_base_without_an_http_origin_is_ignored(self):
+		self.set_conf(pilot_endpoint="pilot.example.com")
+
+		self.assertEqual(self.process().headers["Content-Security-Policy"], DEFAULT_CONTENT_SECURITY_POLICY)
+
+	def test_cloud_settings_origin_already_named_is_not_repeated(self):
+		self.set_conf(pilot_endpoint="https://www.youtube.com")
+
+		script_src = get_directive(self.process().headers["Content-Security-Policy"], "script-src").split()
+
+		self.assertEqual(script_src.count("https://www.youtube.com"), 1)
+
+	def test_cloud_settings_origin_is_not_added_to_a_configured_policy(self):
+		configured_policy = "default-src 'self'; script-src 'self'"
+		self.set_conf(pilot_endpoint="https://pilot.example.com", content_security_policy=configured_policy)
+
+		self.assertEqual(self.process().headers["Content-Security-Policy"], configured_policy)
 
 	def test_explicit_policy_with_embedding_domains_is_preserved(self):
 		embedding_policy = "frame-ancestors 'self' https://embed.example"

@@ -406,12 +406,13 @@ export default class ChartWidget extends Widget {
 			`<div class="dashboard-date-field pull-right"></div>`
 		).insertAfter(this.action_area.find(".timespan-filter"));
 
-		this.collapse_header_for_date_field();
+		this.wrap_header_for_date_field();
 
 		this.date_range_field = frappe.ui.form.make_control({
 			df: {
 				fieldtype: "DateRange",
 				fieldname: "from_date",
+				label: __("Date Range"),
 				placeholder: __("Date Range"),
 				input_class: "input-xs",
 				default: [time_window.from_date, time_window.to_date],
@@ -439,6 +440,17 @@ export default class ChartWidget extends Widget {
 			render_input: 1,
 		});
 
+		// the accessible name of the rendered input, which its label row — hidden inside a
+		// widget header — does not carry, and the association of that label with the input
+		// this widget holds (RB-10)
+		const date_range_input_id = frappe.dom.get_unique_id();
+
+		this.date_range_field.$input.attr({
+			id: date_range_input_id,
+			"aria-label": __("Date Range"),
+		});
+		this.date_field_wrapper.find("label.control-label").attr("for", date_range_input_id);
+
 		if (time_window.from_date && time_window.to_date) {
 			this.date_range_field.set_input(time_window.from_date, time_window.to_date);
 		}
@@ -446,31 +458,27 @@ export default class ChartWidget extends Widget {
 		focus_input && this.date_range_field.$input.focus();
 	}
 
-	// Hides the title and subtitle and reverses the header of a narrow widget, making room for
-	// the date range control, and records that this widget's header is collapsed for it.
-	collapse_header_for_date_field() {
+	// Wraps the header of a narrow widget onto a second row, making room for the date range
+	// control while the title and subtitle keep the first row, and records that this widget's
+	// header is wrapped for it (RB-11).
+	wrap_header_for_date_field() {
 		if (this.width === "Full" || this.widget.width() >= 700) {
 			return;
 		}
 
-		this.title_field.hide();
-		this.subtitle_field.hide();
-		this.head.css("flex-direction", "row-reverse");
-		this.header_collapsed_for_date_field = true;
+		this.widget.addClass("date-range-header");
+		this.header_wrapped_for_date_field = true;
 	}
 
-	// Shows the title and subtitle again and restores the header direction, for a header this
-	// widget collapsed for its date range control. A header hidden by anything else is left as
-	// it is.
+	// Returns the header to a single row, for a header this widget wrapped for its date range
+	// control. A header laid out by anything else is left as it is.
 	restore_header_after_date_field() {
-		if (!this.header_collapsed_for_date_field) {
+		if (!this.header_wrapped_for_date_field) {
 			return;
 		}
 
-		this.header_collapsed_for_date_field = false;
-		this.title_field.show();
-		this.subtitle_field.show();
-		this.head.css("flex-direction", "row");
+		this.header_wrapped_for_date_field = false;
+		this.widget.removeClass("date-range-header");
 	}
 
 	// Removes this instance's date range control, its datepicker and the references to both,

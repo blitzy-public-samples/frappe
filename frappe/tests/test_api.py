@@ -629,14 +629,14 @@ class TestCSRFProtection(FrappeAPITestCase):
 
 	def setUp(self):
 		self.todo = frappe.get_doc(doctype="ToDo", description=self.PROBE_DESCRIPTION).insert()
-		frappe.db.commit()
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit
 		self.addCleanup(self.delete_todo, self.todo.name)
 
 	@staticmethod
 	def delete_todo(name: str) -> None:
 		frappe.db.rollback()
 		frappe.delete_doc_if_exists("ToDo", name, force=True)
-		frappe.db.commit()
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit
 
 	@staticmethod
 	def delete_session(sid: str) -> None:
@@ -698,7 +698,7 @@ class TestCSRFProtection(FrappeAPITestCase):
 			.where(Sessions.sid == sid)
 			.set(Sessions.sessiondata, frappe.as_json(session_data, indent=None, separators=(",", ":")))
 		).run()
-		frappe.db.commit()
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit
 
 		if cached_session := frappe.cache.hget("session", sid):
 			cached_session["data"].pop("csrf_token", None)
