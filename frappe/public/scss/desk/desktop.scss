@@ -1605,6 +1605,22 @@ body[data-route^="dashboard-view"] {
 	fill: var(--text-color);
 }
 
+// Holds the tooltip frappe-charts draws inside a chart widget within the
+// `.chart-container` it is absolutely positioned in, and wraps its text there.
+// Overrides `max-width: none` and `overflow-wrap: normal` on `.graph-svg-tip`, and
+// `white-space: nowrap` on `.graph-svg-tip.comparison ul`, from the stylesheet the
+// library injects; `overflow-wrap: anywhere` is the value that lowers the tooltip's
+// min-content width, which its shrink-to-fit width is resolved against.
+// Decision row RF-21 in blitzy/documentation/PR Description.md section 6.
+.dashboard-widget-box .graph-svg-tip {
+	max-width: 100%;
+	overflow-wrap: anywhere;
+
+	&.comparison ul {
+		white-space: normal;
+	}
+}
+
 // Overrides `.navbar-breadcrumbs a { color: var(--ink-gray-5) }` and its `/` separator
 // `a:before { color: var(--ink-gray-4) }` from frappe/public/scss/desk/breadcrumb.scss.
 // Decision rows RF-6 and RF-7 in blitzy/documentation/PR Description.md section 6.

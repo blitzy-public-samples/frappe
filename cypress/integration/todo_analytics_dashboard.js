@@ -528,6 +528,81 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			});
 		};
 
+		// The widget object of the named chart, which holds the chart the widget drew and the
+		// tooltip formatter it was drawn with.
+		const chart_object = (win, title) =>
+			win.frappe.dashboard.chart_group.widgets_list.find(
+				(widget) => widget.chart_name === title
+			);
+
+		// Raises the tooltip of the bar at `index` with a pointer move over its centre and
+		// asserts the value it prints is the text the bar label and the axis carry (RA-9).
+		const assert_bar_tooltip_value = (index, where) =>
+			top_owners_widget().should(($widget) => {
+				const bar = $widget.find("rect.bar")[index];
+				const tip = $widget.find(".graph-svg-tip")[0];
+				const box = bar.getBoundingClientRect();
+				const win = bar.ownerDocument.defaultView;
+
+				bar.dispatchEvent(
+					new win.MouseEvent("mousemove", {
+						bubbles: true,
+						clientX: box.left + box.width / 2,
+						clientY: box.top + box.height / 2,
+					})
+				);
+
+				expect(tip.style.opacity, `tooltip of bar ${index} ${where}`).to.eq("1");
+				expect(
+					tip.querySelector(".tooltip-value").textContent.trim(),
+					`tooltip value of bar ${index} ${where}`
+				).to.eq(owner_value_texts[index]);
+			});
+
+		// Focuses the ranked chart's plot area and sends it one key, as a native event rather
+		// than through an actionability check a raised tooltip would fail.
+		const press_in_plot_area = (key, code) =>
+			top_owners_widget()
+				.find('.chart-plot-area[tabindex="0"]')
+				.then(($plot) => {
+					const plot = $plot[0];
+					const win = plot.ownerDocument.defaultView;
+
+					plot.focus();
+					plot.dispatchEvent(
+						new win.KeyboardEvent("keydown", {
+							key: key,
+							keyCode: code,
+							which: code,
+							bubbles: true,
+							cancelable: true,
+						})
+					);
+				});
+
+		// Walks the keyboard tooltip to the first data point and asserts the live region carries
+		// the formatted value rather than the raw one (RA-9).
+		const assert_announced_value = (where) => {
+			press_in_plot_area("Home", 36);
+			top_owners_widget()
+				.find(".chart-tooltip-announcer[aria-live]")
+				.should(($announcer) => {
+					const announcement = $announcer.text();
+
+					expect(announcement, `announced value ${where}`).to.contain(
+						`Open ToDos ${owner_value_texts[0]}`
+					);
+					expect(announcement, `raw announced value ${where}`).to.not.contain(
+						String(owner_values[0])
+					);
+				});
+			// leaves the plot area as the rest of the case finds it: no tooltip, no live text
+			press_in_plot_area("Escape", 27);
+			top_owners_widget()
+				.find(".chart-tooltip-announcer[aria-live]")
+				.should("have.text", "");
+		};
+
 		cy.viewport(1400, 960);
 		cy.intercept(
 			"POST",
@@ -548,6 +623,59 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 		assert_owner_value_labels("at 1400px");
 		assert_owner_labels(owner_labels.length, "at 1400px");
+
+		// the tooltip of a data point is written with the axis convention, so one screen carries
+		// one numeric convention across its ticks, its printed values and its tooltips (RA-9)
+		cy.window().then((win) => {
+			const axis = (value) => win.frappe.utils.format_chart_axis_number(value);
+			const values = [
+				0, 6, 1250, 1255, 1504, 12500, 999999, 0.30000000000000004, 1500000, 1234567,
+			];
+
+			driven_charts.forEach((title) => {
+				const format_tooltip = chart_object(win, title).dashboard_chart.config
+					.formatTooltipY;
+
+				expect(format_tooltip, `tooltip formatter of ${title}`).to.be.a("function");
+				// the dataset descriptor frappe-charts passes as the second argument is not read
+				// as the country of the number system
+				values.forEach((value) =>
+					expect(
+						String(
+							format_tooltip(value, {
+								name: "Open ToDos",
+								index: 0,
+								values: values,
+							})
+						),
+						`tooltip of ${value} in ${title}`
+					).to.eq(axis(value))
+				);
+				expect(
+					String(format_tooltip(1250)),
+					`thousands separator in the ${title} tooltip`
+				).to.eq("1,250");
+				expect(
+					String(format_tooltip(0.30000000000000004)),
+					`floating-point artifact in the ${title} tooltip`
+				).to.eq("0.3");
+			});
+
+			// the values frappe-charts holds for the tooltip and for the live region are the
+			// texts printed over the bars
+			const points = Object.values(
+				chart_object(win, top_owners_chart).dashboard_chart.dataByIndex
+			);
+
+			expect(
+				points.map((point) => String(point.values[0].formatted)),
+				"tooltip values held by the ranked chart"
+			).to.deep.eq(owner_value_texts);
+		});
+
+		assert_bar_tooltip_value(0, "at 1400px");
+		assert_bar_tooltip_value(1, "at 1400px");
+		assert_announced_value("at 1400px");
 
 		cy.get(".dashboard-widget-box").each(($widget) => {
 			cy.wrap($widget).should(assert_y_axis).and(assert_x_axis);
@@ -579,6 +707,8 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 		assert_owner_value_labels("at 375px");
 		assert_owner_labels(1, "at 375px");
+		assert_bar_tooltip_value(0, "at 375px");
+		assert_announced_value("at 375px");
 
 		cy.window().then((win) => {
 			expect(win.frappe.utils.format_chart_axis_number(0)).to.eq("0");
@@ -1704,7 +1834,9 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 					.split(/\s+/)
 					.map((id) => in_document.getElementById(id))
 					.filter(Boolean)
-					.map((node) => node.textContent.trim())
+					// a referenced element carrying its own aria-label is read from it, which is
+					// how the name of a menu labelled by a named toggle is computed
+					.map((node) => (node.getAttribute("aria-label") || node.textContent).trim())
 					.filter(Boolean)
 					.join(" ");
 
@@ -1729,6 +1861,36 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 
 			return (element.getAttribute("title") || "").trim();
 		};
+
+		// the accessible name of one time-window toggle and of the menu it labels: the property
+		// the control changes, then the value it holds, on both (RD-16)
+		const assert_filter_name = (filter_class, purpose, value) =>
+			trend_widget()
+				.find(`.${filter_class} [data-toggle="dropdown"]`)
+				.should(($toggle) => {
+					const toggle = $toggle[0];
+					const menu = toggle.parentElement.querySelector('ul[role="menu"]');
+					const expected = `${purpose}: ${value}`;
+
+					expect(
+						accessible_name(toggle),
+						`accessible name of .${filter_class}`
+					).to.equal(expected);
+					// the name carries the text the control shows (WCAG 2.5.3 Label in Name)
+					expect(
+						$toggle.find(".filter-label").text().trim(),
+						`visible label of .${filter_class}`
+					).to.equal(value);
+					expect(toggle.id, `id of .${filter_class}`).to.not.equal("");
+					expect(
+						menu.getAttribute("aria-labelledby"),
+						`menu labelled by .${filter_class}`
+					).to.equal(toggle.id);
+					expect(
+						accessible_name(menu),
+						`accessible name of the .${filter_class} menu`
+					).to.equal(expected);
+				});
 
 		const assert_only_checked = (menu_selector, label) => {
 			cy.get(`${menu_selector} [role="menuitemradio"]`).each(($option) => {
@@ -1775,6 +1937,21 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		cy.visit("/desk/dashboard-view/ToDo Analytics");
 		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
 
+		// 0. each time-window toggle is named after the property it changes as well as the value
+		// it holds, and so is the menu it opens (RD-16)
+		assert_filter_name("timespan-filter", "Time window", "Last Week");
+		assert_filter_name("time-interval-filter", "Time interval", "Daily");
+		cy.get(".dashboard-widget-box button.chart-filter-toggle")
+			.should("have.length", 2)
+			.each(($toggle) => {
+				const name = accessible_name($toggle[0]);
+				const shown = $toggle.text().trim();
+
+				expect(name, `accessible name of the "${shown}" toggle`).to.not.equal("");
+				expect(name, `name of the "${shown}" toggle beyond its value`).to.not.equal(shown);
+				expect(name, `value inside the name of the "${shown}" toggle`).to.contain(shown);
+			});
+
 		// 1. timespan dropdown: opens from the keyboard, closes on Escape with focus restored,
 		// and marks the option that is applied
 		cy.get(timespan_toggle).focus().trigger("keydown", ENTER);
@@ -1797,6 +1974,8 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 			"Last Month"
 		);
 		assert_only_checked(".dashboard-widget-box .timespan-filter", "Last Month");
+		// the name follows the value the selection applied
+		assert_filter_name("timespan-filter", "Time window", "Last Month");
 		cy.focused()
 			.should("have.attr", "data-toggle", "dropdown")
 			.parent()
@@ -1842,6 +2021,7 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		cy.get(".dashboard-widget-box .time-interval-filter").should("have.class", "show");
 		cy.focused().should("have.attr", "role", "menuitemradio").and("have.text", "Yearly");
 		assert_only_checked(".dashboard-widget-box .time-interval-filter", "Daily");
+		assert_filter_name("time-interval-filter", "Time interval", "Daily");
 		cy.focused().trigger("keydown", ESCAPE);
 		cy.get(".dashboard-widget-box .time-interval-filter").should("not.have.class", "show");
 		cy.focused()
@@ -1947,6 +2127,9 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		assert_focus_on_rebuilt_menu();
 		trend_widget().find(".timespan-filter .filter-label").should("have.text", "Last Week");
 		trend_widget().find(".time-interval-filter .filter-label").should("have.text", "Daily");
+		// the rebuilt toggles are named again from the window the chart record carries
+		assert_filter_name("timespan-filter", "Time window", "Last Week");
+		assert_filter_name("time-interval-filter", "Time interval", "Daily");
 
 		// 9. Escape on the actions toggle of a closed menu reaches the document's own handler,
 		// which blurs the toggle and leaves the menu closed
@@ -3055,5 +3238,107 @@ describe("ToDo Analytics Dashboard", { scrollBehavior: false }, () => {
 		cy.get(".number-widget-box").should("have.length", 2);
 		cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
 		cy.get(".dashboard-widget-box .chart-loading-state.text-danger").should("not.be.visible");
+	});
+
+	it("keeps a long owner label inside the chart tooltip at 375px", () => {
+		const top_owners_source =
+			"frappe.desk.dashboard_chart_source.todo_top_owners.todo_top_owners.get";
+		const long_token = "Wolfeschlegelsteinhausenbergerdorffvoraltern";
+
+		// the two shapes a 129-character full_name takes: one that wraps at its spaces, and
+		// one unbroken word that only `overflow-wrap: anywhere` can break (RF-21)
+		const long_labels = [
+			`Annelieserose ${long_token} ${long_token} Pendragonsworthingtonshire`.slice(0, 129),
+			"Wolfeschlegelsteinhausenbergerdorff".repeat(4).slice(0, 129),
+		];
+
+		long_labels.forEach((long_label) => {
+			expect(long_label.length, "label length").to.equal(129);
+
+			cy.intercept("POST", `**/${top_owners_source}`, (req) =>
+				req.reply({
+					body: {
+						message: {
+							labels: [long_label, "_Test2"],
+							datasets: [{ name: "Open ToDos", values: [4, 2] }],
+						},
+					},
+				})
+			).as("long_label_owners");
+
+			cy.viewport(375, 812);
+			cy.visit("/desk/dashboard-view/ToDo Analytics");
+			cy.wait("@long_label_owners");
+			cy.get(".dashboard-widget-box svg.frappe-chart").should("have.length", 2);
+
+			chart_widget(top_owners_chart).should(($widget) => {
+				const widget = $widget[0];
+				const win = widget.ownerDocument.defaultView;
+				const tip = widget.querySelector(".graph-svg-tip");
+				const title = tip.querySelector(".title");
+				const style = win.getComputedStyle(tip);
+				const titles = [];
+
+				expect(style.maxWidth, `tooltip max-width for ${long_label}`).to.not.equal("none");
+				expect(style.overflowWrap, `tooltip overflow-wrap for ${long_label}`).to.equal(
+					"anywhere"
+				);
+				expect(
+					win.getComputedStyle(tip.querySelector("ul")).whiteSpace,
+					"tooltip value list white-space"
+				).to.equal("normal");
+
+				widget.querySelectorAll("rect.bar").forEach((bar, index) => {
+					const bar_box = bar.getBoundingClientRect();
+
+					bar.dispatchEvent(
+						new win.MouseEvent("mousemove", {
+							bubbles: true,
+							clientX: bar_box.left + bar_box.width / 2,
+							clientY: bar_box.top + bar_box.height / 2,
+						})
+					);
+
+					const widget_box = widget.getBoundingClientRect();
+					const tip_box = tip.getBoundingClientRect();
+					titles.push(title.textContent);
+
+					expect(tip.style.opacity, `tooltip shown over bar ${index}`).to.equal("1");
+					expect(
+						widget.scrollWidth,
+						`no hidden horizontal overflow over bar ${index}`
+					).to.equal(widget.clientWidth);
+					expect(
+						tip_box.right,
+						`tooltip inside the card over bar ${index}`
+					).to.be.at.most(widget_box.right + 1);
+					expect(
+						tip_box.right,
+						`tooltip inside the viewport over bar ${index}`
+					).to.be.at.most(win.innerWidth);
+					expect(
+						title.scrollWidth,
+						`tooltip title wrapped rather than clipped over bar ${index}`
+					).to.be.at.most(title.clientWidth + 1);
+				});
+
+				// the whole label is readable in the tooltip, which is what the thinned axis
+				// leaves it to carry (RA-3)
+				expect(titles, "tooltip titles, one per bar").to.deep.equal([
+					long_label,
+					"_Test2",
+				]);
+				expect(tip.innerText, "tooltip dataset").to.contain("Open ToDos");
+			});
+
+			// the scrolling content area offers no horizontal scrollbar to reach an overflow with
+			cy.get(".main-section").should(($section) => {
+				expect($section[0].scrollWidth, "content overflow at 375px").to.be.at.most(
+					$section[0].clientWidth
+				);
+			});
+		});
+
+		cy.viewport(1400, 960);
 	});
 });

@@ -9,7 +9,8 @@ frappe.dashboard_utils = {
 	 * See PR Description decisions RD-13 and RD-15.
 	 *
 	 * @param {Array} filters One object per dropdown: `label`, `options`, `action` and the
-	 *   optional `icon`, `class` and `fieldnames`.
+	 *   optional `icon`, `class`, `fieldnames` and `aria_label` — the last naming what the
+	 *   dropdown changes, which `filter_toggle_name` turns into the toggle's accessible name.
 	 * @param {string} button_class Class every dropdown carries, e.g. `"chart-actions"`.
 	 * @param {Object} container jQuery object wrapping the element the group is inserted into.
 	 * @param {boolean|number} append Truthy to prepend the group to `container`.
@@ -41,9 +42,17 @@ frappe.dashboard_utils = {
 				filter_class = filter.class;
 			}
 
+			// The toggle is named after what the dropdown changes and the value it holds; a
+			// filter that names no purpose renders the attribute-free button it always did
+			// (PR Description decision RD-16).
+			const toggle_name = this.filter_toggle_name(filter.aria_label, filter.label);
+			const toggle_name_html = toggle_name
+				? ` aria-label="${frappe.utils.escape_html(toggle_name)}"`
+				: "";
+
 			let chart_filter_html = `<div class="${button_class} ${filter_class} btn-group dropdown pull-right">
 					<button class="btn btn-secondary btn-xs chart-filter-toggle" data-toggle="dropdown"
-						aria-haspopup="true" aria-expanded="false">
+						aria-haspopup="true" aria-expanded="false"${toggle_name_html}>
 						${icon_html}
 						<span class="filter-label">${__(filter.label)}</span>
 						${frappe.utils.icon("chevrons-up-down", "xs")}
@@ -103,7 +112,10 @@ frappe.dashboard_utils = {
 				}
 
 				let selected_item = decodeURIComponent($el.data("option"));
-				$el.parents(`.${button_class}`).find(".filter-label").html(__(selected_item));
+				const $toggle = $el.parents(`.${button_class}`).find(".chart-filter-toggle");
+
+				$toggle.find(".filter-label").html(__(selected_item));
+				this.name_filter_toggle($toggle, filter.aria_label, selected_item);
 				filter.action(selected_item, fieldname);
 
 				// keep focus where the action moved it when it leaves this dropdown
@@ -312,6 +324,34 @@ frappe.dashboard_utils = {
 		}
 
 		$menu.attr("aria-labelledby", frappe.dom.set_unique_id($toggle[0]));
+	},
+
+	/**
+	 * The accessible name of a filter toggle: what the control changes, followed by the value it
+	 * holds, so the name states the property and still carries the visible label. An empty string
+	 * where the filter names no purpose, and the purpose alone where the control holds no value.
+	 *
+	 * See PR Description decision RD-16.
+	 *
+	 * @param {string} purpose What the dropdown changes, e.g. "Time window".
+	 * @param {string} value The value the dropdown currently holds, e.g. "Last Week".
+	 */
+	filter_toggle_name(purpose, value) {
+		if (!purpose) {
+			return "";
+		}
+
+		const applied = value == null ? "" : String(__(value)).trim();
+
+		return applied ? __("{0}: {1}", [__(purpose), applied]) : __(purpose);
+	},
+
+	// Names `$toggle` after the purpose its filter declares and the value the control now holds,
+	// and leaves a toggle whose filter declares no purpose exactly as it is.
+	name_filter_toggle($toggle, purpose, value) {
+		const name = this.filter_toggle_name(purpose, value);
+
+		name && $toggle.attr("aria-label", name);
 	},
 
 	// Marks `$selected` as the applied option of a single-selection menu and unmarks the rest,

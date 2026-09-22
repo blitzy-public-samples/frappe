@@ -333,6 +333,7 @@ export default class ChartWidget extends Widget {
 			filters = [
 				{
 					label: __(time_window.heatmap_year),
+					aria_label: __("Heatmap year"),
 					options: frappe.dashboard_utils.get_years_since_creation(
 						frappe.boot.user.creation
 					),
@@ -352,6 +353,7 @@ export default class ChartWidget extends Widget {
 			filters = [
 				{
 					label: __(time_window.time_interval),
+					aria_label: __("Time interval"),
 					options: ["Yearly", "Quarterly", "Monthly", "Weekly", "Daily"],
 					icon: "calendar",
 					class: "time-interval-filter",
@@ -371,6 +373,7 @@ export default class ChartWidget extends Widget {
 				},
 				{
 					label: __(time_window.timespan),
+					aria_label: __("Time window"),
 					options: [
 						"Select Date Range",
 						"Last Year",
@@ -2023,7 +2026,7 @@ export default class ChartWidget extends Widget {
 			chart_args.tooltipOptions = {
 				formatTooltipY: (value) => format_currency(value, this.chart_doc.currency),
 			};
-		} else {
+		} else if (fieldtype) {
 			chart_args.tooltipOptions = {
 				formatTooltipY: (value) =>
 					frappe.format(
@@ -2031,6 +2034,14 @@ export default class ChartWidget extends Widget {
 						{ fieldtype, options },
 						{ always_show_decimals: true, inline: true }
 					),
+			};
+		} else {
+			// A chart carrying neither a currency nor a value fieldtype writes its tooltip with
+			// the axis number formatter, called with the value alone because frappe-charts passes
+			// a dataset descriptor as the second argument and the formatter's own second
+			// parameter is a country (RA-9).
+			chart_args.tooltipOptions = {
+				formatTooltipY: (value) => frappe.utils.format_chart_axis_number(value),
 			};
 		}
 
